@@ -1,0 +1,24 @@
+[package]
+name = "kaols"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+cpal = "0.15"
+ringbuf = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+dotenvy = "0.15"
+anyhow = "1.0"
+colored = "2.1"
+uuid = { version = "1.10", features = ["v4"] }
+crossbeam-channel = "0.5"
+hound = "3.5"
+base64 = "0.22"
+rubato = "5.0.1"
+audioadapter = "5.0.0"
+audioadapter-buffers = "5.2.0"
