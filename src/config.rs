@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -35,17 +34,9 @@ pub struct AppConfig {
     /// CosyVoice preset voice name or custom cloned voice ID
     #[arg(
         long,
-        default_value = "cosyvoice-v3.5-flash-bailian-561a3afc8ae64aee8a826c5611d80f66"
+        default_value = "cosyvoice-v3.5-flash-bailian-c5f751276fcc47f0850d9dafd8cb9781"
     )]
     pub voice: String,
-
-    /// Path to reference audio WAV file for voice cloning (3-10 seconds)
-    #[arg(long)]
-    pub ref_audio: Option<PathBuf>,
-
-    /// Transcription text of reference audio file for voice cloning
-    #[arg(long)]
-    pub ref_text: Option<String>,
 
     /// Specific input audio device (microphone) name
     #[arg(long)]

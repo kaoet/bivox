@@ -75,9 +75,6 @@ impl PipelineOrchestrator {
         }
         println!("🤖 合成模型: {}", self.config.tts_model.yellow());
         println!("🎙️ 合成音色: {}", self.config.voice.yellow());
-        if let Some(ref_path) = &self.config.ref_audio {
-            println!("🧬 声音克隆: 开启 ({:?})", ref_path);
-        }
         println!(
             "{}",
             "==================================================".dimmed()
@@ -140,8 +137,6 @@ impl PipelineOrchestrator {
             api_key: api_key.clone(),
             tts_model: self.config.tts_model.clone(),
             voice: self.config.voice.clone(),
-            ref_audio: self.config.ref_audio.clone(),
-            ref_text: self.config.ref_text.clone(),
         };
         let tts_playback = playback.clone();
         let tts_running = is_running.clone();

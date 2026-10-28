@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,12 +18,12 @@ const DASHSCOPE_WS_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference
 #[derive(Debug, Deserialize)]
 struct AsrServerResponse {
     header: AsrHeader,
-    payload: Option<AsrPayload>,
+    payload: AsrPayload,
 }
 
 #[derive(Debug, Deserialize)]
 struct AsrHeader {
-    event: Option<String>,
+    event: String,
     error_code: Option<String>,
     error_message: Option<String>,
 }
@@ -35,14 +35,17 @@ struct AsrPayload {
 
 #[derive(Debug, Deserialize)]
 struct AsrOutput {
-    sentence: Option<AsrSentence>,
-    text: Option<String>,
+    sentence: AsrSentence,
 }
 
 #[derive(Debug, Deserialize)]
 struct AsrSentence {
-    text: Option<String>,
-    sentence_end: Option<bool>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    sentence_end: bool,
+    #[serde(default)]
+    heartbeat: bool,
 }
 
 pub struct QwenAsrClient;
@@ -108,32 +111,29 @@ impl QwenAsrClient {
         while let Some(msg_res) = read.next().await {
             match msg_res {
                 Ok(Message::Text(text)) => {
-                    if let Ok(resp) = serde_json::from_str::<AsrServerResponse>(&text) {
-                        if let Some(err) = resp.header.error_message {
-                            let err_code = resp.header.error_code.unwrap_or_default();
-                            eprintln!("Qwen ASR 握手失败 [{}]: {}", err_code, err);
-                            return Err(anyhow::anyhow!("Qwen ASR 握手被拒绝: {}", err));
-                        }
-                        if resp.header.event.as_deref() == Some("task-started") {
+                    let resp: AsrServerResponse =
+                        serde_json::from_str(&text).context("解析 Qwen ASR 握手响应失败")?;
+                    match resp.header.event.as_str() {
+                        "task-started" => {
                             task_started = true;
                             break;
                         }
+                        "task-failed" => {
+                            let err_code = resp.header.error_code.unwrap_or_default();
+                            let err_msg = resp.header.error_message.unwrap_or_default();
+                            bail!("Qwen ASR 握手失败 [{}]: {}", err_code, err_msg);
+                        }
+                        _ => {}
                     }
                 }
-                Ok(Message::Close(_)) => {
-                    return Err(anyhow::anyhow!("Qwen ASR WebSocket 在握手完成前被关闭"));
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Qwen ASR 连接异常: {:?}", e));
-                }
+                Ok(Message::Close(_)) => bail!("Qwen ASR WebSocket 在握手完成前被关闭"),
+                Err(e) => bail!("Qwen ASR 连接异常: {:?}", e),
                 _ => {}
             }
         }
 
         if !task_started {
-            return Err(anyhow::anyhow!(
-                "Qwen ASR 未能成功启动 (未收到 task-started)"
-            ));
+            bail!("Qwen ASR 未能成功启动 (未收到 task-started)");
         }
 
         println!("✨ Qwen-Audio-3.1 极速语音识别通道已就绪（无翻译纯识别模式）...");
@@ -174,36 +174,36 @@ impl QwenAsrClient {
 
             match msg_res {
                 Ok(Message::Text(text)) => {
-                    if let Ok(resp) = serde_json::from_str::<AsrServerResponse>(&text) {
-                        if let Some(err) = resp.header.error_message {
-                            eprintln!("Qwen ASR 服务端错误: {}", err);
-                            continue;
-                        }
+                    let Ok(resp) = serde_json::from_str::<AsrServerResponse>(&text) else {
+                        continue;
+                    };
 
-                        if let Some(payload) = resp.payload {
-                            if let Some(output) = payload.output {
-                                let (asr_text, is_end) = if let Some(sentence) = output.sentence {
-                                    (
-                                        sentence.text.unwrap_or_default(),
-                                        sentence.sentence_end.unwrap_or(false),
-                                    )
-                                } else {
-                                    (output.text.unwrap_or_default(), false)
-                                };
-
-                                if !asr_text.is_empty() {
-                                    // 纯转写模式下，翻译字段直接回填识别文本，直接送入下游分块与 TTS
-                                    println!("ASR end={is_end}: {asr_text}");
-                                    let _ = tx_events
-                                        .send(TranslationEvent {
-                                            transcription: asr_text.clone(),
-                                            translation: asr_text,
-                                            is_sentence_end: is_end,
-                                        })
-                                        .await;
+                    match resp.header.event.as_str() {
+                        "result-generated" => {
+                            if let Some(output) = resp.payload.output {
+                                let sentence = output.sentence;
+                                if sentence.heartbeat || sentence.text.is_empty() {
+                                    continue;
                                 }
+
+                                // 纯转写模式下，翻译字段直接回填识别文本，直接送入下游分块与 TTS
+                                let _ = tx_events
+                                    .send(TranslationEvent {
+                                        transcription: sentence.text.clone(),
+                                        translation: sentence.text,
+                                        is_sentence_end: sentence.sentence_end,
+                                    })
+                                    .await;
                             }
                         }
+                        "task-finished" => break,
+                        "task-failed" => {
+                            let err_code = resp.header.error_code.unwrap_or_default();
+                            let err_msg = resp.header.error_message.unwrap_or_default();
+                            eprintln!("Qwen ASR 任务失败 [{}]: {}", err_code, err_msg);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Message::Close(_)) => break,
