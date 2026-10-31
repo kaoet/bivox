@@ -13,34 +13,74 @@
 
 ## 快速上手
 
-### 1. 配置百炼 API Key
+### 1. 创建配置文件
 
-在项目根目录下创建 `.env` 文件（或参考 `.env.example`）：
-
-```env
-DASHSCOPE_API_KEY=sk-your-dashscope-api-key-here
-```
-
-也可以通过环境变量或启动参数指定：
+复制示例配置，并填入百炼 API Key（获取地址：https://bailian.console.aliyun.com/）：
 
 ```bash
-cargo run -- --api-key "sk-..."
+cp config.example.toml config.toml     # Windows: copy config.example.toml config.toml
+```
+
+```toml
+[api]
+key = "sk-your-dashscope-api-key-here"
+```
+
+`config.toml` 已被 `.gitignore` 忽略，不会被提交。所有配置项都有默认值，未写出的字段使用内置默认值，完整字段见 [`config.example.toml`](config.example.toml)：
+
+```toml
+[api]
+key = "sk-..."
+# workspace_host = "dashscope.aliyuncs.com"
+
+[asr]
+# model = "qwen-audio-3.1-asr-flash-streaming"
+
+[tts]
+# model = "cosyvoice-v3.5-flash"
+# voice = "cosyvoice-v3.5-flash-bailian-..."
+
+[audio]
+# input_device = "Microphone"
+# output_device = "CABLE Input"
+
+[vad]
+# enabled = true
+# margin_db = 9.0
+# hangover_ms = 500
+# tail_ms = 1000
+# debug = false
+
+[chunking]
+# words = 6
+```
+
+默认读取当前工作目录下的 `config.toml`；也可以指定其它路径：
+
+```bash
+cargo run --release -- --config path/to/config.toml
+# 或使用短参数
+cargo run --release -- -c path/to/config.toml
 ```
 
 ---
 
-### 2. 百炼业务空间专属域名（已配置默认值）
+### 2. 百炼接入域名（默认使用通用域名）
 
-百炼已为华北2（北京）/ 新加坡推出业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），官方建议替换旧的 `dashscope.aliyuncs.com`。本项目 ASR / CosyVoice 两条 WebSocket 链路均已使用该域名：
+默认使用百炼通用接入域名 `dashscope.aliyuncs.com`，无需额外配置：
 
 ```bash
-# 默认：ws-e01bu1mp0vk0o909.cn-beijing.maas.aliyuncs.com
 cargo run --release
-
-# 切换到其它业务空间 / 地域
-cargo run --release -- --workspace-host ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com
-# 或设置环境变量 DASHSCOPE_WORKSPACE_HOST
 ```
+
+如果控制台开通了业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`，百炼建议华北2 / 新加坡等地域使用），可在 `config.toml` 中覆盖：
+
+```toml
+[api]
+workspace_host = "ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com"
+```
+
+`workspace_host` 只填写纯 host，不要带 `wss://` 前缀、路径或端口；格式不规范时程序会在启动阶段直接报错。
 
 > ASR 固定使用近场 VAD 模型（`vad_model=near_meeting_16k`），适配"识别自己麦克风近讲"的使用场景。
 
@@ -53,20 +93,28 @@ cargo run --release -- --workspace-host ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com
 cargo run --release
 ```
 
-#### 查看系统中所有可用音频设备（输入与输出）：
+#### 查看系统中所有可用音频设备（输入与输出，无需配置文件）：
 ```bash
 cargo run -- --list-devices
 ```
 
 #### 指定特定麦克风与虚拟声卡（输出到 VRChat）：
-```bash
-# 例如指定 VB-Cable 虚拟音频线作为输出：
-cargo run --release -- --input-device "Microphone" --output-device "CABLE Input"
+```toml
+[audio]
+input_device = "Microphone"
+output_device = "CABLE Input"
 ```
 
+设备名称支持模糊匹配（不区分大小写）；留空或不写表示系统默认设备。
+
 #### 指定识别模型或合成音色：
-```bash
-cargo run --release -- --asr-model qwen-audio-3.1-asr-flash-streaming --voice longxiaochun
+```toml
+[asr]
+model = "qwen-audio-3.1-asr-flash-streaming"
+
+[tts]
+model = "cosyvoice-v3.5-flash"
+voice = "longxiaochun"
 ```
 
 #### 本地 VAD（默认开启，节省 ASR 费用）：
@@ -74,18 +122,30 @@ cargo run --release -- --asr-model qwen-audio-3.1-asr-flash-streaming --voice lo
 默认启用本地 VAD：只上传语音段，静音不上传；
 静音期每 10 秒补 100ms 静音保活，句末自动补 ~1s 静音以触发服务端断句。
 
-```bash
-# 默认（VAD 开启）
-cargo run --release
-
+```toml
+[vad]
 # 关闭 VAD（全量上传，便于对比 / 排查）
-cargo run --release -- --no-vad
+enabled = false
 
 # 打印每个 100ms chunk 的电平、噪声底、阈值与发送决策，用于现场标定
-cargo run --release -- --vad-debug
+debug = true
 
-# 可调参数：起音阈值 = 噪声底 + margin dB；hangover = 语音结束拖尾；tail = 句末静音
-cargo run --release -- --vad-margin-db 9 --vad-hangover-ms 500 --vad-tail-ms 1000
+# 起音阈值 = 噪声底 + margin dB；hangover = 语音结束拖尾；tail = 句末静音
+margin_db = 9.0
+hangover_ms = 500
+tail_ms = 1000
 ```
 
-调参提示：安静说话被切掉时降低 `--vad-margin-db`（如 6）；键盘/环境噪声频繁触发时提高它（如 12）。
+调参提示：安静说话被切掉时降低 `margin_db`（如 6）；键盘/环境噪声频繁触发时提高它（如 12）。
+
+---
+
+## 命令行参数
+
+业务配置全部来自 `config.toml`，命令行只保留两个入口：
+
+| 参数 | 说明 |
+|---|---|
+| `-c, --config <path>` | 指定 TOML 配置文件路径（默认 `./config.toml`） |
+| `--list-devices` | 列出所有可用音频输入/输出设备后退出（不读取配置文件） |
+| `-h, --help` | 查看帮助 |

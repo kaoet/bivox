@@ -1,0 +1,51 @@
+# ============================================================
+# kaols 配置示例
+#
+# 复制为 config.toml 后按需修改（Windows: copy，Linux/macOS: cp）：
+#   cp config.example.toml config.toml
+#
+# 读取规则：默认读取当前工作目录下的 config.toml；
+# 可用 --config / -c <path> 指定其它路径。
+# 未写出的字段使用内置默认值；未知字段会导致解析失败。
+# 注意：config.toml 含 API Key，已被 .gitignore 忽略，请勿提交。
+# ============================================================
+
+[api]
+# 百炼 API Key，必填。获取地址：https://bailian.console.aliyun.com/
+key = "sk-your-dashscope-api-key-here"
+
+# 百炼接入域名 Host：只填写纯 host，不要带 wss:// 前缀、路径或端口，否则启动会报错。
+# 默认使用百炼通用域名 dashscope.aliyuncs.com；
+# 如使用业务空间专属域名（{WorkspaceId}.cn-beijing.maas.aliyuncs.com），在此覆盖。
+# workspace_host = "dashscope.aliyuncs.com"
+
+[asr]
+# 实时识别模型，默认 qwen-audio-3.1-asr-flash-streaming
+# model = "qwen-audio-3.1-asr-flash-streaming"
+
+[tts]
+# 合成模型，默认 cosyvoice-v3.5-flash
+# model = "cosyvoice-v3.5-flash"
+# 预置音色名或克隆音色 ID，默认 cosyvoice-v3.5-flash-bailian-...
+# voice = "cosyvoice-v3.5-flash-bailian-c5f751276fcc47f0850d9dafd8cb9781"
+
+[audio]
+# 不填 = 系统默认设备；设备名称支持模糊匹配（不区分大小写）
+# input_device = "Microphone"
+# output_device = "CABLE Input"
+
+[vad]
+# 本地 VAD 门控：只上传语音段，节省 ASR 费用（默认开启）
+# enabled = true
+# 起音阈值 = 噪声底 + margin_db（dB）
+# margin_db = 9.0
+# 语音结束后拖尾保持（毫秒）
+# hangover_ms = 500
+# 句末补发的尾部静音（毫秒），用于触发服务端 sentence_end
+# tail_ms = 1000
+# 打印每个 chunk 的 VAD 电平/阈值/发送决策，用于现场标定
+# debug = false
+
+[chunking]
+# 投机分块词数阈值
+# words = 6

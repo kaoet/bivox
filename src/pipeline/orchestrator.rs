@@ -26,19 +26,15 @@ impl PipelineOrchestrator {
     pub async fn run(&self) -> Result<()> {
         let device_mgr = AudioDeviceManager::new();
 
-        if self.config.list_devices {
-            device_mgr.list_devices()?;
-            return Ok(());
-        }
+        let api_key =
+            self.config.api.key.clone().ok_or_else(|| {
+                anyhow::anyhow!("未配置 API Key，请在配置文件的 [api] key 中设置")
+            })?;
 
-        let api_key = self.config.api_key.clone().ok_or_else(|| {
-            anyhow::anyhow!("未配置 DASHSCOPE_API_KEY，请在 .env 中设置或通过 --api-key 传入")
-        })?;
-
-        let in_dev = device_mgr.get_input_device(self.config.input_device.as_deref())?;
+        let in_dev = device_mgr.get_input_device(self.config.audio.input_device.as_deref())?;
         let in_dev_name = in_dev.name().unwrap_or_else(|_| "默认麦克风".into());
 
-        let out_dev = device_mgr.get_output_device(self.config.output_device.as_deref())?;
+        let out_dev = device_mgr.get_output_device(self.config.audio.output_device.as_deref())?;
         let out_dev_name = out_dev.name().unwrap_or_else(|_| "默认扬声器".into());
 
         println!(
@@ -56,22 +52,22 @@ impl PipelineOrchestrator {
         println!("🌐 运行模式: {}", "语音识别转文字 -> 语音合成".yellow());
         println!(
             "🧠 识别模型: {}",
-            format!("Qwen Audio ({})", self.config.asr_model).yellow()
+            format!("Qwen Audio ({})", self.config.asr.model).yellow()
         );
-        if self.config.no_vad {
+        if !self.config.vad.enabled {
             println!("🎚️ 本地 VAD: {}", "关闭（全量上传）".yellow());
         } else {
             println!(
                 "🎚️ 本地 VAD: {}",
                 format!(
                     "开启（margin={}dB, hangover={}ms, tail={}ms, keepalive=10s）",
-                    self.config.vad_margin_db, self.config.vad_hangover_ms, self.config.vad_tail_ms
+                    self.config.vad.margin_db, self.config.vad.hangover_ms, self.config.vad.tail_ms
                 )
                 .yellow()
             );
         }
-        println!("🤖 合成模型: {}", self.config.tts_model.yellow());
-        println!("🎙️ 合成音色: {}", self.config.voice.yellow());
+        println!("🤖 合成模型: {}", self.config.tts.model.yellow());
+        println!("🎙️ 合成音色: {}", self.config.tts.voice.yellow());
         println!(
             "🌐 业务空间域名: {}",
             self.config.workspace_ws_base().cyan()
@@ -98,19 +94,19 @@ impl PipelineOrchestrator {
         let engine_key = api_key.clone();
         let engine_running = is_running.clone();
         let inference_ws_url = self.config.inference_ws_url();
-        let asr_model = self.config.asr_model.clone();
+        let asr_model = self.config.asr.model.clone();
         let asr_ws_url = inference_ws_url.clone();
-        let asr_gate = if self.config.no_vad {
+        let asr_gate = if !self.config.vad.enabled {
             None
         } else {
             Some(vad::SpeechGate::new(vad::GateConfig {
                 vad: vad::VadConfig {
-                    margin_db: self.config.vad_margin_db,
-                    hangover_ms: self.config.vad_hangover_ms,
+                    margin_db: self.config.vad.margin_db,
+                    hangover_ms: self.config.vad.hangover_ms,
                     ..Default::default()
                 },
-                tail_ms: self.config.vad_tail_ms,
-                debug: self.config.vad_debug,
+                tail_ms: self.config.vad.tail_ms,
+                debug: self.config.vad.debug,
                 ..Default::default()
             }))
         };
@@ -135,8 +131,8 @@ impl PipelineOrchestrator {
         let (tx_tts, rx_tts) = mpsc::channel::<TtsChunkRequest>(100);
         let tts_config = CosyVoiceConfig {
             api_key: api_key.clone(),
-            tts_model: self.config.tts_model.clone(),
-            voice: self.config.voice.clone(),
+            tts_model: self.config.tts.model.clone(),
+            voice: self.config.tts.voice.clone(),
             ws_url: inference_ws_url,
         };
         let tts_playback = playback.clone();
@@ -151,7 +147,7 @@ impl PipelineOrchestrator {
         });
 
         // 5. 调度中枢：接收识别事件 -> 流式分块 -> 全双工并发推入 CosyVoice 管道
-        let mut chunker = TextChunker::new(self.config.chunk_words);
+        let mut chunker = TextChunker::new(self.config.chunking.words);
 
         while let Some(event) = rx_events.recv().await {
             let chunks = chunker.process_stream(&event.text, event.is_sentence_end);

@@ -27,17 +27,17 @@ git commit -m "..."  # 5. 以上全部通过后才允许提交
 ```bash
 cargo build            # 编译
 cargo test             # 全部单元测试（含本地 mock WebSocket 服务）
-cargo run -- --help    # 查看 CLI 参数
-cargo run -- --list-devices   # 列出可用音频设备（无需 API Key）
-cargo run --release    # 默认运行：实时语音识别 -> CosyVoice 合成播放
+cargo run -- --help    # 查看 CLI 参数（-c/--config、--list-devices）
+cargo run -- --list-devices   # 列出可用音频设备（无需配置文件）
+cargo run --release    # 默认运行：读取 ./config.toml，实时语音识别 -> CosyVoice 合成播放
 ```
 
-运行需要 `.env` 中的 `DASHSCOPE_API_KEY`（参见 `.env.example`）。
+运行需要 `config.toml` 中的 `[api] key`（参见 `config.example.toml`）。
 
 ## 项目结构速览
 
 - `src/main.rs`：入口，解析配置并启动编排器。
-- `src/config.rs`：clap CLI 配置（API Key、业务空间域名、设备、ASR/TTS 模型、VAD 参数）。
+- `src/config.rs`：TOML 配置加载与校验（API Key、业务空间域名、设备、ASR/TTS 模型、VAD 参数）；clap 仅保留 `-c/--config`、`--list-devices`。
 - `src/audio/`：`cpal` 采集/播放、设备枚举、重采样、本地能量 VAD 门控。
 - `src/client/`：
   - `qwen_asr.rs`：百炼 Qwen Audio 实时双向流式识别（run-task 协议）。
@@ -49,4 +49,4 @@ cargo run --release    # 默认运行：实时语音识别 -> CosyVoice 合成�
 
 - 注释与终端提示语用中文，标识符用英文；提交信息简洁描述“做了什么、为什么”。
 - 涉及 WebSocket 协议、重连、VAD 等逻辑时，测试使用本地 `tokio` mock 服务，不依赖真实百炼网络。
-- 不要提交 `.env`（已被 `.gitignore` 忽略）；密钥只通过环境变量或 `--api-key` 传入。
+- 不要提交 `config.toml`（已被 `.gitignore` 忽略）；密钥只放在 `[api] key` 中，不再读取环境变量。
