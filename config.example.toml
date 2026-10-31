@@ -24,10 +24,10 @@ key = "sk-your-dashscope-api-key-here"
 # model = "qwen-audio-3.1-asr-flash-streaming"
 
 [tts]
-# 合成模型，默认 cosyvoice-v3.5-flash
-# model = "cosyvoice-v3.5-flash"
-# 预置音色名或克隆音色 ID，默认 cosyvoice-v3.5-flash-bailian-...
-# voice = "cosyvoice-v3.5-flash-bailian-c5f751276fcc47f0850d9dafd8cb9781"
+# 合成模型，默认 qwen-audio-3.1-tts-flash（低延迟实时流式合成）
+# model = "qwen-audio-3.1-tts-flash"
+# 系统音色名或复刻/设计音色 ID（音色与模型绑定，不能跨模型混用），默认乔小娇
+# voice = "qiaoxiaojiao_v3.1"
 
 [audio]
 # 不填 = 系统默认设备；设备名称支持模糊匹配（不区分大小写）

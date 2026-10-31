@@ -1,3 +1,10 @@
+//! 百炼 Qwen-Audio-TTS 全双工双向流式合成客户端。
+//!
+//! 走 DashScope 统一的 run-task 协议（`/api-ws/v1/inference`）：
+//! 建连 → run-task → task-started → continue-task(文本) → finish-task →
+//! task-finished，音频通过 binary 帧流式返回。事件与参数结构同 ASR 链路一致，
+//! 因此建连/握手/断线重连骨架完全复用 [`ws`]。
+
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -14,7 +21,7 @@ use crate::audio::playback::AudioPlaybackHandle;
 use crate::client::ws::{self, ReconnectingSession, SessionEnd, WsRead, WsWrite};
 
 #[derive(Debug, Clone)]
-pub struct CosyVoiceConfig {
+pub struct QwenTtsConfig {
     pub api_key: String,
     pub tts_model: String,
     pub voice: String,
@@ -30,19 +37,19 @@ pub struct TtsChunkRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CosyHeader {
+struct TtsHeader {
     event: Option<String>,
     error_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CosyServerResponse {
-    header: CosyHeader,
+struct TtsServerResponse {
+    header: TtsHeader,
 }
 
 /// TTS 会话的共享状态（跨重连保留）
 pub(crate) struct TtsRuntime {
-    config: CosyVoiceConfig,
+    config: QwenTtsConfig,
     rx_chunks: Receiver<TtsChunkRequest>,
     playback: AudioPlaybackHandle,
     /// 上一个连接在 run-task/握手阶段失败时保留的首个切片；
@@ -63,14 +70,14 @@ impl TtsRuntime {
         if self.pending_attempts >= MAX_PENDING_ATTEMPTS {
             if let Some(chunk) = self.pending_chunk.take() {
                 eprintln!(
-                    "⚠️ CosyVoice 同一句连续 {} 次启动失败，丢弃该句: {:?}",
+                    "⚠️ TTS 同一句连续 {} 次启动失败，丢弃该句: {:?}",
                     self.pending_attempts, chunk.text
                 );
             }
             self.pending_attempts = 0;
         } else if let Some(chunk) = self.pending_chunk.as_ref() {
             eprintln!(
-                "⚠️ CosyVoice 该句启动失败（第 {}/{} 次），重连后重试: {:?}",
+                "⚠️ TTS 该句启动失败（第 {}/{} 次），重连后重试: {:?}",
                 self.pending_attempts, MAX_PENDING_ATTEMPTS, chunk.text
             );
         }
@@ -90,15 +97,15 @@ enum ChunkWait {
     End(SessionEnd),
 }
 
-pub struct CosyVoiceClient;
+pub struct QwenTtsClient;
 
-impl CosyVoiceClient {
-    /// 运行百炼 CosyVoice 全双工双向异步流式语音合成服务：
+impl QwenTtsClient {
+    /// 运行百炼 Qwen-Audio-TTS 全双工双向异步流式语音合成服务：
     /// - 单条 WebSocket 连接跨句子长效复用（省掉每句的 TLS/TCP 握手）
     /// - 空闲期间用 WS Ping 保活（inference 连接约 60s 无帧会被服务端关闭）
     /// - 断线由 [`ws::run_with_reconnect`] 统一退避重连，未成功启动的句子会被保留重试
     pub async fn run_duplex(
-        config: CosyVoiceConfig,
+        config: QwenTtsConfig,
         rx_chunks: Receiver<TtsChunkRequest>,
         playback: AudioPlaybackHandle,
         is_running: Arc<AtomicBool>,
@@ -110,14 +117,14 @@ impl CosyVoiceClient {
             pending_chunk: None,
             pending_attempts: 0,
         };
-        ws::run_with_reconnect::<Self>("CosyVoice", &is_running, &mut state).await
+        ws::run_with_reconnect::<Self>("TTS", &is_running, &mut state).await
     }
 
     /// 一条连接的生命周期：连接后循环处理多个句子的 TTS 任务
     async fn run_connection(state: &mut TtsRuntime, is_running: &AtomicBool) -> Result<SessionEnd> {
         let ws_stream =
             ws::connect_authenticated(&state.config.api_key, &state.config.ws_url).await?;
-        println!("✨ 百炼 CosyVoice WebSocket 连接已建立...");
+        println!("✨ 百炼 TTS WebSocket 连接已建立...");
 
         // 连接只 split 一次并长期持有：空闲等待时也要 poll 读半边，
         // 才能消费 Ping/Pong、及时发现服务端 Close，并用写半边发送保活 Ping。
@@ -187,7 +194,7 @@ impl CosyVoiceClient {
                 // 保留 pending_chunk，重连后用同一句重试
                 state.note_pending_failure();
                 return Ok(SessionEnd::Disconnected(format!(
-                    "发送 CosyVoice run-task 失败: {:?}",
+                    "发送 TTS run-task 失败: {:?}",
                     e
                 )));
             }
@@ -204,7 +211,7 @@ impl CosyVoiceClient {
                 Err(e) => {
                     state.note_pending_failure();
                     return Ok(SessionEnd::Disconnected(format!(
-                        "CosyVoice 等待 task-started 失败: {e:#}"
+                        "TTS 等待 task-started 失败: {e:#}"
                     )));
                 }
             };
@@ -215,7 +222,7 @@ impl CosyVoiceClient {
                     .unwrap_or("未知错误");
                 state.note_pending_failure();
                 return Ok(SessionEnd::Disconnected(format!(
-                    "CosyVoice task-failed: {}",
+                    "TTS task-failed: {}",
                     msg
                 )));
             }
@@ -256,13 +263,13 @@ impl CosyVoiceClient {
                                 state.playback.push_pcm16(&pcm_bytes);
                             }
                             Some(Ok(Message::Text(t))) => {
-                                let Ok(resp) = serde_json::from_str::<CosyServerResponse>(&t) else {
+                                let Ok(resp) = serde_json::from_str::<TtsServerResponse>(&t) else {
                                     continue;
                                 };
                                 if let Some(err) = resp.header.error_message {
-                                    eprintln!("CosyVoice 服务端报错: {}", err);
+                                    eprintln!("TTS 服务端报错: {}", err);
                                     return Ok(SessionEnd::Disconnected(format!(
-                                        "CosyVoice 服务端报错: {}",
+                                        "TTS 服务端报错: {}",
                                         err
                                     )));
                                 }
@@ -366,7 +373,7 @@ impl CosyVoiceClient {
         write_sink
             .send(Message::Text(continue_payload.to_string()))
             .await
-            .context("发送 CosyVoice continue-task 失败")?;
+            .context("发送 TTS continue-task 失败")?;
 
         Ok(())
     }
@@ -386,13 +393,13 @@ impl CosyVoiceClient {
         write_sink
             .send(Message::Text(finish_payload.to_string()))
             .await
-            .context("发送 CosyVoice finish-task 失败")?;
+            .context("发送 TTS finish-task 失败")?;
 
         Ok(())
     }
 }
 
-impl ReconnectingSession for CosyVoiceClient {
+impl ReconnectingSession for QwenTtsClient {
     type State = TtsRuntime;
 
     fn run_once<'a>(
@@ -462,14 +469,14 @@ mod tests {
         let (tx_chunks, rx_chunks) = tokio::sync::mpsc::channel(8);
         let playback = AudioPlaybackHandle::for_test();
         let is_running = Arc::new(AtomicBool::new(true));
-        let config = CosyVoiceConfig {
+        let config = QwenTtsConfig {
             api_key: "sk-test".to_string(),
-            tts_model: "cosyvoice-test".to_string(),
+            tts_model: "qwen-tts-test".to_string(),
             voice: "test-voice".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
         };
 
-        let client = tokio::spawn(CosyVoiceClient::run_duplex(
+        let client = tokio::spawn(QwenTtsClient::run_duplex(
             config,
             rx_chunks,
             playback.clone(),
@@ -569,14 +576,14 @@ mod tests {
         let (tx_chunks, rx_chunks) = tokio::sync::mpsc::channel(8);
         let playback = AudioPlaybackHandle::for_test();
         let is_running = Arc::new(AtomicBool::new(true));
-        let config = CosyVoiceConfig {
+        let config = QwenTtsConfig {
             api_key: "sk-test".to_string(),
-            tts_model: "cosyvoice-test".to_string(),
+            tts_model: "qwen-tts-test".to_string(),
             voice: "test-voice".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
         };
 
-        let client = tokio::spawn(CosyVoiceClient::run_duplex(
+        let client = tokio::spawn(QwenTtsClient::run_duplex(
             config,
             rx_chunks,
             playback.clone(),

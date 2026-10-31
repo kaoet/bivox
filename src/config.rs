@@ -12,11 +12,11 @@ pub const DEFAULT_WORKSPACE_HOST: &str = "dashscope.aliyuncs.com";
 /// 实时识别模型默认值。
 pub const DEFAULT_ASR_MODEL: &str = "qwen-audio-3.1-asr-flash-streaming";
 
-/// 合成模型默认值。
-pub const DEFAULT_TTS_MODEL: &str = "cosyvoice-v3.5-flash";
+/// 合成模型默认值（Qwen-Audio-3.1-TTS-Flash，低延迟实时语音合成）。
+pub const DEFAULT_TTS_MODEL: &str = "qwen-audio-3.1-tts-flash";
 
-/// 合成音色默认值（百炼预置音色）。
-pub const DEFAULT_VOICE: &str = "cosyvoice-v3.5-flash-bailian-c5f751276fcc47f0850d9dafd8cb9781";
+/// 合成音色默认值（Qwen-Audio-TTS 系统音色：乔小娇，俏丽可爱女声）。
+pub const DEFAULT_VOICE: &str = "qiaoxiaojiao_v3.1";
 
 /// 本地 VAD 默认起音余量（dB）。
 pub const DEFAULT_VAD_MARGIN_DB: f32 = 9.0;
@@ -231,7 +231,7 @@ impl AppConfig {
         format!("wss://{}", self.api.workspace_host)
     }
 
-    /// 实时语音识别（ASR）/ 语音合成（CosyVoice）共用的 run-task 协议端点
+    /// 实时语音识别（ASR）/ 语音合成（TTS）共用的 run-task 协议端点
     pub fn inference_ws_url(&self) -> String {
         format!("{}/api-ws/v1/inference", self.workspace_ws_base())
     }

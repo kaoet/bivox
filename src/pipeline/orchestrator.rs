@@ -9,8 +9,8 @@ use crate::audio::capture::AudioCapture;
 use crate::audio::device::AudioDeviceManager;
 use crate::audio::playback::AudioPlaybackEngine;
 use crate::audio::vad;
-use crate::client::cosyvoice::{CosyVoiceClient, CosyVoiceConfig, TtsChunkRequest};
 use crate::client::qwen_asr::QwenAsrClient;
+use crate::client::qwen_tts::{QwenTtsClient, QwenTtsConfig, TtsChunkRequest};
 use crate::config::AppConfig;
 use crate::pipeline::chunker::TextChunker;
 
@@ -81,7 +81,7 @@ impl PipelineOrchestrator {
 
         let is_running = Arc::new(AtomicBool::new(true));
 
-        // 1. 初始化扬声器输出引擎 (CosyVoice 默认 22050Hz)
+        // 1. 初始化扬声器输出引擎 (TTS 默认 22050Hz)
         let playback_engine = AudioPlaybackEngine::new(&out_dev, 22050)?;
         let playback = playback_engine.handle();
 
@@ -127,9 +127,9 @@ impl PipelineOrchestrator {
             }
         });
 
-        // 4. 初始化 CosyVoice 全双工双向异步流式合成服务
+        // 4. 初始化 TTS 全双工双向异步流式合成服务
         let (tx_tts, rx_tts) = mpsc::channel::<TtsChunkRequest>(100);
-        let tts_config = CosyVoiceConfig {
+        let tts_config = QwenTtsConfig {
             api_key: api_key.clone(),
             tts_model: self.config.tts.model.clone(),
             voice: self.config.tts.voice.clone(),
@@ -140,13 +140,13 @@ impl PipelineOrchestrator {
 
         tokio::spawn(async move {
             if let Err(e) =
-                CosyVoiceClient::run_duplex(tts_config, rx_tts, tts_playback, tts_running).await
+                QwenTtsClient::run_duplex(tts_config, rx_tts, tts_playback, tts_running).await
             {
-                eprintln!("CosyVoice 流式合成服务异常: {:?}", e);
+                eprintln!("TTS 流式合成服务异常: {:?}", e);
             }
         });
 
-        // 5. 调度中枢：接收识别事件 -> 流式分块 -> 全双工并发推入 CosyVoice 管道
+        // 5. 调度中枢：接收识别事件 -> 流式分块 -> 全双工并发推入 TTS 管道
         let mut chunker = TextChunker::new(self.config.chunking.words);
 
         while let Some(event) = rx_events.recv().await {

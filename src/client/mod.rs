@@ -1,5 +1,5 @@
-pub mod cosyvoice;
 pub mod qwen_asr;
+pub mod qwen_tts;
 pub mod ws;
 
 /// 语音识别结果事件（ASR 经 channel 送给下游分块与 TTS）

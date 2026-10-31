@@ -29,7 +29,7 @@ cargo build            # 编译
 cargo test             # 全部单元测试（含本地 mock WebSocket 服务）
 cargo run -- --help    # 查看 CLI 参数（-c/--config、--list-devices）
 cargo run -- --list-devices   # 列出可用音频设备（无需配置文件）
-cargo run --release    # 默认运行：读取 ./config.toml，实时语音识别 -> CosyVoice 合成播放
+cargo run --release    # 默认运行：读取 ./config.toml，实时语音识别 -> Qwen-Audio-TTS 合成播放
 ```
 
 运行需要 `config.toml` 中的 `[api] key`（参见 `config.example.toml`）。
@@ -41,7 +41,7 @@ cargo run --release    # 默认运行：读取 ./config.toml，实时语音识�
 - `src/audio/`：`cpal` 采集/播放、设备枚举、重采样、本地能量 VAD 门控。
 - `src/client/`：
   - `qwen_asr.rs`：百炼 Qwen Audio 实时双向流式识别（run-task 协议）。
-  - `cosyvoice.rs`：CosyVoice 流式语音合成（run-task 协议，单连接复用）。
+  - `qwen_tts.rs`：Qwen-Audio-TTS 流式语音合成（run-task 协议，单连接复用）。
   - `ws.rs`：鉴权建连、握手、Ping 保活、断线指数退避重连的公共骨架。
 - `src/pipeline/`：`chunker.rs` 流式文本分块，`orchestrator.rs` 编排 ASR -> 分块 -> TTS。
 

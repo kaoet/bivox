@@ -6,7 +6,7 @@
 1. **音频采集**：通过 `cpal` 原生采集麦克风输入，100ms 切片持续推流。
 2. **实时流式识别**：直连阿里百炼 **`qwen-audio-3.1-asr-flash-streaming`**，在服务端流式输出转写文本。
 3. **流式切片 (Streaming Chunking)**：命中标点或达到 5~8 词语义断点时，立即切块触发语音合成，无需等待整句说完。
-4. **CosyVoice 实时合成**：通过百炼 **`cosyvoice-v3.5-flash`** WebSocket 流式接收 PCM 音频。
+4. **Qwen-Audio-TTS 实时合成**：通过百炼 **`qwen-audio-3.1-tts-flash`** WebSocket 流式接收 PCM 音频。
 5. **无缝平滑播放**：环形缓冲队列平滑连续播放，并支持新发言或打断信号即时清空旧语音。
 
 ---
@@ -37,8 +37,8 @@ key = "sk-..."
 # model = "qwen-audio-3.1-asr-flash-streaming"
 
 [tts]
-# model = "cosyvoice-v3.5-flash"
-# voice = "cosyvoice-v3.5-flash-bailian-..."
+# model = "qwen-audio-3.1-tts-flash"
+# voice = "qiaoxiaojiao_v3.1"
 
 [audio]
 # input_device = "Microphone"
@@ -113,8 +113,8 @@ output_device = "CABLE Input"
 model = "qwen-audio-3.1-asr-flash-streaming"
 
 [tts]
-model = "cosyvoice-v3.5-flash"
-voice = "longxiaochun"
+model = "qwen-audio-3.1-tts-flash"
+voice = "qiaoxiaojiao_v3.1"   # 系统音色；也可填同模型下复刻/设计音色的 voice_id
 ```
 
 #### 本地 VAD（默认开启，节省 ASR 费用）：
