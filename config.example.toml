@@ -5,7 +5,7 @@
 #   cp config.example.toml config.toml
 #
 # 读取规则：默认读取当前工作目录下的 config.toml；
-# 可用 --config / -c <path> 指定其它路径。
+# 可用全局参数 --config / -c <path> 指定其它路径。
 # 未写出的字段使用内置默认值；未知字段会导致解析失败。
 # 注意：config.toml 含 API Key，已被 .gitignore 忽略，请勿提交。
 # ============================================================
@@ -23,11 +23,59 @@ key = "sk-your-dashscope-api-key-here"
 # 实时识别模型，默认 qwen-audio-3.1-asr-flash-streaming
 # model = "qwen-audio-3.1-asr-flash-streaming"
 
+# 用户可能说的语言列表（有序）：
+#   - 只写一个元素 = 强提示只按该语言识别（例如 ["ja"]）；
+#   - 首个元素 = 没有"上一句"时的默认语言；
+#   - 本地语言判定始终使用完整列表；但传给 ASR API 的 language_hints 最多 4 个
+#     （超出会截断并打印一次警告）；
+#   - 自动判定覆盖：中日韩（假名/谚文/汉字）、拉丁（归一到列表中第一个拉丁语种）、
+#     西里尔→ru、阿拉伯→ar、泰文→th、希腊→el、天城文→hi；其它文字落到首个语言；
+#   - 支持的代码见 README（zh/ja/ko/en/fr/de/...，ASR 的 tl 与复刻的 fil 会自动归一）。
+# languages = ["zh"]
+
 [tts]
 # 合成模型，默认 qwen-audio-3.1-tts-flash（低延迟实时流式合成）
 # model = "qwen-audio-3.1-tts-flash"
-# 系统音色名或复刻/设计音色 ID（音色与模型绑定，不能跨模型混用），默认乔小娇
+
+# 当前音色，支持三种写法：
+#   1. 系统音色名（默认 qiaoxiaojiao_v3.1）
+#   2. 百炼复刻音色 voice_id
+#   3. custom:<配置名>，引用下面的 [tts.custom_voices.<配置名>]（支持多语言声线样本）
+# 音色与模型绑定，不能跨模型混用。
 # voice = "qiaoxiaojiao_v3.1"
+
+# 自定义音色缓存文件（相对本配置文件所在目录）。
+# 按「TTS 模型 → 样例音频内容」两层保存 voice_id：同一模型下同一音频只复刻一次，
+# 同一段音频在不同模型下分别缓存；删除该文件只会导致下次重新上传复刻。
+# cache_file = "voice_cache.json"
+
+# ------------------------------------------------------------
+# 自定义（复刻）音色：一个音色可以有多份不同语言的声线样本
+#
+# 每个样本都会按（当前 tts.model, 音频内容）单独复刻并缓存一个 voice_id。
+# 合成时按 ASR 文本判定本句语言：
+#   - 有该语言样本 → 用该语言的声线；
+#   - 没有该语言样本 → 回退到 samples 的第一个（默认声线）；
+# 同时合成请求始终携带目标语言的 language_hints；
+# 有内置映射的非中英语种（ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar）会附带 instruction。
+#
+# 注意 TOML 顺序：先写父表 [tts.custom_voices.<名字>]，再写 [[...samples]]。
+# 配置键名（如 edgar）会自动派生百炼音色前缀：去掉非字母数字、转小写；
+# 多语言样本追加语言代码（如 edgarzh / edgarja），单语言直接使用。
+# 建议配置键名使用 ASCII 小写字母/数字（非 ASCII 键名净化后可能为空，回退 voice 或只剩语言代码）。
+# 样例音频要求：清晰单说话人、至少约 5 秒（推荐 10~20 秒，单条建议不超过 60 秒，≤10 MB），
+# 可用 wav/mp3/m4a，尽量无背景音乐。
+#
+# [tts.custom_voices.edgar]
+# name = "异环 - 埃德嘉"      # 可选，显示名（默认用配置名）
+#
+# [[tts.custom_voices.edgar.samples]]
+# language = "zh"             # 必填，该样本语言（zh/ja/ko/en/...）
+# audio = "samples/edgar-zh.wav"
+#
+# [[tts.custom_voices.edgar.samples]]
+# language = "ja"
+# audio = "samples/edgar-ja.wav"
 
 [audio]
 # 不填 = 系统默认设备；设备名称支持模糊匹配（不区分大小写）

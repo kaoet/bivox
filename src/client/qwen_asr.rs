@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::audio::vad::SpeechGate;
 use crate::client::ws::{self, AudioStreamState, ReconnectingSession, SessionEnd, WsStream};
 use crate::client::AsrEvent;
+use crate::config::ASR_LANGUAGE_HINTS_LIMIT;
 
 /// 近场识别：本项目输入始终为说话人自己的麦克风（耳机/桌面近讲），
 /// 服务端默认远场 vad_model（far_field_meeting_16k）会降低近讲场景的 VAD 灵敏度。
@@ -57,6 +58,8 @@ pub(crate) struct AsrRuntime {
     api_key: String,
     model: String,
     ws_url: String,
+    /// 传给 ASR API 的 `language_hints`（已截断到上限）
+    language_hints: Vec<String>,
     io: AudioStreamState,
     /// 本地 VAD 发送门控；None 表示关闭（全量上传）
     gate: Option<SpeechGate>,
@@ -84,19 +87,36 @@ impl QwenAsrClient {
     ///
     /// `ws_url` 为百炼业务空间专属域名的 run-task 端点，
     /// 形如 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`。
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_duplex(
         api_key: String,
         model: String,
         ws_url: String,
+        language_hints: Vec<String>,
         gate: Option<SpeechGate>,
         rx_audio: Receiver<Vec<u8>>,
         tx_events: Sender<AsrEvent>,
         is_running: Arc<AtomicBool>,
     ) -> Result<()> {
+        // 填充 ASR API 时最多传前 4 个语言；检测范围仍由上层使用完整列表。
+        if language_hints.len() > ASR_LANGUAGE_HINTS_LIMIT {
+            eprintln!(
+                "⚠️ [asr] languages 共 {} 个，ASR API 的 language_hints 最多支持 {} 个，只传前 {} 个（语言检测仍使用完整列表）",
+                language_hints.len(),
+                ASR_LANGUAGE_HINTS_LIMIT,
+                ASR_LANGUAGE_HINTS_LIMIT
+            );
+        }
+        let language_hints: Vec<String> = language_hints
+            .into_iter()
+            .take(ASR_LANGUAGE_HINTS_LIMIT)
+            .collect();
+
         let mut state = AsrRuntime {
             api_key,
             model,
             ws_url,
+            language_hints,
             io: AudioStreamState {
                 rx_audio,
                 tx_events,
@@ -111,9 +131,21 @@ impl QwenAsrClient {
         api_key: &str,
         model: &str,
         ws_url: &str,
+        language_hints: &[String],
     ) -> Result<(WsStream, String)> {
         let task_id = Uuid::new_v4().simple().to_string();
         let mut stream = ws::connect_authenticated(api_key, ws_url).await?;
+
+        let mut parameters = json!({
+            "format": "pcm",
+            "sample_rate": 16000,
+            "vad_model": ASR_VAD_MODEL,
+            // 心跳：长时间只有静音音频时保持会话不被服务端超时断开
+            "heartbeat": true
+        });
+        if !language_hints.is_empty() {
+            parameters["language_hints"] = json!(language_hints);
+        }
 
         let run_task_payload = json!({
             "header": {
@@ -126,13 +158,7 @@ impl QwenAsrClient {
                 "task": "asr",
                 "function": "recognition",
                 "model": model,
-                "parameters": {
-                    "format": "pcm",
-                    "sample_rate": 16000,
-                    "vad_model": ASR_VAD_MODEL,
-                    // 心跳：长时间只有静音音频时保持会话不被服务端超时断开
-                    "heartbeat": true
-                },
+                "parameters": parameters,
                 "input": {}
             }
         });
@@ -295,8 +321,13 @@ impl ReconnectingSession for QwenAsrClient {
         is_running: &'a AtomicBool,
     ) -> Pin<Box<dyn Future<Output = Result<SessionEnd>> + Send + 'a>> {
         Box::pin(async move {
-            let (ws_stream, task_id) =
-                Self::connect_and_start(&state.api_key, &state.model, &state.ws_url).await?;
+            let (ws_stream, task_id) = Self::connect_and_start(
+                &state.api_key,
+                &state.model,
+                &state.ws_url,
+                &state.language_hints,
+            )
+            .await?;
             Ok(Self::pump_session(ws_stream, &task_id, state, is_running).await)
         })
     }
@@ -397,6 +428,7 @@ mod tests {
             "sk-test".to_string(),
             "qwen-audio-3.1-asr-flash-streaming".to_string(),
             ws_url,
+            vec!["zh".to_string()],
             None,
             rx_audio,
             tx_events,
@@ -469,6 +501,7 @@ mod tests {
             "sk-test".to_string(),
             "qwen-audio-3.1-asr-flash-streaming".to_string(),
             ws_url,
+            vec!["zh".to_string()],
             Some(gate),
             rx_audio,
             tx_events,
@@ -505,6 +538,63 @@ mod tests {
         );
         assert_eq!(received[4].0, 3200, "pre-roll 应与采集 chunk 等长");
         assert!(!received[5].1, "起音后应发送真实语音而不是静音");
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
+    }
+
+    /// run-task 里应带上配置的语言提示，且填充 ASR API 时截断到最多 4 个。
+    #[tokio::test]
+    async fn sends_language_hints_truncated_to_api_limit() {
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let _ = tx.send(value);
+            }
+            let _ = ws.next().await;
+        });
+
+        let (_tx_audio, rx_audio) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_events, _rx_events) = tokio::sync::mpsc::channel(8);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let client = tokio::spawn(QwenAsrClient::run_duplex(
+            "sk-test".to_string(),
+            "qwen-audio-3.1-asr-flash-streaming".to_string(),
+            format!("ws://{addr}/api-ws/v1/inference"),
+            vec![
+                "zh".to_string(),
+                "ja".to_string(),
+                "en".to_string(),
+                "ko".to_string(),
+                "fr".to_string(),
+            ],
+            None,
+            rx_audio,
+            tx_events,
+            is_running.clone(),
+        ));
+
+        let value = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("应收到 run-task")
+            .expect("run-task 解析失败");
+        assert_eq!(
+            value["payload"]["parameters"]["language_hints"],
+            json!(["zh", "ja", "en", "ko"]),
+            "language_hints 应截断到 4 个"
+        );
 
         is_running.store(false, Ordering::SeqCst);
         client.abort();

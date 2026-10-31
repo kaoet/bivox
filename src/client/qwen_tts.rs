@@ -19,21 +19,26 @@ use uuid::Uuid;
 
 use crate::audio::playback::AudioPlaybackHandle;
 use crate::client::ws::{self, ReconnectingSession, SessionEnd, WsRead, WsWrite};
+use crate::language;
 
 #[derive(Debug, Clone)]
 pub struct QwenTtsConfig {
     pub api_key: String,
     pub tts_model: String,
-    pub voice: String,
     /// 业务空间专属域名的 run-task 端点，
     /// 形如 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`
     pub ws_url: String,
 }
 
+/// 一个待合成的文本切片；`voice`/`language` 由上游按"本句语言"解析好。
 #[derive(Clone)]
 pub struct TtsChunkRequest {
     pub text: String,
     pub is_sentence_end: bool,
+    /// 本句使用的百炼 voice（系统音色名、复刻 voice_id 等）。
+    pub voice: String,
+    /// 本句语言（ASR 语言代码），用于合成的 `language_hints` / `instruction`。
+    pub language: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +169,21 @@ impl QwenTtsClient {
             // ===== 每个句子一个 task：run-task -> continue-task* -> finish-task =====
             let task_id = Uuid::new_v4().simple().to_string();
 
+            // 本句 task 的 voice / 语言在此固定；同句后续 chunk 共享
+            let mut parameters = json!({
+                "text_type": "PlainText",
+                "format": "pcm",
+                "sample_rate": 22050,
+                "voice": &first_chunk.voice,
+                "language_hints": [language::tts_language_hint(&first_chunk.language)],
+                "volume": 50,
+                "rate": 1.0,
+                "pitch": 1.0
+            });
+            if let Some(instruction) = language::instruction_for(&first_chunk.language) {
+                parameters["instruction"] = json!(instruction);
+            }
+
             let run_task_payload = json!({
                 "header": {
                     "action": "run-task",
@@ -175,15 +195,7 @@ impl QwenTtsClient {
                     "task": "tts",
                     "function": "SpeechSynthesizer",
                     "model": &state.config.tts_model,
-                    "parameters": {
-                        "text_type": "PlainText",
-                        "format": "pcm",
-                        "sample_rate": 22050,
-                        "voice": &state.config.voice,
-                        "volume": 50,
-                        "rate": 1.0,
-                        "pitch": 1.0
-                    },
+                    "parameters": parameters,
                     "input": {}
                 }
             });
@@ -472,7 +484,6 @@ mod tests {
         let config = QwenTtsConfig {
             api_key: "sk-test".to_string(),
             tts_model: "qwen-tts-test".to_string(),
-            voice: "test-voice".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
         };
 
@@ -487,6 +498,8 @@ mod tests {
             .send(TtsChunkRequest {
                 text: "第一句。".to_string(),
                 is_sentence_end: true,
+                voice: "test-voice".to_string(),
+                language: "zh".to_string(),
             })
             .await
             .unwrap();
@@ -494,6 +507,8 @@ mod tests {
             .send(TtsChunkRequest {
                 text: "第二句。".to_string(),
                 is_sentence_end: true,
+                voice: "test-voice".to_string(),
+                language: "zh".to_string(),
             })
             .await
             .unwrap();
@@ -579,7 +594,6 @@ mod tests {
         let config = QwenTtsConfig {
             api_key: "sk-test".to_string(),
             tts_model: "qwen-tts-test".to_string(),
-            voice: "test-voice".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
         };
 
@@ -594,6 +608,8 @@ mod tests {
             .send(TtsChunkRequest {
                 text: "第一句。".to_string(),
                 is_sentence_end: true,
+                voice: "test-voice".to_string(),
+                language: "zh".to_string(),
             })
             .await
             .unwrap();
@@ -611,6 +627,90 @@ mod tests {
             "重连后应完成合成并收到音频"
         );
         assert!(!client.is_finished());
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
+    }
+
+    /// 每个句子的 run-task 都应带本句解析出的 voice / language_hints / instruction。
+    #[tokio::test]
+    async fn sends_voice_and_language_params_per_task() {
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            let mut pending = None;
+            let mut tx = Some(tx);
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    match value["header"]["action"].as_str() {
+                        Some("run-task") => {
+                            pending = Some(value);
+                            let started =
+                                json!({ "header": { "event": "task-started" }, "payload": {} });
+                            ws.send(Message::Text(started.to_string())).await.unwrap();
+                        }
+                        Some("finish-task") => {
+                            if let Some(value) = pending.take() {
+                                if let Some(tx) = tx.take() {
+                                    let _ = tx.send(value);
+                                }
+                            }
+                            ws.send(Message::Binary(vec![1, 0, 2, 0])).await.unwrap();
+                            let finished =
+                                json!({ "header": { "event": "task-finished" }, "payload": {} });
+                            ws.send(Message::Text(finished.to_string())).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let (tx_chunks, rx_chunks) = tokio::sync::mpsc::channel(8);
+        let playback = AudioPlaybackHandle::for_test();
+        let is_running = Arc::new(AtomicBool::new(true));
+        let config = QwenTtsConfig {
+            api_key: "sk-test".to_string(),
+            tts_model: "qwen-tts-test".to_string(),
+            ws_url: format!("ws://{addr}/api-ws/v1/inference"),
+        };
+
+        let client = tokio::spawn(QwenTtsClient::run_duplex(
+            config,
+            rx_chunks,
+            playback,
+            is_running.clone(),
+        ));
+
+        tx_chunks
+            .send(TtsChunkRequest {
+                text: "こんにちは。".to_string(),
+                is_sentence_end: true,
+                voice: "custom-ja-voice".to_string(),
+                language: "ja".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let value = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("应收到 run-task")
+            .expect("run-task 解析失败");
+        let parameters = &value["payload"]["parameters"];
+        assert_eq!(parameters["voice"], "custom-ja-voice");
+        assert_eq!(parameters["language_hints"], json!(["ja"]));
+        assert_eq!(parameters["instruction"], "请讲日语。");
 
         is_running.store(false, Ordering::SeqCst);
         client.abort();

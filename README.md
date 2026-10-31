@@ -26,7 +26,7 @@ cp config.example.toml config.toml     # Windows: copy config.example.toml confi
 key = "sk-your-dashscope-api-key-here"
 ```
 
-`config.toml` 已被 `.gitignore` 忽略，不会被提交。所有配置项都有默认值，未写出的字段使用内置默认值，完整字段见 [`config.example.toml`](config.example.toml)：
+`config.toml` 已被 `.gitignore` 忽略，不会被提交。所有配置项都有默认值，完整字段见 [`config.example.toml`](config.example.toml)：
 
 ```toml
 [api]
@@ -35,10 +35,22 @@ key = "sk-..."
 
 [asr]
 # model = "qwen-audio-3.1-asr-flash-streaming"
+# languages = ["zh"]          # 用户可能说的语言（有序，首个为默认）
 
 [tts]
 # model = "qwen-audio-3.1-tts-flash"
-# voice = "qiaoxiaojiao_v3.1"
+# voice = "qiaoxiaojiao_v3.1" # 系统音色 / voice_id / custom:<配置名>
+# cache_file = "voice_cache.json"
+
+# 自定义音色（可选，多语言声线样本）
+# [tts.custom_voices.edgar]
+# name = "异环 - 埃德嘉"
+# [[tts.custom_voices.edgar.samples]]
+# language = "zh"
+# audio = "samples/edgar-zh.wav"
+# [[tts.custom_voices.edgar.samples]]
+# language = "ja"
+# audio = "samples/edgar-ja.wav"
 
 [audio]
 # input_device = "Microphone"
@@ -73,29 +85,31 @@ cargo run --release -- -c path/to/config.toml
 cargo run --release
 ```
 
-如果控制台开通了业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`，百炼建议华北2 / 新加坡等地域使用），可在 `config.toml` 中覆盖：
+如果控制台开通了业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），可在 `config.toml` 中覆盖：
 
 ```toml
 [api]
 workspace_host = "ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com"
 ```
 
-`workspace_host` 只填写纯 host，不要带 `wss://` 前缀、路径或端口；格式不规范时程序会在启动阶段直接报错。
+`workspace_host` 只填写纯 host，不要带 `wss://` 前缀、路径或端口；格式不规范时程序会在启动阶段直接报错。语音识别/合成的 WebSocket 连接与音色管理的 HTTP 接口都使用这个域名。
 
-> ASR 固定使用近场 VAD 模型（`vad_model=near_meeting_16k`），适配"识别自己麦克风近讲"的使用场景。
+> ASR 固定使用近场 VAD 模型（`vad_model=near_meeting_16k`），适配“识别自己麦克风近讲”的使用场景。
 
 ---
 
 ### 3. 常用运行命令
 
-#### 默认启动（使用系统默认麦克风与扬声器，预置音色）：
+#### 默认启动（使用系统默认麦克风与扬声器）：
 ```bash
 cargo run --release
+# 等价于显式指定默认子命令
+cargo run --release -- run
 ```
 
 #### 查看系统中所有可用音频设备（输入与输出，无需配置文件）：
 ```bash
-cargo run -- --list-devices
+cargo run -- devices
 ```
 
 #### 指定特定麦克风与虚拟声卡（输出到 VRChat）：
@@ -107,20 +121,7 @@ output_device = "CABLE Input"
 
 设备名称支持模糊匹配（不区分大小写）；留空或不写表示系统默认设备。
 
-#### 指定识别模型或合成音色：
-```toml
-[asr]
-model = "qwen-audio-3.1-asr-flash-streaming"
-
-[tts]
-model = "qwen-audio-3.1-tts-flash"
-voice = "qiaoxiaojiao_v3.1"   # 系统音色；也可填同模型下复刻/设计音色的 voice_id
-```
-
 #### 本地 VAD（默认开启，节省 ASR 费用）：
-
-默认启用本地 VAD：只上传语音段，静音不上传；
-静音期每 10 秒补 100ms 静音保活，句末自动补 ~1s 静音以触发服务端断句。
 
 ```toml
 [vad]
@@ -140,12 +141,156 @@ tail_ms = 1000
 
 ---
 
-## 命令行参数
+## 多语言识别与声线
 
-业务配置全部来自 `config.toml`，命令行只保留两个入口：
+### 1. `[asr] languages`：用户可能说的语言
 
-| 参数 | 说明 |
-|---|---|
-| `-c, --config <path>` | 指定 TOML 配置文件路径（默认 `./config.toml`） |
-| `--list-devices` | 列出所有可用音频输入/输出设备后退出（不读取配置文件） |
-| `-h, --help` | 查看帮助 |
+```toml
+[asr]
+languages = ["zh", "ja", "en"]
+```
+
+- 有序列表，**首个元素是默认语言**（没有“上一句”时的语言）；
+- 只写一个元素（如 `["ja"]`）相当于强提示只按该语言识别；
+- 程序对 ASR 文本做本地语言判定，判定范围始终是**完整列表**；
+- 传给 ASR API 的 `language_hints` 最多 4 个（官方限制），超出会截断并打印一次警告；
+  截断只影响 API 提示，不影响本地判定的完整范围。
+
+### 2. 语言判定规则（不等待整句、不回溯）
+
+每个 TTS task（约等于一个 ASR 句子）在首个 chunk 送出前判定一次，之后整句沿用：
+
+- 出现**假名** → 日语；出现**谚文** → 韩语（这两类字符不会被中文/英文使用，属于强证据）；
+- **纯汉字句**：当前是日语且汉字数 ≥ 6 且无假名 → 切回中文；更短的汉字句保持当前语言（粘性）；
+- **拉丁字母**必须"占多数"（`拉丁数 ≥ 2` 且多于汉字）才算证据：`我找不到我的 U盘了` 不会被误判为英语；
+- 文本太短（< 2 个文字）或证据不足 → 沿用当前语言；
+- 判定结果不在 `languages` 列表中 → 落到 `languages[0]`；
+- 不等待整句、不额外调用语言识别模型；因此句尾才出现决定性字符时可能错判一句，下一句自动纠正。
+
+自动判定的脚本覆盖范围：
+
+- 中日韩：假名 / 谚文 / 汉字（规则如上）；
+- 拉丁字母语系：**无法区分具体语种**，归一到 `languages` 中出现的第一个拉丁语言（如 `["zh","en"]` 下识别为 en）；
+- 其它可映射脚本：西里尔→`ru`、阿拉伯→`ar`、泰文→`th`、希腊→`el`、天城文→`hi`；
+- 其它未覆盖文字 → 落到 `languages[0]`。
+
+### 3. 合成语言参数
+
+每个 TTS 句子的 `run-task` 都会带：
+
+- `language_hints`: 本句判定出的语言（官方说明：合成目标语言，与复刻样本语种无关）；
+- `instruction`: 有内置映射的非中英语种自动附带（ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar，如 `请讲日语。`）；
+  中英文不需要；其它 ASR-only 语种（nl/sv/no/hi/el 等）`language_hints` 使用 `other`、不附 instruction。
+
+---
+
+## 自定义音色（声音复刻，多语言声线）
+
+无需在百炼控制台手动上传音频：在配置文件中声明每个语言的样本，程序会自动上传、复刻、缓存。
+
+### 1. 配置
+
+```toml
+[tts]
+model = "qwen-audio-3.1-tts-flash"
+voice = "custom:edgar"
+# cache_file = "voice_cache.json"
+
+# 先定义父表，再写 samples 数组表
+[tts.custom_voices.edgar]
+name = "异环 - 埃德嘉"
+
+[[tts.custom_voices.edgar.samples]]
+language = "zh"
+audio = "samples/edgar-zh.wav"
+
+[[tts.custom_voices.edgar.samples]]
+language = "ja"
+audio = "samples/edgar-ja.wav"
+```
+
+- `samples` 是**有序数组**，`samples[0]` 是默认声线样本；
+- 每个样本都会按（`[tts] model`, 音频内容）单独复刻一个 voice_id；
+- 合成时：本句语言有对应样本 → 用该语言声线；没有 → 回退 `samples[0]`；
+- 三种常见来源都适用：
+  1. 同一个人多种语言录音（各自复刻，声线一致、母语发音更好）；
+  2. 游戏角色不同语言由不同配音演员录制（各语言用各自配音声线）；
+  3. 只有一种语言的网络样本（其它语言回退到该声线，合成时仍按目标语言发音，"凑合可用"）；
+- 音频要求：清晰单说话人、至少约 5 秒（推荐 10~20 秒，单条建议不超过 60 秒，≤10 MB）、wav/mp3/m4a；
+- 前缀：只由**配置键名**自动生成（去掉非字母数字、转小写；多语言追加语言代码，如 `edgarzh`/`edgarja`，≤10 字符）；建议键名使用 ASCII 小写字母/数字（非 ASCII 键名净化后可能为空，回退 `voice` 或只剩语言代码）。
+
+### 2. 首次使用
+
+启动程序（或执行 `kaols voices enroll`）时，对每个语言样本：
+
+1. 读取样例音频并计算内容指纹（SHA256）；
+2. 上传到百炼文件服务（`purpose=inference`）并换取临时下载 URL；
+3. 调用音色复刻接口创建音色，轮询到部署完成；
+4. 把 `模型 + 音频指纹 -> voice_id` 写入 `voice_cache.json`，清理临时文件。
+
+多个语言样本会**并行注册**（首次约十几秒到几十秒）；之后启动只读一次音频并逐样本
+`query_voice` 校验，**不会重复上传或复刻**。缓存命中后若云端音色被删除会自动重建；
+校验请求失败（网络抖动）时继续信任缓存。
+
+### 3. 缓存文件
+
+- 默认位置：与 `config.toml` 同目录的 `voice_cache.json`（已被 `.gitignore` 忽略）；
+- 按「TTS 模型 → 样例音频 SHA256」两层组织；每种语言样本因音频不同天然独立缓存；
+- 切换模型时为该模型单独复刻并缓存，不影响其它模型记录。
+
+### 4. 管理账号下的自定义音色
+
+```bash
+# 列出百炼账号下全部自定义音色（交叉显示本地缓存的音色名/语言/音频）
+cargo run --release -- voices list
+
+# 删除指定百炼原生 voice_id
+cargo run --release -- voices delete --voice-id qwen-audio-3.1-tts-flash-edgarzh-xxxx
+
+# 删除某个音色配置下的全部语言声线
+cargo run --release -- voices delete --voice edgar
+
+# 只删除某个音色的指定语言声线
+cargo run --release -- voices delete --voice edgar --language ja
+
+# 删除账号下全部自定义音色（交互确认；-y 跳过）
+cargo run --release -- voices delete-all
+cargo run --release -- voices delete-all -y
+
+# 立即上传并注册配置里的自定义音色（可指定音色名 / 语言）
+cargo run --release -- voices enroll
+cargo run --release -- voices enroll edgar --language ja
+```
+
+- 多目标删除（`--voice` 命中多个语言）默认需要交互确认，`-y` 跳过；
+- 删除后会同步清理对应的本地缓存记录；
+- `voices list` 会清理“云端已删除”的缓存记录（列表不完整时跳过，避免误删）。
+
+> ⚠️ `delete-all` 会删除该百炼账号下**全部**自定义音色（包括其它工具创建的），请确认后再执行。
+
+---
+
+## 命令行
+
+不写子命令时默认进入运行模式（等价于 `kaols run`）：
+
+```bash
+kaols                       # 运行实时识别 -> 合成
+kaols -c other.toml         # 指定配置文件运行
+kaols run -c other.toml
+kaols devices               # 列出音频设备后退出（无需配置文件）
+kaols voices list           # 自定义音色管理
+kaols voices delete --voice-id <id>
+kaols voices delete --voice <配置名> [--language <code>] [-y]
+kaols voices delete-all [-y]
+kaols voices enroll [配置名] [--language <code>]
+kaols --help                # 查看全部子命令
+kaols voices --help
+```
+
+`-c/--config <path>` 是全局参数，任何子命令都可以用来指定配置文件（默认 `./config.toml`）。
+
+> 语言代码一览：
+> - 复刻样本 / 合成完整支持：`zh/en/ja/ko/fr/de/ru/pt/th/id/vi/es/it/ms/fil/ar`；
+> - `[asr] languages` 还可用：`tl hi nl sv da fi no el pl cs hu ro bg hr sk`（以官方文档为准）；
+> - ASR 的菲律宾语代码是 `tl`、复刻是 `fil`，程序内部会自动归一。
