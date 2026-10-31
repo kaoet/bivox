@@ -10,6 +10,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
+use crate::audio::vad::SpeechGate;
 use crate::client::ws::{self, AudioStreamState, ReconnectingSession, SessionEnd, WsStream};
 use crate::client::TranslationEvent;
 
@@ -57,12 +58,18 @@ pub(crate) struct AsrRuntime {
     model: String,
     ws_url: String,
     io: AudioStreamState,
+    /// 本地 VAD 发送门控；None 表示关闭（全量上传）
+    gate: Option<SpeechGate>,
 }
 
 impl ws::SessionState for AsrRuntime {
     fn before_reconnect(&mut self) {
         // 丢弃断连期间积压的音频，并通知下游 chunker 丢弃半句上下文
         self.io.drain_and_reset();
+        // 音频时间线已断，门控的起音/尾部状态也要重置（保留噪声底估计）
+        if let Some(gate) = &mut self.gate {
+            gate.reset_transient();
+        }
     }
 }
 
@@ -73,12 +80,15 @@ impl QwenAsrClient {
     ///
     /// 断线重连、退避与握手超时统一由 [`ws::run_with_reconnect`] 处理。
     ///
+    /// `gate` 为本地 VAD 发送门控（None 表示关闭、全量上传）。
+    ///
     /// `ws_url` 为百炼业务空间专属域名的 run-task 端点，
     /// 形如 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`。
     pub async fn run_duplex(
         api_key: String,
         model: String,
         ws_url: String,
+        gate: Option<SpeechGate>,
         rx_audio: Receiver<Vec<u8>>,
         tx_events: Sender<TranslationEvent>,
         is_running: Arc<AtomicBool>,
@@ -91,6 +101,7 @@ impl QwenAsrClient {
                 rx_audio,
                 tx_events,
             },
+            gate,
         };
         ws::run_with_reconnect::<Self>("Qwen ASR", &is_running, &mut state).await
     }
@@ -156,10 +167,15 @@ impl QwenAsrClient {
     async fn pump_session(
         ws_stream: WsStream,
         task_id: &str,
-        io: &mut AudioStreamState,
+        state: &mut AsrRuntime,
         is_running: &AtomicBool,
     ) -> SessionEnd {
         let (mut write, mut read) = ws_stream.split();
+        let AudioStreamState {
+            rx_audio,
+            tx_events,
+        } = &mut state.io;
+        let gate = &mut state.gate;
         let mut audio_closed = false;
 
         loop {
@@ -169,12 +185,18 @@ impl QwenAsrClient {
             }
 
             tokio::select! {
-                // 持续上传麦克风 16kHz PCM16 二进制流
-                maybe_chunk = io.rx_audio.recv(), if !audio_closed => {
+                // 持续上传麦克风 16kHz PCM16 二进制流（经过本地 VAD 门控）
+                maybe_chunk = rx_audio.recv(), if !audio_closed => {
                     match maybe_chunk {
                         Some(pcm_chunk) => {
-                            if let Err(e) = write.send(Message::Binary(pcm_chunk)).await {
-                                return SessionEnd::Disconnected(format!("发送音频失败: {:?}", e));
+                            let chunks: Vec<Vec<u8>> = match gate.as_mut() {
+                                Some(gate) => gate.process_chunk(pcm_chunk),
+                                None => vec![pcm_chunk],
+                            };
+                            for chunk in chunks {
+                                if let Err(e) = write.send(Message::Binary(chunk)).await {
+                                    return SessionEnd::Disconnected(format!("发送音频失败: {:?}", e));
+                                }
                             }
                         }
                         None => {
@@ -207,7 +229,7 @@ impl QwenAsrClient {
                                     }
 
                                     // 纯转写模式下，翻译字段直接回填识别文本，直接送入下游分块与 TTS
-                                    let _ = io.tx_events
+                                    let _ = tx_events
                                         .send(TranslationEvent {
                                             transcription: sentence.text.clone(),
                                             translation: sentence.text,
@@ -276,7 +298,7 @@ impl ReconnectingSession for QwenAsrClient {
         Box::pin(async move {
             let (ws_stream, task_id) =
                 Self::connect_and_start(&state.api_key, &state.model, &state.ws_url).await?;
-            Ok(Self::pump_session(ws_stream, &task_id, &mut state.io, is_running).await)
+            Ok(Self::pump_session(ws_stream, &task_id, state, is_running).await)
         })
     }
 }
@@ -376,6 +398,7 @@ mod tests {
             "sk-test".to_string(),
             "qwen-audio-3.1-asr-flash-streaming".to_string(),
             ws_url,
+            None,
             rx_audio,
             tx_events,
             is_running.clone(),
@@ -389,6 +412,100 @@ mod tests {
             "应至少重连一次，实际建连 {} 次",
             attempts.load(Ordering::SeqCst)
         );
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
+    }
+
+    /// 本地 VAD 门控接入 ASR 后：静音只发保活、起音补 pre-roll、语音段原样发送
+    #[tokio::test]
+    async fn gates_silence_and_sends_pre_roll_on_speech() {
+        use crate::audio::vad::{GateConfig, SpeechGate, VadConfig};
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // (长度, 是否全零)
+        let received = Arc::new(Mutex::new(Vec::<(usize, bool)>::new()));
+        let received_server = received.clone();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            // 读 run-task，回 task-started
+            let _ = ws.next().await;
+            let started = json!({ "header": { "event": "task-started" }, "payload": {} });
+            ws.send(Message::Text(started.to_string())).await.unwrap();
+
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Binary(bytes) = msg {
+                    received_server
+                        .lock()
+                        .unwrap()
+                        .push((bytes.len(), bytes.iter().all(|byte| *byte == 0)));
+                }
+            }
+        });
+
+        let (tx_audio, rx_audio) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx_events, _rx_events) = tokio::sync::mpsc::channel(8);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let gate = SpeechGate::new(GateConfig {
+            vad: VadConfig {
+                hangover_ms: 100,
+                ..Default::default()
+            },
+            pre_roll_ms: 100,
+            tail_ms: 200,
+            keepalive_ms: 500,
+            debug: false,
+        });
+
+        let ws_url = format!("ws://{}/api-ws/v1/inference", addr);
+        let client = tokio::spawn(QwenAsrClient::run_duplex(
+            "sk-test".to_string(),
+            "qwen-audio-3.1-asr-flash-streaming".to_string(),
+            ws_url,
+            Some(gate),
+            rx_audio,
+            tx_events,
+            is_running.clone(),
+        ));
+
+        // 20 个 100ms 静音 chunk：500ms 保活间隔 → 只应发 4 个零静音
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..20 {
+            tx_audio.send(vec![0u8; 3200]).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 一个 100ms 语音 chunk：起音 → 补发 pre-roll（上一个静音）+ 语音
+        let mut tone = Vec::with_capacity(3200);
+        for i in 0..1600 {
+            let phase = 2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0;
+            let sample = (phase.sin() * 3000.0) as i16;
+            tone.extend_from_slice(&sample.to_le_bytes());
+        }
+        tx_audio.send(tone).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let received = received.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            6,
+            "20 个静音 chunk 应只有 4 个保活，加语音起音的 pre-roll+语音共 6 个，实际 {:?}",
+            received
+        );
+        assert!(
+            received[0..4].iter().all(|(_, zero)| *zero),
+            "保活应为零静音"
+        );
+        assert_eq!(received[4].0, 3200, "pre-roll 应与采集 chunk 等长");
+        assert!(!received[5].1, "起音后应发送真实语音而不是静音");
 
         is_running.store(false, Ordering::SeqCst);
         client.abort();

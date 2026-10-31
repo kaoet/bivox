@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use crate::audio::capture::AudioCapture;
 use crate::audio::device::AudioDeviceManager;
 use crate::audio::playback::AudioPlaybackEngine;
+use crate::audio::vad;
 use crate::client::cosyvoice::{CosyVoiceClient, CosyVoiceConfig, TtsChunkRequest};
 use crate::client::qwen_asr::QwenAsrClient;
 use crate::client::qwen_realtime::{QwenRealtimeClient, LIVETRANSLATE_REALTIME_MODEL};
@@ -62,6 +63,20 @@ impl PipelineOrchestrator {
                 "🧠 识别模型: {}",
                 format!("Qwen Audio ({})", self.config.asr_model).yellow()
             );
+            if self.config.no_vad {
+                println!("🎚️ 本地 VAD: {}", "关闭（全量上传）".yellow());
+            } else {
+                println!(
+                    "🎚️ 本地 VAD: {}",
+                    format!(
+                        "开启（margin={}dB, hangover={}ms, tail={}ms, keepalive=10s）",
+                        self.config.vad_margin_db,
+                        self.config.vad_hangover_ms,
+                        self.config.vad_tail_ms
+                    )
+                    .yellow()
+                );
+            }
         } else {
             println!(
                 "🌐 语言方向: {} -> {}",
@@ -107,11 +122,26 @@ impl PipelineOrchestrator {
         if self.config.no_translate {
             let asr_model = self.config.asr_model.clone();
             let asr_ws_url = inference_ws_url.clone();
+            let asr_gate = if self.config.no_vad {
+                None
+            } else {
+                Some(vad::SpeechGate::new(vad::GateConfig {
+                    vad: vad::VadConfig {
+                        margin_db: self.config.vad_margin_db,
+                        hangover_ms: self.config.vad_hangover_ms,
+                        ..Default::default()
+                    },
+                    tail_ms: self.config.vad_tail_ms,
+                    debug: self.config.vad_debug,
+                    ..Default::default()
+                }))
+            };
             tokio::spawn(async move {
                 if let Err(e) = QwenAsrClient::run_duplex(
                     engine_key,
                     asr_model,
                     asr_ws_url,
+                    asr_gate,
                     rx_mic,
                     tx_events,
                     engine_running,

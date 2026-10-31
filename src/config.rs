@@ -81,6 +81,26 @@ pub struct AppConfig {
     #[arg(long)]
     pub list_devices: bool,
 
+    /// 关闭本地 VAD 门控（默认开启：静音不上传，只发保活/尾部静音以节省 ASR 费用）
+    #[arg(long)]
+    pub no_vad: bool,
+
+    /// 本地 VAD 起音阈值：噪声底 + 该 dB 值
+    #[arg(long, default_value_t = 9.0)]
+    pub vad_margin_db: f32,
+
+    /// 本地 VAD 语音结束后的拖尾保持时长（毫秒）
+    #[arg(long, default_value_t = 500)]
+    pub vad_hangover_ms: u32,
+
+    /// 语音结束后补发的尾部静音时长（毫秒），用于触发服务端 sentence_end
+    #[arg(long, default_value_t = 1000)]
+    pub vad_tail_ms: u32,
+
+    /// 打印每个 chunk 的 VAD 电平/阈值/发送决策（用于现场标定阈值）
+    #[arg(long)]
+    pub vad_debug: bool,
+
     /// Word threshold for speculative chunking (default 6)
     #[arg(long, default_value_t = 6)]
     pub chunk_words: usize,

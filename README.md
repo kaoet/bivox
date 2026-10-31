@@ -83,3 +83,24 @@ cargo run --release -- --no-translate
 cargo run --release -- --no-translate --asr-model qwen-audio-3.1-asr-flash-streaming --voice longxiaochun
 ```
 
+#### 本地 VAD（默认开启，节省 ASR 费用）：
+
+`--no-translate` 模式下默认启用本地 VAD：只上传语音段，静音不上传；
+静音期每 10 秒补 100ms 静音保活，句末自动补 ~1s 静音以触发服务端断句。
+
+```bash
+# 默认（VAD 开启）
+cargo run --release -- --no-translate
+
+# 关闭 VAD（全量上传，便于对比 / 排查）
+cargo run --release -- --no-translate --no-vad
+
+# 打印每个 100ms chunk 的电平、噪声底、阈值与发送决策，用于现场标定
+cargo run --release -- --no-translate --vad-debug
+
+# 可调参数：起音阈值 = 噪声底 + margin dB；hangover = 语音结束拖尾；tail = 句末静音
+cargo run --release -- --no-translate --vad-margin-db 9 --vad-hangover-ms 500 --vad-tail-ms 1000
+```
+
+调参提示：安静说话被切掉时降低 `--vad-margin-db`（如 6）；键盘/环境噪声频繁触发时提高它（如 12）。
+
