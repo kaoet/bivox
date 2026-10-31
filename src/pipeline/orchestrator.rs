@@ -11,7 +11,6 @@ use crate::audio::playback::AudioPlaybackEngine;
 use crate::audio::vad;
 use crate::client::cosyvoice::{CosyVoiceClient, CosyVoiceConfig, TtsChunkRequest};
 use crate::client::qwen_asr::QwenAsrClient;
-use crate::client::qwen_realtime::{QwenRealtimeClient, LIVETRANSLATE_REALTIME_MODEL};
 use crate::config::AppConfig;
 use crate::pipeline::chunker::TextChunker;
 
@@ -48,44 +47,27 @@ impl PipelineOrchestrator {
         );
         println!(
             "{}",
-            "🚀 超低延迟流式同传与语音合成 MVP (Rust + 百炼)"
+            "🚀 超低延迟流式语音识别与语音合成 (Rust + 百炼)"
                 .bold()
                 .green()
         );
         println!("🎤 输入设备: {}", in_dev_name.cyan());
         println!("🔊 输出设备: {}", out_dev_name.cyan());
-        if self.config.no_translate {
-            println!(
-                "🌐 运行模式: {}",
-                "纯语音识别转文字 -> 语音合成 (关闭翻译)".yellow()
-            );
-            println!(
-                "🧠 识别模型: {}",
-                format!("Qwen Audio ({})", self.config.asr_model).yellow()
-            );
-            if self.config.no_vad {
-                println!("🎚️ 本地 VAD: {}", "关闭（全量上传）".yellow());
-            } else {
-                println!(
-                    "🎚️ 本地 VAD: {}",
-                    format!(
-                        "开启（margin={}dB, hangover={}ms, tail={}ms, keepalive=10s）",
-                        self.config.vad_margin_db,
-                        self.config.vad_hangover_ms,
-                        self.config.vad_tail_ms
-                    )
-                    .yellow()
-                );
-            }
+        println!("🌐 运行模式: {}", "语音识别转文字 -> 语音合成".yellow());
+        println!(
+            "🧠 识别模型: {}",
+            format!("Qwen Audio ({})", self.config.asr_model).yellow()
+        );
+        if self.config.no_vad {
+            println!("🎚️ 本地 VAD: {}", "关闭（全量上传）".yellow());
         } else {
             println!(
-                "🌐 语言方向: {} -> {}",
-                self.config.source_lang.yellow(),
-                self.config.target_lang.yellow()
-            );
-            println!(
-                "🧠 同传模型: {}",
-                format!("Qwen ({})", LIVETRANSLATE_REALTIME_MODEL).yellow()
+                "🎚️ 本地 VAD: {}",
+                format!(
+                    "开启（margin={}dB, hangover={}ms, tail={}ms, keepalive=10s）",
+                    self.config.vad_margin_db, self.config.vad_hangover_ms, self.config.vad_tail_ms
+                )
+                .yellow()
             );
         }
         println!("🤖 合成模型: {}", self.config.tts_model.yellow());
@@ -111,62 +93,43 @@ impl PipelineOrchestrator {
         let (tx_mic, rx_mic) = mpsc::channel::<Vec<u8>>(100);
         let _capture = AudioCapture::start(&in_dev, tx_mic)?;
 
-        // 3. 初始化识别/同传客户端
+        // 3. 初始化语音识别客户端（本地 VAD 门控可选）
         let (tx_events, mut rx_events) = mpsc::channel(100);
         let engine_key = api_key.clone();
-        let tgt_lang = self.config.target_lang.clone();
         let engine_running = is_running.clone();
         let inference_ws_url = self.config.inference_ws_url();
-        let realtime_ws_url = self.config.realtime_ws_url(LIVETRANSLATE_REALTIME_MODEL);
-
-        if self.config.no_translate {
-            let asr_model = self.config.asr_model.clone();
-            let asr_ws_url = inference_ws_url.clone();
-            let asr_gate = if self.config.no_vad {
-                None
-            } else {
-                Some(vad::SpeechGate::new(vad::GateConfig {
-                    vad: vad::VadConfig {
-                        margin_db: self.config.vad_margin_db,
-                        hangover_ms: self.config.vad_hangover_ms,
-                        ..Default::default()
-                    },
-                    tail_ms: self.config.vad_tail_ms,
-                    debug: self.config.vad_debug,
-                    ..Default::default()
-                }))
-            };
-            tokio::spawn(async move {
-                if let Err(e) = QwenAsrClient::run_duplex(
-                    engine_key,
-                    asr_model,
-                    asr_ws_url,
-                    asr_gate,
-                    rx_mic,
-                    tx_events,
-                    engine_running,
-                )
-                .await
-                {
-                    eprintln!("Qwen ASR 运行异常: {:?}", e);
-                }
-            });
+        let asr_model = self.config.asr_model.clone();
+        let asr_ws_url = inference_ws_url.clone();
+        let asr_gate = if self.config.no_vad {
+            None
         } else {
-            tokio::spawn(async move {
-                if let Err(e) = QwenRealtimeClient::run_duplex(
-                    engine_key,
-                    realtime_ws_url,
-                    tgt_lang,
-                    rx_mic,
-                    tx_events,
-                    engine_running,
-                )
-                .await
-                {
-                    eprintln!("Qwen LiveTranslate 运行异常: {:?}", e);
-                }
-            });
-        }
+            Some(vad::SpeechGate::new(vad::GateConfig {
+                vad: vad::VadConfig {
+                    margin_db: self.config.vad_margin_db,
+                    hangover_ms: self.config.vad_hangover_ms,
+                    ..Default::default()
+                },
+                tail_ms: self.config.vad_tail_ms,
+                debug: self.config.vad_debug,
+                ..Default::default()
+            }))
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = QwenAsrClient::run_duplex(
+                engine_key,
+                asr_model,
+                asr_ws_url,
+                asr_gate,
+                rx_mic,
+                tx_events,
+                engine_running,
+            )
+            .await
+            {
+                eprintln!("Qwen ASR 运行异常: {:?}", e);
+            }
+        });
 
         // 4. 初始化 CosyVoice 全双工双向异步流式合成服务
         let (tx_tts, rx_tts) = mpsc::channel::<TtsChunkRequest>(100);
@@ -187,11 +150,11 @@ impl PipelineOrchestrator {
             }
         });
 
-        // 5. 调度中枢：接收事件 -> 投机分块 -> 全双工并发推入 CosyVoice 管道
+        // 5. 调度中枢：接收识别事件 -> 流式分块 -> 全双工并发推入 CosyVoice 管道
         let mut chunker = TextChunker::new(self.config.chunk_words);
 
         while let Some(event) = rx_events.recv().await {
-            let chunks = chunker.process_stream(&event.translation, event.is_sentence_end);
+            let chunks = chunker.process_stream(&event.text, event.is_sentence_end);
 
             for chunk in chunks {
                 let req = TtsChunkRequest {

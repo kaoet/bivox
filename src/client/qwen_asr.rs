@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::audio::vad::SpeechGate;
 use crate::client::ws::{self, AudioStreamState, ReconnectingSession, SessionEnd, WsStream};
-use crate::client::TranslationEvent;
+use crate::client::AsrEvent;
 
 /// 近场识别：本项目输入始终为说话人自己的麦克风（耳机/桌面近讲），
 /// 服务端默认远场 vad_model（far_field_meeting_16k）会降低近讲场景的 VAD 灵敏度。
@@ -76,7 +76,7 @@ impl ws::SessionState for AsrRuntime {
 pub struct QwenAsrClient;
 
 impl QwenAsrClient {
-    /// 运行 Qwen Audio 3.1 实时双向流式语音识别（无翻译，直通 ASR -> TTS）。
+    /// 运行 Qwen Audio 3.1 实时双向流式语音识别（直通 ASR -> TTS）。
     ///
     /// 断线重连、退避与握手超时统一由 [`ws::run_with_reconnect`] 处理。
     ///
@@ -90,7 +90,7 @@ impl QwenAsrClient {
         ws_url: String,
         gate: Option<SpeechGate>,
         rx_audio: Receiver<Vec<u8>>,
-        tx_events: Sender<TranslationEvent>,
+        tx_events: Sender<AsrEvent>,
         is_running: Arc<AtomicBool>,
     ) -> Result<()> {
         let mut state = AsrRuntime {
@@ -159,7 +159,7 @@ impl QwenAsrClient {
             bail!("Qwen ASR 握手失败 [{}]: {}", err_code, err_msg);
         }
 
-        println!("✨ Qwen-Audio-3.1 极速语音识别通道已就绪（无翻译纯识别模式）...");
+        println!("✨ Qwen-Audio-3.1 极速语音识别通道已就绪...");
         Ok((stream, task_id))
     }
 
@@ -228,11 +228,10 @@ impl QwenAsrClient {
                                         continue;
                                     }
 
-                                    // 纯转写模式下，翻译字段直接回填识别文本，直接送入下游分块与 TTS
+                                    // 识别文本直接送入下游分块与 TTS
                                     let _ = tx_events
-                                        .send(TranslationEvent {
-                                            transcription: sentence.text.clone(),
-                                            translation: sentence.text,
+                                        .send(AsrEvent {
+                                            text: sentence.text,
                                             is_sentence_end: sentence.sentence_end,
                                         })
                                         .await;

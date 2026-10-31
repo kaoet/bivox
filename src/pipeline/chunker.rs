@@ -17,8 +17,25 @@ const SENTENCE_PUNCTUATION: &[char] = &[
 fn is_cjk_punctuation(c: char) -> bool {
     matches!(
         c,
-        '，' | '。' | '？' | '！' | '；' | '：' | '、' | '…' | '—' | '～'
-            | '“' | '”' | '‘' | '’' | '（' | '）' | '【' | '】' | '《' | '》'
+        '，' | '。'
+            | '？'
+            | '！'
+            | '；'
+            | '：'
+            | '、'
+            | '…'
+            | '—'
+            | '～'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '（'
+            | '）'
+            | '【'
+            | '】'
+            | '《'
+            | '》'
     )
 }
 
@@ -216,15 +233,12 @@ impl TextChunker {
                     let char_count = pending_slice.chars().count();
                     let cjk_threshold = self.chunk_word_threshold * 2;
                     if char_count >= cjk_threshold + self.guard_tail_chars {
-                        if let Some((idx, ch)) =
-                            pending_slice.char_indices().nth(cjk_threshold - 1)
+                        if let Some((idx, ch)) = pending_slice.char_indices().nth(cjk_threshold - 1)
                         {
                             let mut cut_idx = idx + ch.len_utf8();
                             // 避免在中英混排时截断英文单词
                             if ch.is_ascii_alphanumeric() {
-                                for (next_idx, next_ch) in
-                                    pending_slice[cut_idx..].char_indices()
-                                {
+                                for (next_idx, next_ch) in pending_slice[cut_idx..].char_indices() {
                                     if !next_ch.is_ascii_alphanumeric() {
                                         cut_idx += next_idx;
                                         break;

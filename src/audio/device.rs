@@ -28,7 +28,10 @@ impl AudioDeviceManager {
         }
 
         println!("\n=== 可用音频输出设备 (Speakers / Virtual Cables) ===");
-        let default_out = self.host.default_output_device().and_then(|d| d.name().ok());
+        let default_out = self
+            .host
+            .default_output_device()
+            .and_then(|d| d.name().ok());
         for (i, dev) in self.host.output_devices()?.enumerate() {
             let name = dev.name().unwrap_or_else(|_| "Unknown".into());
             let is_default = default_out.as_deref() == Some(&name);

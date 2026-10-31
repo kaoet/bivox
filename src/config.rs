@@ -24,7 +24,7 @@ pub fn normalize_ws_host(raw: &str) -> String {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "kaols",
-    about = "Ultra-low-latency Speech Translation & Synthesis Client (Rust + DashScope)",
+    about = "Ultra-low-latency Speech Recognition & Synthesis Client (Rust + DashScope)",
     version = "0.1.0"
 )]
 pub struct AppConfig {
@@ -42,19 +42,7 @@ pub struct AppConfig {
     )]
     pub workspace_host: String,
 
-    /// Source language code (e.g., zh, en, ja)
-    #[arg(long, default_value = "zh")]
-    pub source_lang: String,
-
-    /// Target language code (e.g., en, ja, zh)
-    #[arg(long, default_value = "en")]
-    pub target_lang: String,
-
-    /// Disable translation: directly recognize speech to text and synthesize speech
-    #[arg(long)]
-    pub no_translate: bool,
-
-    /// ASR streaming model name for non-translation mode (default: qwen-audio-3.1-asr-flash-streaming)
+    /// ASR streaming model name (default: qwen-audio-3.1-asr-flash-streaming)
     #[arg(long, default_value = "qwen-audio-3.1-asr-flash-streaming")]
     pub asr_model: String,
 
@@ -121,15 +109,6 @@ impl AppConfig {
     pub fn inference_ws_url(&self) -> String {
         format!("{}/api-ws/v1/inference", self.workspace_ws_base())
     }
-
-    /// Realtime API 端点（Qwen-LiveTranslate / Qwen-ASR-Realtime）
-    pub fn realtime_ws_url(&self, model: &str) -> String {
-        format!(
-            "{}/api-ws/v1/realtime?model={}",
-            self.workspace_ws_base(),
-            model
-        )
-    }
 }
 
 #[cfg(test)]
@@ -159,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn build_ws_urls_from_config() {
+    fn build_ws_url_from_config() {
         let config = AppConfig::parse_from([
             "kaols",
             "--workspace-host",
@@ -168,10 +147,6 @@ mod tests {
         assert_eq!(
             config.inference_ws_url(),
             "wss://ws-test.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
-        );
-        assert_eq!(
-            config.realtime_ws_url("qwen3.8-livetranslate-flash-realtime"),
-            "wss://ws-test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen3.8-livetranslate-flash-realtime"
         );
     }
 

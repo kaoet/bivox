@@ -1,8 +1,8 @@
 //! 百炼 WebSocket 客户端的公共底座。
 //!
-//! ASR（run-task 协议）、Qwen-LiveTranslate（Realtime 协议）、CosyVoice（run-task
-//! TTS 协议）三者的业务事件完全不同，但"鉴权建连 → 协议握手 → 收发 → 断线退避
-//! 重连"的骨架是一致的。本模块只抽这条骨架，协议细节仍留在各自客户端里。
+//! ASR（run-task 协议）与 CosyVoice（run-task TTS 协议）的业务事件完全不同，
+//! 但"鉴权建连 → 协议握手 → 收发 → 断线退避重连"的骨架是一致的。
+//! 本模块只抽这条骨架，协议细节仍留在各自客户端里。
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::client::TranslationEvent;
+use crate::client::AsrEvent;
 
 pub(crate) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(crate) type WsRead = SplitStream<WsStream>;
@@ -32,8 +32,7 @@ pub(crate) type WsWrite = SplitSink<WsStream, Message>;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 连接级保活周期。
 ///
-/// 实测：inference 连接（run-task 协议）在连续约 60s 没有任何帧时会被服务端关闭；
-/// Realtime 会话空闲 300s 会被以 `1007 Idle timeout!` 关闭。
+/// 实测：inference 连接（run-task 协议）在连续约 60s 没有任何帧时会被服务端关闭。
 /// WebSocket Ping 是协议帧，不产生任何音频/文本 Token，能让连接续命（实测 240s/360s 仍存活）。
 pub(crate) const KEEPALIVE_PERIOD: Duration = Duration::from_secs(20);
 /// 重连指数退避：初始间隔与上限
@@ -219,14 +218,14 @@ where
     Ok(())
 }
 
-/// 音频输入 / 文本事件输出：ASR 与实时同传共用的会话状态。
+/// 音频输入 / 识别事件输出：ASR 会话状态。
 ///
 /// 断连期间采集端仍在 `try_send`，channel 里会积压过期音频；
 /// 重连后回放旧语音只会让转写错位，因此在重连前丢弃，
 /// 同时通知下游（chunker）丢弃半句上下文。
 pub(crate) struct AudioStreamState {
     pub rx_audio: Receiver<Vec<u8>>,
-    pub tx_events: Sender<TranslationEvent>,
+    pub tx_events: Sender<AsrEvent>,
 }
 
 impl AudioStreamState {
@@ -240,9 +239,8 @@ impl AudioStreamState {
         }
 
         // 空文本 + 句终 = 下游 chunker 的重置信号
-        let _ = self.tx_events.try_send(TranslationEvent {
-            transcription: String::new(),
-            translation: String::new(),
+        let _ = self.tx_events.try_send(AsrEvent {
+            text: String::new(),
             is_sentence_end: true,
         });
     }
@@ -276,7 +274,7 @@ mod tests {
         });
 
         let mut stream =
-            connect_authenticated("sk-test", &format!("ws://{addr}/api-ws/v1/realtime"))
+            connect_authenticated("sk-test", &format!("ws://{addr}/api-ws/v1/inference"))
                 .await
                 .unwrap();
         let value = wait_for_json(&mut stream, Duration::from_secs(5), |v| {
