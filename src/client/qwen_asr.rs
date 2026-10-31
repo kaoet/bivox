@@ -2,18 +2,20 @@ use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use crate::client::qwen_realtime::TranslationEvent;
+use crate::client::ws::{self, AudioStreamState, ReconnectingSession, SessionEnd, WsStream};
+use crate::client::TranslationEvent;
 
-const DASHSCOPE_WS_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+/// 近场识别：本项目输入始终为说话人自己的麦克风（耳机/桌面近讲），
+/// 服务端默认远场 vad_model（far_field_meeting_16k）会降低近讲场景的 VAD 灵敏度。
+const ASR_VAD_MODEL: &str = "near_meeting_16k";
 
 #[derive(Debug, Deserialize)]
 struct AsrServerResponse {
@@ -35,7 +37,8 @@ struct AsrPayload {
 
 #[derive(Debug, Deserialize)]
 struct AsrOutput {
-    sentence: AsrSentence,
+    /// `task-finished` 等事件的 `output` 为空对象，句段字段必须是可缺省的
+    sentence: Option<AsrSentence>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,40 +51,59 @@ struct AsrSentence {
     heartbeat: bool,
 }
 
+/// ASR 会话的共享状态（跨重连保留）
+pub(crate) struct AsrRuntime {
+    api_key: String,
+    model: String,
+    ws_url: String,
+    io: AudioStreamState,
+}
+
+impl ws::SessionState for AsrRuntime {
+    fn before_reconnect(&mut self) {
+        // 丢弃断连期间积压的音频，并通知下游 chunker 丢弃半句上下文
+        self.io.drain_and_reset();
+    }
+}
+
 pub struct QwenAsrClient;
 
 impl QwenAsrClient {
-    /// 运行 Qwen Audio 3.1 实时双向流式语音识别（无翻译，直通 ASR -> TTS）
+    /// 运行 Qwen Audio 3.1 实时双向流式语音识别（无翻译，直通 ASR -> TTS）。
+    ///
+    /// 断线重连、退避与握手超时统一由 [`ws::run_with_reconnect`] 处理。
+    ///
+    /// `ws_url` 为百炼业务空间专属域名的 run-task 端点，
+    /// 形如 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`。
     pub async fn run_duplex(
         api_key: String,
         model: String,
-        mut rx_audio: Receiver<Vec<u8>>,
+        ws_url: String,
+        rx_audio: Receiver<Vec<u8>>,
         tx_events: Sender<TranslationEvent>,
         is_running: Arc<AtomicBool>,
     ) -> Result<()> {
+        let mut state = AsrRuntime {
+            api_key,
+            model,
+            ws_url,
+            io: AudioStreamState {
+                rx_audio,
+                tx_events,
+            },
+        };
+        ws::run_with_reconnect::<Self>("Qwen ASR", &is_running, &mut state).await
+    }
+
+    /// 建立连接、发送 run-task 并等待 task-started
+    async fn connect_and_start(
+        api_key: &str,
+        model: &str,
+        ws_url: &str,
+    ) -> Result<(WsStream, String)> {
         let task_id = Uuid::new_v4().simple().to_string();
+        let mut stream = ws::connect_authenticated(api_key, ws_url).await?;
 
-        let mut request = DASHSCOPE_WS_URL
-            .into_client_request()
-            .context("创建 Qwen ASR WebSocket 请求失败")?;
-
-        let auth_val = format!("Bearer {}", api_key);
-        request.headers_mut().insert(
-            "Authorization",
-            auth_val.parse().context("无效的 Authorization Header")?,
-        );
-        request.headers_mut().insert(
-            "X-DashScope-DataInspection",
-            HeaderValue::from_static("enable"),
-        );
-
-        let (ws_stream, _) = connect_async(request)
-            .await
-            .context("连接百炼 ASR WebSocket 端点失败")?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // 1. 发送 run-task 任务握手
         let run_task_payload = json!({
             "header": {
                 "action": "run-task",
@@ -95,127 +117,281 @@ impl QwenAsrClient {
                 "model": model,
                 "parameters": {
                     "format": "pcm",
-                    "sample_rate": 16000
+                    "sample_rate": 16000,
+                    "vad_model": ASR_VAD_MODEL,
+                    // 心跳：长时间只有静音音频时保持会话不被服务端超时断开
+                    "heartbeat": true
                 },
                 "input": {}
             }
         });
 
-        write
+        stream
             .send(Message::Text(run_task_payload.to_string()))
             .await
             .context("发送 Qwen ASR run-task 失败")?;
 
-        // 2. 等待握手确认 (task-started)
-        let mut task_started = false;
-        while let Some(msg_res) = read.next().await {
-            match msg_res {
-                Ok(Message::Text(text)) => {
-                    let resp: AsrServerResponse =
-                        serde_json::from_str(&text).context("解析 Qwen ASR 握手响应失败")?;
-                    match resp.header.event.as_str() {
-                        "task-started" => {
-                            task_started = true;
-                            break;
-                        }
-                        "task-failed" => {
-                            let err_code = resp.header.error_code.unwrap_or_default();
-                            let err_msg = resp.header.error_message.unwrap_or_default();
-                            bail!("Qwen ASR 握手失败 [{}]: {}", err_code, err_msg);
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Message::Close(_)) => bail!("Qwen ASR WebSocket 在握手完成前被关闭"),
-                Err(e) => bail!("Qwen ASR 连接异常: {:?}", e),
-                _ => {}
-            }
-        }
+        let value = ws::wait_for_json(&mut stream, ws::CONNECT_TIMEOUT, |v| {
+            matches!(
+                v["header"]["event"].as_str(),
+                Some("task-started") | Some("task-failed")
+            )
+        })
+        .await
+        .context("Qwen ASR 握手失败")?;
 
-        if !task_started {
-            bail!("Qwen ASR 未能成功启动 (未收到 task-started)");
+        if value["header"]["event"] == "task-failed" {
+            let err_code = value["header"]["error_code"].as_str().unwrap_or_default();
+            let err_msg = value["header"]["error_message"]
+                .as_str()
+                .unwrap_or_default();
+            bail!("Qwen ASR 握手失败 [{}]: {}", err_code, err_msg);
         }
 
         println!("✨ Qwen-Audio-3.1 极速语音识别通道已就绪（无翻译纯识别模式）...");
+        Ok((stream, task_id))
+    }
 
-        let running_clone = is_running.clone();
-        let task_id_clone = task_id.clone();
+    /// 单次会话的收发泵：并发上传音频 + 接收识别结果，直到会话结束
+    async fn pump_session(
+        ws_stream: WsStream,
+        task_id: &str,
+        io: &mut AudioStreamState,
+        is_running: &AtomicBool,
+    ) -> SessionEnd {
+        let (mut write, mut read) = ws_stream.split();
+        let mut audio_closed = false;
 
-        // 3. 协程 A：持续上传麦克风 16kHz PCM16 二进制流
-        let send_handle = tokio::spawn(async move {
-            while running_clone.load(Ordering::Relaxed) {
-                match rx_audio.recv().await {
-                    Some(pcm_chunk) => {
-                        if write.send(Message::Binary(pcm_chunk)).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-
-            // 退出时发送 finish-task
-            let finish_payload = json!({
-                "header": {
-                    "action": "finish-task",
-                    "task_id": task_id_clone,
-                    "streaming": "duplex"
-                },
-                "payload": { "input": {} }
-            });
-            let _ = write.send(Message::Text(finish_payload.to_string())).await;
-        });
-
-        // 4. 协程 B：接收服务端识别流
-        while let Some(msg_res) = read.next().await {
+        loop {
             if !is_running.load(Ordering::Relaxed) {
-                break;
+                Self::send_finish_task(&mut write, task_id).await;
+                return SessionEnd::Shutdown;
             }
 
-            match msg_res {
-                Ok(Message::Text(text)) => {
-                    let Ok(resp) = serde_json::from_str::<AsrServerResponse>(&text) else {
-                        continue;
-                    };
-
-                    match resp.header.event.as_str() {
-                        "result-generated" => {
-                            if let Some(output) = resp.payload.output {
-                                let sentence = output.sentence;
-                                if sentence.heartbeat || sentence.text.is_empty() {
-                                    continue;
-                                }
-
-                                // 纯转写模式下，翻译字段直接回填识别文本，直接送入下游分块与 TTS
-                                let _ = tx_events
-                                    .send(TranslationEvent {
-                                        transcription: sentence.text.clone(),
-                                        translation: sentence.text,
-                                        is_sentence_end: sentence.sentence_end,
-                                    })
-                                    .await;
+            tokio::select! {
+                // 持续上传麦克风 16kHz PCM16 二进制流
+                maybe_chunk = io.rx_audio.recv(), if !audio_closed => {
+                    match maybe_chunk {
+                        Some(pcm_chunk) => {
+                            if let Err(e) = write.send(Message::Binary(pcm_chunk)).await {
+                                return SessionEnd::Disconnected(format!("发送音频失败: {:?}", e));
                             }
                         }
-                        "task-finished" => break,
-                        "task-failed" => {
-                            let err_code = resp.header.error_code.unwrap_or_default();
-                            let err_msg = resp.header.error_message.unwrap_or_default();
-                            eprintln!("Qwen ASR 任务失败 [{}]: {}", err_code, err_msg);
-                            break;
+                        None => {
+                            // 音频采集通道已关闭（程序退出），通知服务端结束
+                            audio_closed = true;
+                            Self::send_finish_task(&mut write, task_id).await;
                         }
-                        _ => {}
                     }
                 }
-                Ok(Message::Close(_)) => break,
-                Err(e) => {
-                    eprintln!("Qwen ASR WebSocket 接收异常: {:?}", e);
-                    break;
+                // 接收服务端识别流
+                maybe_msg = read.next() => {
+                    match maybe_msg {
+                        Some(Ok(Message::Text(text))) => {
+                            let Ok(resp) = serde_json::from_str::<AsrServerResponse>(&text) else {
+                                continue;
+                            };
+
+                            match resp.header.event.as_str() {
+                                "result-generated" => {
+                                    let Some(sentence) = resp
+                                        .payload
+                                        .output
+                                        .and_then(|output| output.sentence)
+                                    else {
+                                        continue;
+                                    };
+
+                                    if sentence.heartbeat || sentence.text.is_empty() {
+                                        continue;
+                                    }
+
+                                    // 纯转写模式下，翻译字段直接回填识别文本，直接送入下游分块与 TTS
+                                    let _ = io.tx_events
+                                        .send(TranslationEvent {
+                                            transcription: sentence.text.clone(),
+                                            translation: sentence.text,
+                                            is_sentence_end: sentence.sentence_end,
+                                        })
+                                        .await;
+                                }
+                                "task-finished" => {
+                                    if audio_closed || !is_running.load(Ordering::Relaxed) {
+                                        return SessionEnd::Shutdown;
+                                    }
+                                    return SessionEnd::Disconnected(
+                                        "服务端提前返回 task-finished".to_string(),
+                                    );
+                                }
+                                "task-failed" => {
+                                    let err_code = resp.header.error_code.unwrap_or_default();
+                                    let err_msg = resp.header.error_message.unwrap_or_default();
+                                    return SessionEnd::Disconnected(format!(
+                                        "task-failed [{}]: {}",
+                                        err_code, err_msg
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            return SessionEnd::Disconnected("WebSocket 被服务端关闭".to_string());
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            return SessionEnd::Disconnected(format!("WebSocket 接收异常: {:?}", e));
+                        }
+                        None => {
+                            return SessionEnd::Disconnected("WebSocket 流结束".to_string());
+                        }
+                    }
                 }
-                _ => {}
             }
         }
+    }
 
-        let _ = send_handle.await;
-        Ok(())
+    async fn send_finish_task<S>(write: &mut S, task_id: &str)
+    where
+        S: SinkExt<Message> + Unpin,
+    {
+        let finish_payload = json!({
+            "header": {
+                "action": "finish-task",
+                "task_id": task_id,
+                "streaming": "duplex"
+            },
+            "payload": { "input": {} }
+        });
+        let _ = write.send(Message::Text(finish_payload.to_string())).await;
+    }
+}
+
+impl ReconnectingSession for QwenAsrClient {
+    type State = AsrRuntime;
+
+    fn run_once<'a>(
+        state: &'a mut AsrRuntime,
+        is_running: &'a AtomicBool,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionEnd>> + Send + 'a>> {
+        Box::pin(async move {
+            let (ws_stream, task_id) =
+                Self::connect_and_start(&state.api_key, &state.model, &state.ws_url).await?;
+            Ok(Self::pump_session(ws_stream, &task_id, &mut state.io, is_running).await)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_task_finished_with_empty_output() {
+        // 真实服务端 task-finished 的 payload.output 是空对象，不能因此解析失败
+        let text = r#"{"header":{"task_id":"x","event":"task-finished","attributes":{}},"payload":{"output":{}}}"#;
+        let resp: AsrServerResponse = serde_json::from_str(text).unwrap();
+        assert_eq!(resp.header.event, "task-finished");
+        assert!(resp
+            .payload
+            .output
+            .as_ref()
+            .and_then(|output| output.sentence.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn parses_result_generated_sentence() {
+        let text = r#"{"header":{"task_id":"x","event":"result-generated","attributes":{}},"payload":{"output":{"sentence":{"sentence_id":1,"begin_time":0,"end_time":780,"text":"你好","sentence_end":true,"heartbeat":false,"words":[]},"text":"你好"}}}"#;
+        let resp: AsrServerResponse = serde_json::from_str(text).unwrap();
+        let sentence = resp
+            .payload
+            .output
+            .as_ref()
+            .and_then(|output| output.sentence.as_ref())
+            .unwrap();
+        assert_eq!(sentence.text, "你好");
+        assert!(sentence.sentence_end);
+        assert!(!sentence.heartbeat);
+    }
+
+    #[test]
+    fn parses_heartbeat_result_without_text() {
+        let text = r#"{"header":{"task_id":"x","event":"result-generated","attributes":{}},"payload":{"output":{"sentence":{"sentence_id":0,"text":"","sentence_end":false,"heartbeat":true}}}}"#;
+        let resp: AsrServerResponse = serde_json::from_str(text).unwrap();
+        let sentence = resp
+            .payload
+            .output
+            .as_ref()
+            .and_then(|output| output.sentence.as_ref())
+            .unwrap();
+        assert!(sentence.heartbeat);
+    }
+
+    /// 握手失败（task-failed）后识别协程必须继续重连，而不是直接退出。
+    #[tokio::test]
+    async fn reconnects_after_handshake_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_server = attempts.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempts = attempts_server.clone();
+                tokio::spawn(async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let Ok(mut ws) = accept_async(tcp).await else {
+                        return;
+                    };
+                    // 读掉 run-task，回一个 task-failed 模拟握手失败
+                    let _ = ws.next().await;
+                    let fail = json!({
+                        "header": {
+                            "task_id": "mock",
+                            "event": "task-failed",
+                            "error_code": "CLIENT_ERROR",
+                            "error_message": "mock handshake failure"
+                        },
+                        "payload": {}
+                    });
+                    let _ = ws.send(Message::Text(fail.to_string())).await;
+                    let _ = ws.close(None).await;
+                });
+            }
+        });
+
+        let (_tx_audio, rx_audio) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_events, _rx_events) = tokio::sync::mpsc::channel(8);
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        let ws_url = format!("ws://{}/api-ws/v1/inference", addr);
+        let client = tokio::spawn(QwenAsrClient::run_duplex(
+            "sk-test".to_string(),
+            "qwen-audio-3.1-asr-flash-streaming".to_string(),
+            ws_url,
+            rx_audio,
+            tx_events,
+            is_running.clone(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        assert!(!client.is_finished(), "识别协程不应在握手失败后退出");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "应至少重连一次，实际建连 {} 次",
+            attempts.load(Ordering::SeqCst)
+        );
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
     }
 }

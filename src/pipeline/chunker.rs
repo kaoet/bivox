@@ -156,6 +156,11 @@ impl TextChunker {
     /// 根据百炼流式返回的完整/增量文本，智能检测断句并吐出切片
     pub fn process_stream(&mut self, full_text: &str, is_sentence_end: bool) -> Vec<TextChunk> {
         if full_text.is_empty() {
+            // 空文本 + 句终：作为外部重置信号（例如 ASR 重连后，上一句已无法续接，
+            // 需要丢弃已消费上下文，避免新句子与旧状态错位）
+            if is_sentence_end {
+                self.reset();
+            }
             return Vec::new();
         }
 
@@ -391,6 +396,22 @@ mod tests {
         assert_eq!(chunks[0].chunk_text, "第一句话。");
         assert_eq!(chunks[1].chunk_text, "第二句话！");
         assert_eq!(chunks[2].chunk_text, "第三句话？");
+    }
+
+    #[test]
+    fn test_empty_sentence_end_resets_state() {
+        // 模拟 ASR 重连：上一句只发了一半，之后收到空文本 + 句终作为重置信号，
+        // 新会话的首句不应与旧状态错位/漏字。
+        let mut chunker = TextChunker::new(6);
+        assert!(chunker
+            .process_stream("上一句只识别了一半", false)
+            .is_empty());
+
+        assert!(chunker.process_stream("", true).is_empty());
+
+        let chunks = chunker.process_stream("新的一句话。", false);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_text, "新的一句话。");
     }
 
     #[test]

@@ -71,6 +71,23 @@ impl AudioPlaybackHandle {
     }
 }
 
+#[cfg(test)]
+impl AudioPlaybackHandle {
+    /// 测试用：不依赖声卡的空句柄
+    pub fn for_test() -> Self {
+        Self {
+            sample_queue: Arc::new(Mutex::new(VecDeque::new())),
+            resampler: None,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 测试用：当前播放队列中已排队的样本数
+    pub fn queued_samples_len(&self) -> usize {
+        self.sample_queue.lock().unwrap().len()
+    }
+}
+
 pub struct AudioPlaybackEngine {
     _stream: Stream,
     handle: AudioPlaybackHandle,

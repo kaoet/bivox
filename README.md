@@ -29,7 +29,24 @@ cargo run -- --api-key "sk-..."
 
 ---
 
-### 2. 常用运行命令
+### 2. 百炼业务空间专属域名（已配置默认值）
+
+百炼已为华北2（北京）/ 新加坡推出业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），官方建议替换旧的 `dashscope.aliyuncs.com`。本项目 ASR / 同传 / CosyVoice 三条 WebSocket 链路均已使用该域名：
+
+```bash
+# 默认：ws-e01bu1mp0vk0o909.cn-beijing.maas.aliyuncs.com
+cargo run --release
+
+# 切换到其它业务空间 / 地域
+cargo run --release -- --workspace-host ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com
+# 或设置环境变量 DASHSCOPE_WORKSPACE_HOST
+```
+
+> ASR 固定使用近场 VAD 模型（`vad_model=near_meeting_16k`），适配"识别自己麦克风近讲"的使用场景。
+
+---
+
+### 3. 常用运行命令
 
 #### 默认启动（使用系统默认麦克风与扬声器，中文 -> 英文，预置音色）：
 ```bash

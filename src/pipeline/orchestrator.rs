@@ -10,7 +10,7 @@ use crate::audio::device::AudioDeviceManager;
 use crate::audio::playback::AudioPlaybackEngine;
 use crate::client::cosyvoice::{CosyVoiceClient, CosyVoiceConfig, TtsChunkRequest};
 use crate::client::qwen_asr::QwenAsrClient;
-use crate::client::qwen_realtime::QwenRealtimeClient;
+use crate::client::qwen_realtime::{QwenRealtimeClient, LIVETRANSLATE_REALTIME_MODEL};
 use crate::config::AppConfig;
 use crate::pipeline::chunker::TextChunker;
 
@@ -70,11 +70,15 @@ impl PipelineOrchestrator {
             );
             println!(
                 "🧠 同传模型: {}",
-                "Qwen (qwen3.8-livetranslate-flash-realtime)".yellow()
+                format!("Qwen ({})", LIVETRANSLATE_REALTIME_MODEL).yellow()
             );
         }
         println!("🤖 合成模型: {}", self.config.tts_model.yellow());
         println!("🎙️ 合成音色: {}", self.config.voice.yellow());
+        println!(
+            "🌐 业务空间域名: {}",
+            self.config.workspace_ws_base().cyan()
+        );
         println!(
             "{}",
             "==================================================".dimmed()
@@ -95,16 +99,19 @@ impl PipelineOrchestrator {
         // 3. 初始化识别/同传客户端
         let (tx_events, mut rx_events) = mpsc::channel(100);
         let engine_key = api_key.clone();
-        let src_lang = self.config.source_lang.clone();
         let tgt_lang = self.config.target_lang.clone();
         let engine_running = is_running.clone();
+        let inference_ws_url = self.config.inference_ws_url();
+        let realtime_ws_url = self.config.realtime_ws_url(LIVETRANSLATE_REALTIME_MODEL);
 
         if self.config.no_translate {
             let asr_model = self.config.asr_model.clone();
+            let asr_ws_url = inference_ws_url.clone();
             tokio::spawn(async move {
                 if let Err(e) = QwenAsrClient::run_duplex(
                     engine_key,
                     asr_model,
+                    asr_ws_url,
                     rx_mic,
                     tx_events,
                     engine_running,
@@ -118,7 +125,7 @@ impl PipelineOrchestrator {
             tokio::spawn(async move {
                 if let Err(e) = QwenRealtimeClient::run_duplex(
                     engine_key,
-                    src_lang,
+                    realtime_ws_url,
                     tgt_lang,
                     rx_mic,
                     tx_events,
@@ -137,6 +144,7 @@ impl PipelineOrchestrator {
             api_key: api_key.clone(),
             tts_model: self.config.tts_model.clone(),
             voice: self.config.voice.clone(),
+            ws_url: inference_ws_url,
         };
         let tts_playback = playback.clone();
         let tts_running = is_running.clone();
