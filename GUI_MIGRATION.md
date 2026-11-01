@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.7，**M0 与 M4 已完成**，下一步 M1
+> **状态**：草案 v0.8，**M0 与 M4 已完成**，下一步 M1
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -34,7 +34,7 @@
 
 ### 1.3 附带开发工具（不属于 GUI 产品的一部分）
 
-- `kaols-voice-admin.exe`：**独立的命令行调试工具**，只用于管理百炼账号里已有的自定义音色（列出/删除）。
+- `admin.exe`：**独立的命令行调试工具**，只用于管理百炼账号里已有的自定义音色（列出/删除）。
 - **读 `config.toml`**：默认读当前工作目录的 `./config.toml`，`-c/--config` 可覆盖；只取 `[api] key` 与 `[api] workspace_host`（见 D19）。
 - **不读写 `voice_cache.json`**、不提供 enroll（复刻/上传）、不做任何 prefix 过滤。
 - 不随发布包分发，仅本地 `cargo build --release --bin ...` 自用（已定）。
@@ -47,7 +47,7 @@
 |---|---|
 | 代码规模 | 迁移前约 7.4k 行；M0/M4 之后 `src/` 共 7737 行（新增 GUI/admin 约 1.2k，删除 `voice/cli.rs` 931 行） |
 | 依赖 | tokio 全异步、cpal 音频、tokio-tungstenite WebSocket、reqwest、eframe/egui（glow 后端）、log、chrono；clap/colored 现在只被调试 CLI 使用 |
-| 入口 | `src/main.rs`：eframe GUI 入口；`src/bin/kaols-voice-admin.rs`：调试 CLI（M4 已实现） |
+| 入口 | `src/main.rs`：eframe GUI 入口；`src/bin/admin.rs`：调试 CLI（M4 已实现） |
 | 音色工具结构 | `voice/cli.rs` 已删除；远程列表/删除逻辑在 `voice/admin.rs`（纯逻辑、可用 mock 测试），终端交互与表格在 bin 里 |
 | 测试 | 全部模块内 `#[cfg(test)]`；`voice/mock_http.rs` 被 `voice/api.rs`、`voice/cache.rs`、`voice/admin.rs`、`voice/mod.rs` 复用；根目录 `tests/` 为空 |
 | 工具链 | `rustc 1.99.1`（2026-10-13，已 `rustup update`）；egui 0.37 的 MSRV 为 1.95，余量充足 |
@@ -278,7 +278,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 
 ### D19 ✅ 独立调试 CLI 工具：百炼音色管理
 
-- 新二进制 `kaols-voice-admin`（`src/bin/`），**只做三件事**：列出百炼账号下的自定义音色、删除指定 voice_id、删除全部音色。
+- 新二进制 `admin`（`src/bin/admin.rs`），**只做三件事**：列出百炼账号下的自定义音色、删除指定 voice_id、删除全部音色。
 - **读 `config.toml`**：默认读**当前工作目录**的 `./config.toml`，可用 `-c/--config <path>` 指定其它路径；只取 `[api] key` 与 `[api] workspace_host`（复用 `AppConfig::load` + `voice::api_from_config`），其余字段照常校验。
 - 因为主程序是便携的，通常应在 **exe 所在目录**运行该工具（这样默认的 `./config.toml` 就是便携目录里的那份）；否则用 `-c` 指向便携目录的配置。配置其它字段无效时，工具会按同一套校验拒绝启动（与 GUI 行为一致）。
 - **绝不读写 `voice_cache.json`**；不提供 enroll（复刻/上传）；**不提供任何 prefix 过滤或筛选逻辑**（只按 voice_id 精确操作）。
@@ -289,8 +289,8 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 逻辑放在 `src/voice/admin.rs`（lib 内，可用 `voice/mock_http.rs` 做单测），bin 只做参数解析与终端输出；保留 `colored` 做终端彩色（调试工具专用）。
 - **不随发布包分发**（已定），需要时本地构建。
 - 注意（与 GUI 的交互）：如果删掉的 voice_id 仍被 `voice_cache.json` 引用，GUI 下次合成会收到"音色不存在"。v1 的处理是文档说明——删除 `voice_cache.json` 或用 GUI 重新触发复刻即可；不做自动恢复（见 R16）。
-- **实现状态（M4 已完成）**：`src/voice/admin.rs` + `src/bin/kaols-voice-admin.rs`，命令为
-  `kaols-voice-admin [-c config.toml] list | delete --voice-id <id> [-y] | delete-all [-y]`；
+- **实现状态（M4 已完成）**：`src/voice/admin.rs` + `src/bin/admin.rs`，命令为
+  `admin [-c config.toml] list | delete --voice-id <id> [-y] | delete-all [-y]`；
   已手工验证帮助/配置缺失/非交互确认三条路径，7 个 mock 测试覆盖列表与删除结果分类。
 
 ---
@@ -327,8 +327,8 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 | `src/config.rs:89-130` | 删 `VoicesAction` |
 | `src/main.rs` | 重写为 GUI 入口（第 6 节） |
 | 新增 `src/lib.rs` | 把现有模块改为 `pub mod`，供两个 bin 共用（`voice/api` 等） |
-| `src/voice/cli.rs`（931 行） | **M4 已删除**：薄壳、`enroll`、`delete_by_voice_config_with`（配置+缓存耦合）都不要；远程列表/删除逻辑迁到 `voice/admin.rs`，交互与表格在 `src/bin/kaols-voice-admin.rs`，测试用 `voice/mock_http.rs` 重写 |
-| 新增（M4） | `src/voice/admin.rs`（`list_remote_voices` / `delete_remote_voice` / `delete_all_remote_voices` + 7 个 mock 测试）、`src/bin/kaols-voice-admin.rs` |
+| `src/voice/cli.rs`（931 行） | **M4 已删除**：薄壳、`enroll`、`delete_by_voice_config_with`（配置+缓存耦合）都不要；远程列表/删除逻辑迁到 `voice/admin.rs`，交互与表格在 `src/bin/admin.rs`，测试用 `voice/mock_http.rs` 重写 |
+| 新增（M4） | `src/voice/admin.rs`（`list_remote_voices` / `delete_remote_voice` / `delete_all_remote_voices` + 7 个 mock 测试）、`src/bin/admin.rs` |
 | `src/audio/device.rs:16-47` | `list_devices()` 打印版删除，改为返回 `Vec<String>`（D12） |
 | `src/audio/device.rs:49-81` | 模糊匹配改为精确相等（D12） |
 | `src/audio/playback.rs:42-53` | `interrupt()` 从 `#[allow(dead_code)]` 变为正式 API |
@@ -338,7 +338,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 | `src/config.rs` 测试段 | 删除 `cli_*` 三个用例；`example_config_is_valid` 改为 `..._template_without_key`（M0 已做） |
 | `README.md` | 改写为 GUI + 便携模式说明（配置/缓存/日志/备份/安全提示） |
 | `.gitignore`（可选） | 若把 exe 放仓库根，追加 `/logs/`、`/crash.log`、`/config.toml.bak` |
-| 新增 | `scripts/dev-run.ps1`、`scripts/package.ps1`、`src/config_edit.rs`、`src/voice/editor.rs`、`src/bin/kaols-voice-admin.rs`（M4 已完成） |
+| 新增 | `scripts/dev-run.ps1`、`scripts/package.ps1`、`src/config_edit.rs`、`src/voice/editor.rs`、`src/bin/admin.rs`（M4 已完成） |
 
 > 保留不动：`client/`、`pipeline/chunker.rs`、`language.rs`、`voice/api.rs`、`voice/cache.rs`、`voice/mock_http.rs`、`audio/` 的采集与播放、全部现有测试（除 `voice/cli.rs` 测试需迁移）。
 >
@@ -354,7 +354,7 @@ src/
 ├── lib.rs               # pub mod audio/client/config/events/language/paths/pipeline/voice/...
 ├── main.rs              # GUI 入口：runtime、panic hook、日志、run_native
 ├── bin/
-│   └── kaols-voice-admin.rs   # 调试 CLI（list/delete），参数解析 + 终端输出
+│   └── admin.rs             # 调试 CLI（list/delete），参数解析 + 终端输出
 ├── app.rs               # KaolsApp：状态、事件泵、Tab 分发、退出流程
 ├── events.rs            # PipelineEvent / SessionState
 ├── paths.rs             # 便携路径 + 写探测 + 首启模板（D4/D18）
@@ -566,7 +566,7 @@ impl AppPaths {
 
 ### M4 调试 CLI 工具（D19）（已完成 ✅）
 
-- [x] `src/bin/kaols-voice-admin.rs`：`-c/--config`（默认 `./config.toml`）、`list`、`delete --voice-id`（可重复、`-y` 跳过确认）、`delete-all -y`、终端表格与确认
+- [x] `src/bin/admin.rs`：`-c/--config`（默认 `./config.toml`）、`list`、`delete --voice-id`（可重复、`-y` 跳过确认）、`delete-all -y`、终端表格与确认
 - [x] `AppConfig::load` + `voice::api_from_config` 取 `[api]` 凭据（不碰 cache、不 enroll）
 - [x] `voice/admin.rs`：`list_remote_voices`（强制完整分页，否则报错）/ `delete_remote_voice`（区分 Deleted 与 AlreadyMissing）/ `delete_all_remote_voices`（返回成功/已不存在/失败三分类报告）；**不做任何 prefix 过滤**
 - [x] 新增 7 个 mock HTTP 测试（列表完整/不完整、删除三种结果、空 voice_id 不发请求、批量结果分类）
@@ -574,7 +574,7 @@ impl AppPaths {
 - [x] `voice/cli.rs`（931 行）整体删除；`Cargo.toml` 加 `default-run = "kaols"`，`cargo run` 仍默认进 GUI
 
 **实施结果**：
-- `cargo run --bin kaols-voice-admin -- --help / list -c missing.toml / delete --voice-id x`（非交互终端）三条路径已手工验证：
+- `cargo run --bin admin -- --help / list -c missing.toml / delete --voice-id x`（非交互终端）三条路径已手工验证：
   帮助正常、配置缺失给出可读错误、无 `-y` 时拒绝并提示（不会误发删除请求）。
 - `cargo build --bins` 通过；`cargo test` **110 个用例全绿**（删掉旧 cli 的 9 个用例、新增 admin 7 个）。
 - 用法：在便携目录内运行（默认读 `./config.toml`），或 `-c <path>` 指定。
@@ -656,4 +656,5 @@ impl AppPaths {
 | v0.4 | 2026-11-01 | 调试工具的三项定案：① 凭据改为**读 `config.toml`**（默认工作目录 `./config.toml`，`-c/--config` 可覆盖，只取 `[api]`；撤销 v0.3 的"不读配置"）；② 功能固定为 `list` / `delete --voice-id` / `delete-all -y`，**明确不做任何 prefix 过滤**；③ 不随发布包分发。§4 由"待拍板问题"改为"问题索引"，全部 12 项决策可回溯；D19 重写，新增 R16（远端删除导致缓存失效）；确认无待定问题，可开工 M0 |
 | v0.5 | 2026-11-01 | ① §1.3 修正：调试工具**读 `config.toml`**（默认工作目录，`-c` 可覆盖），删掉"不读配置"的表述；② D8 由绝对禁令改为分级准则，列出当前 6 类明确忽略错误的位置（Ping/收尾帧、实时音频 `try_send`、设备名降级、重置信号、临时文件清理、终端 flush）及各自迁移动作，必须改的只剩 `orchestrator.rs:196/223` 的 `eprintln!`；新增 `// best-effort:` 注释约定并写入 D15；③ D18 明确以 `config.example.toml` 为 `include_str!` 模板源，因此发布 zip **不含** `config.example.toml`（同步修正 D2、§5 迁移表、M5 打包清单） |
 | v0.6 | 2026-11-01 | **M0 实施完成**：新增 `src/lib.rs` / `main.rs`（GUI 入口）/ `app.rs` / `paths.rs` / `log_sink.rs` / `gui/*` / `scripts/dev-run.ps1`；删除 `config.rs` 的 CLI 类型与用例；`config.example.toml` 改为内嵌模板（key 注释）。**渲染后端由 wgpu 改为 glow**（D9：wgpu 30.0.1 + gpu-allocator 0.28 被 cpal 的 windows 0.54 拖成版本冲突，wgpu-hal DX12 编译失败）；设置页去掉 `egui::Grid`（multi-pass 会让 eframe `__screenshot` 抓到空帧，已写入 §10）。验证：fmt/build/test（113 用例）全绿，两张截图确认中文与布局正常 |
-| v0.7 | 2026-11-01 | **M4 实施完成**：新增 `voice/admin.rs`（`list_remote_voices` 强制完整分页、`delete_remote_voice` 区分已删除/本来不存在、`delete_all_remote_voices` 三分类报告，7 个 mock 测试）与 `src/bin/kaols-voice-admin.rs`（`-c/--config`、`list`、`delete --voice-id`、`delete-all -y`，交互确认需输入 YES）；**删除 `voice/cli.rs` 931 行**（enroll 与配置/缓存耦合逻辑一并移除）；`Cargo.toml` 加 `default-run = "kaols"`；顺手把 `AppConfig::load` 的错误提示从"复制 config.example.toml"改成"程序会在 exe 同目录自动生成"。验证：`cargo build --bins` + `cargo test`（110 用例）全绿，CLI 帮助/配置缺失/非交互确认三条路径手工验证 |
+| v0.7 | 2026-11-01 | **M4 实施完成**：新增 `voice/admin.rs`（`list_remote_voices` 强制完整分页、`delete_remote_voice` 区分已删除/本来不存在、`delete_all_remote_voices` 三分类报告，7 个 mock 测试）与调试 bin（`-c/--config`、`list`、`delete --voice-id`、`delete-all -y`，交互确认需输入 YES）；**删除 `voice/cli.rs` 931 行**（enroll 与配置/缓存耦合逻辑一并移除）；`Cargo.toml` 加 `default-run = "kaols"`；顺手把 `AppConfig::load` 的错误提示从"复制 config.example.toml"改成"程序会在 exe 同目录自动生成"。验证：`cargo build --bins` + `cargo test`（110 用例）全绿，CLI 帮助/配置缺失/非交互确认三条路径手工验证 |
+| v0.8 | 2026-11-01 | 按你的要求把调试 CLI 改名为 **`admin`**：`src/bin/kaols-voice-admin.rs` → `src/bin/admin.rs`，clap `name = "admin"`，文档与命令示例同步（`cargo run --bin admin -- list`）；功能与参数不变 |

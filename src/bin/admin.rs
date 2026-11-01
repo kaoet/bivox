@@ -1,4 +1,4 @@
-//! `kaols-voice-admin`：百炼自定义音色调试工具（M4，见 GUI_MIGRATION.md D19）。
+//! `admin`：百炼自定义音色调试工具（M4，见 GUI_MIGRATION.md D19）。
 //!
 //! 只做两件事：列出账号下的自定义音色、删除音色（单条或全部）。
 //!
@@ -21,7 +21,7 @@ use kaols::voice::api::{BailianVoiceApi, RemoteVoice};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "kaols-voice-admin",
+    name = "admin",
     about = "百炼自定义音色调试工具：列出 / 删除账号下的自定义音色（不随主程序分发）"
 )]
 struct Args {
