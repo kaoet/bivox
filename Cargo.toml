@@ -2,6 +2,7 @@
 name = "kaols"
 version = "0.1.0"
 edition = "2021"
+default-run = "kaols"
 
 [dependencies]
 # GUI：立即模式框架，版本钉死（见 GUI_MIGRATION.md D1/D15）。

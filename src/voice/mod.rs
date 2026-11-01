@@ -5,9 +5,9 @@
 //! 每个样本都会按 (`[tts] model`, 音频内容哈希) 单独复刻并缓存一个 voice_id；
 //! 合成时由 pipeline 判定本句语言，选择对应语言的声线，缺语言时回退到第一个样本。
 
+pub mod admin;
 pub mod api;
 pub mod cache;
-pub mod cli;
 
 #[cfg(test)]
 mod mock_http;

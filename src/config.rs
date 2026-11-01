@@ -246,7 +246,8 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| {
             format!(
-                "读取配置文件 {} 失败；请复制 config.example.toml 为 config.toml 并填写 [api] key",
+                "读取配置文件 {} 失败；主程序会在 exe 同目录自动生成 config.toml，\
+                 请确认该目录可写、且不要删除此文件",
                 path.display()
             )
         })?;
