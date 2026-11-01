@@ -1,54 +1,22 @@
-mod audio;
-mod client;
-mod config;
-mod language;
-mod pipeline;
-mod voice;
+//! GUI 入口。
+//!
+//! 只做三件事：定位便携目录 → 交给 [`kaols::app::run`] → 返回退出码。
+//! 具体的日志、崩溃钩子、配置准备都在 `app::run` 里完成（见 GUI_MIGRATION.md D4/D8）。
 
-use anyhow::Result;
-use clap::Parser;
-use config::{AppConfig, CliArgs, Command, VoicesAction};
-use pipeline::orchestrator::PipelineOrchestrator;
+// release 构建不弹控制台；debug 保留控制台，方便直接看 panic 与日志输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = CliArgs::parse();
+use std::process::ExitCode;
 
-    match cli.command.clone().unwrap_or(Command::Run) {
-        // 默认行为：读取配置，启动实时语音识别 -> 合成流水线
-        Command::Run => {
-            let config = AppConfig::load(&cli.config)?;
-            PipelineOrchestrator::new(config).run().await
+fn main() -> ExitCode {
+    let paths = match kaols::paths::AppPaths::resolve() {
+        Ok(paths) => paths,
+        Err(err) => {
+            // 此时还没初始化日志/崩溃文件，只能走 stderr；属于极罕见的基础设施错误。
+            eprintln!("无法定位程序所在目录：{err}");
+            return ExitCode::FAILURE;
         }
+    };
 
-        // 设备列表是一次性诊断动作：不读取配置文件，也不需要 API Key。
-        Command::Devices => audio::device::AudioDeviceManager::new().list_devices(),
-
-        // 自定义音色管理：需要配置里的 API Key 与业务空间域名
-        Command::Voices { action } => {
-            let config = AppConfig::load(&cli.config)?;
-            match action {
-                VoicesAction::List => voice::cli::list(&config).await,
-                VoicesAction::Delete {
-                    voice_id,
-                    voice,
-                    language,
-                    yes,
-                } => {
-                    voice::cli::delete(
-                        &config,
-                        voice_id.as_deref(),
-                        voice.as_deref(),
-                        language.as_deref(),
-                        yes,
-                    )
-                    .await
-                }
-                VoicesAction::DeleteAll { yes } => voice::cli::delete_all(&config, yes).await,
-                VoicesAction::Enroll { name, language } => {
-                    voice::cli::enroll(&config, name.as_deref(), language.as_deref()).await
-                }
-            }
-        }
-    }
+    kaols::app::run(paths)
 }

@@ -1,6 +1,11 @@
 /target
 # 含 API Key 的本地配置，不提交
 /config.toml
+# GUI 写回配置前的备份（便携模式运行产物）
+/config.toml.bak
+# 便携模式运行产物：日志与崩溃记录（若把 exe 放在仓库根）
+/logs/
+/crash.log
 # 自定义音色缓存（音频指纹 -> 百炼 voice_id），本机状态，不提交；
 # 不带前导斜杠以匹配任意目录下的缓存文件（含 .tmp/.bak）
 voice_cache.json

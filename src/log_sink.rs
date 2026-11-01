@@ -1,0 +1,189 @@
+//! 日志与崩溃信息收集（GUI_MIGRATION.md D7/D8）。
+//!
+//! 只做两件事：
+//! 1. 把日志同时写进内存队列（界面每帧取走显示）和按天文件（`logs\kaols-YYYY-MM-DD.log`）；
+//! 2. 提供 panic 钩子，把崩溃信息写到 `crash.log` 并交给界面显示。
+//!
+//! 这里不持有 `egui::Context`：M2 接入后台任务后，由发日志的一方决定是否调用
+//! `ctx.request_repaint()`，避免日志模块反向依赖界面。
+
+use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use chrono::Local;
+
+/// 界面日志面板保留的最大行数（D16）。
+pub const MAX_LOG_LINES: usize = 5000;
+
+/// 一条待展示的日志。
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    /// 本地时间，`HH:MM:SS.mmm`
+    pub time: String,
+    pub level: log::Level,
+    pub message: String,
+}
+
+struct Sink {
+    pending: Mutex<VecDeque<LogLine>>,
+    file: Mutex<Option<File>>,
+}
+
+static SINK: OnceLock<Sink> = OnceLock::new();
+static CRASH: Mutex<Option<String>> = Mutex::new(None);
+
+/// 初始化日志系统：建目录、按天打开文件、注册全局 logger。
+///
+/// 目录/文件不可写时降级为"只有内存日志"，不阻止程序启动——界面上的日志面板仍然可用，
+/// 启动检查产生的错误也会通过 `startup_error` 显示出来。
+pub fn init(log_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(log_dir)?;
+
+    let path = today_log_path(log_dir);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok();
+
+    let sink = Sink {
+        pending: Mutex::new(VecDeque::new()),
+        file: Mutex::new(file),
+    };
+
+    // 重复初始化（例如测试里）保留第一次的 logger。
+    if SINK.set(sink).is_err() {
+        return Ok(());
+    }
+
+    if log::set_logger(SINK.get().expect("SINK 刚刚 set 成功")).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    Ok(())
+}
+
+/// 当天日志文件路径。
+pub fn today_log_path(log_dir: &Path) -> PathBuf {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    log_dir.join(format!("kaols-{today}.log"))
+}
+
+/// 取走累计的待展示日志（界面每帧调用一次）。
+pub fn take_lines() -> Vec<LogLine> {
+    let Some(sink) = SINK.get() else {
+        return Vec::new();
+    };
+    let Ok(mut pending) = sink.pending.lock() else {
+        return Vec::new();
+    };
+    pending.drain(..).collect()
+}
+
+/// 记录一次崩溃信息，供界面下一帧显示红色错误条。
+pub fn set_crash(message: String) {
+    if let Ok(mut guard) = CRASH.lock() {
+        *guard = Some(message);
+    }
+}
+
+/// 取走崩溃信息（显示过一次就清除）。
+pub fn take_crash() -> Option<String> {
+    CRASH.lock().ok().and_then(|mut guard| guard.take())
+}
+
+/// 尽力把日志刷到磁盘（退出前调用）。
+pub fn flush() {
+    if let Some(sink) = SINK.get() {
+        log::Log::flush(sink);
+    }
+}
+
+/// 安装 panic 钩子：写 `crash.log`（含 backtrace）+ 把信息交给界面显示。
+///
+/// 在 release（无控制台）构建里，这是唯一能看到 panic 原因的途径，所以必须尽早安装。
+pub fn install_panic_hook(crash_log: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let text = if let Some(text) = payload.downcast_ref::<&str>() {
+            (*text).to_string()
+        } else if let Some(text) = payload.downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "未知 panic（payload 不是字符串）".to_string()
+        };
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "未知位置".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&crash_log)
+        {
+            // best-effort: 崩溃信息落盘失败时仍继续走默认钩子（stderr）
+            let _ = writeln!(
+                file,
+                "===== {} =====\n{text}\n位置: {location}\n{backtrace}\n",
+                Local::now().format("%Y-%m-%d %H:%M:%S")
+            );
+        }
+        set_crash(format!("{text}（{location}）"));
+
+        previous(info);
+    }));
+}
+
+impl log::Log for Sink {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let now = Local::now();
+        let message = record.args().to_string();
+
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                // best-effort: 日志写盘失败不应影响主流程
+                let _ = writeln!(
+                    file,
+                    "[{}] {:5} {}",
+                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                    record.level(),
+                    message
+                );
+                let _ = file.flush();
+            }
+        }
+
+        if let Ok(mut pending) = self.pending.lock() {
+            if pending.len() >= MAX_LOG_LINES {
+                pending.pop_front();
+            }
+            pending.push_back(LogLine {
+                time: now.format("%H:%M:%S%.3f").to_string(),
+                level: record.level(),
+                message,
+            });
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                // best-effort: 退出前尽力把日志刷到磁盘
+                let _ = file.flush();
+            }
+        }
+    }
+}

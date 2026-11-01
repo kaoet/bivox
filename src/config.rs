@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,90 +43,6 @@ pub const DEFAULT_VAD_TAIL_MS: u32 = 1000;
 
 /// 默认投机分块词数阈值。
 pub const DEFAULT_CHUNK_WORDS: usize = 6;
-
-/// 命令行入口。
-///
-/// 不写子命令时默认运行实时语音识别与合成；`-c/--config` 是全局参数，任何子命令都能用。
-/// 另提供音频设备枚举（`devices`）与百炼自定义音色管理（`voices`）。
-#[derive(Debug, Parser)]
-#[command(
-    name = "kaols",
-    about = "Ultra-low-latency Speech Recognition & Synthesis Client (Rust + DashScope)",
-    version = "0.1.0"
-)]
-pub struct CliArgs {
-    /// TOML 配置文件路径
-    #[arg(
-        short = 'c',
-        long,
-        value_name = "path",
-        default_value = "config.toml",
-        global = true
-    )]
-    pub config: PathBuf,
-
-    #[command(subcommand)]
-    pub command: Option<Command>,
-}
-
-/// 顶层子命令。
-#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
-pub enum Command {
-    /// 运行实时语音识别与语音合成（默认命令，可省略）
-    Run,
-
-    /// 列出所有可用音频输入/输出设备后退出（无需配置文件）
-    Devices,
-
-    /// 管理百炼账号下已上传的自定义（复刻）音色
-    Voices {
-        #[command(subcommand)]
-        action: VoicesAction,
-    },
-}
-
-/// `kaols voices` 的子命令。
-#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
-pub enum VoicesAction {
-    /// 列出百炼账号下已上传的自定义音色，并交叉显示本地缓存
-    List,
-
-    /// 删除音色（三种模式：--voice-id / --voice / --voice + --language）
-    Delete {
-        /// 百炼原生 voice_id（精确匹配）
-        #[arg(long, value_name = "id")]
-        voice_id: Option<String>,
-
-        /// `[tts.custom_voices]` 中的配置名：删除其下全部语言声线样本
-        #[arg(long, value_name = "name")]
-        voice: Option<String>,
-
-        /// 只删除该音色指定语言的样本（需配合 --voice）
-        #[arg(long, value_name = "code")]
-        language: Option<String>,
-
-        /// 跳过交互确认
-        #[arg(short = 'y', long)]
-        yes: bool,
-    },
-
-    /// 删除账号下全部自定义音色
-    DeleteAll {
-        /// 跳过交互确认
-        #[arg(short = 'y', long)]
-        yes: bool,
-    },
-
-    /// 立即上传并注册配置文件中定义的自定义音色（可选只处理其中一个 / 某种语言）
-    Enroll {
-        /// [tts.custom_voices] 中的配置名；省略时处理全部
-        name: Option<String>,
-
-        /// 只注册该语言样本（如 zh / ja）
-        #[arg(long, value_name = "code")]
-        language: Option<String>,
-    },
-}
 
 /// 应用配置，对应 `config.toml` 的顶层结构。
 ///
@@ -766,100 +681,6 @@ words = 10
     }
 
     #[test]
-    fn cli_config_path_defaults_to_config_toml() {
-        let cli = CliArgs::parse_from(["kaols"]);
-        assert_eq!(cli.config, PathBuf::from("config.toml"));
-        assert_eq!(cli.command, None, "不写子命令时默认进入运行模式");
-    }
-
-    #[test]
-    fn cli_accepts_run_and_devices_subcommands() {
-        let run = CliArgs::parse_from(["kaols", "-c", "custom.toml", "run"]);
-        assert_eq!(run.config, PathBuf::from("custom.toml"));
-        assert_eq!(run.command, Some(Command::Run));
-
-        let devices = CliArgs::parse_from(["kaols", "devices"]);
-        assert_eq!(devices.config, PathBuf::from("config.toml"));
-        assert_eq!(devices.command, Some(Command::Devices));
-    }
-
-    #[test]
-    fn cli_parses_voices_subcommands() {
-        let list = CliArgs::parse_from(["kaols", "voices", "list"]);
-        assert_eq!(
-            list.command,
-            Some(Command::Voices {
-                action: VoicesAction::List
-            })
-        );
-
-        let delete_by_id =
-            CliArgs::parse_from(["kaols", "voices", "delete", "--voice-id", "voice-1"]);
-        assert_eq!(
-            delete_by_id.command,
-            Some(Command::Voices {
-                action: VoicesAction::Delete {
-                    voice_id: Some("voice-1".to_string()),
-                    voice: None,
-                    language: None,
-                    yes: false,
-                }
-            })
-        );
-
-        let delete_voice = CliArgs::parse_from([
-            "kaols",
-            "voices",
-            "delete",
-            "--voice",
-            "edgar",
-            "--language",
-            "ja",
-            "-y",
-        ]);
-        assert_eq!(
-            delete_voice.command,
-            Some(Command::Voices {
-                action: VoicesAction::Delete {
-                    voice_id: None,
-                    voice: Some("edgar".to_string()),
-                    language: Some("ja".to_string()),
-                    yes: true,
-                }
-            })
-        );
-
-        let delete_all = CliArgs::parse_from(["kaols", "voices", "delete-all", "--yes"]);
-        assert_eq!(
-            delete_all.command,
-            Some(Command::Voices {
-                action: VoicesAction::DeleteAll { yes: true }
-            })
-        );
-
-        let enroll = CliArgs::parse_from([
-            "kaols",
-            "-c",
-            "other.toml",
-            "voices",
-            "enroll",
-            "edgar",
-            "--language",
-            "ja",
-        ]);
-        assert_eq!(enroll.config, PathBuf::from("other.toml"));
-        assert_eq!(
-            enroll.command,
-            Some(Command::Voices {
-                action: VoicesAction::Enroll {
-                    name: Some("edgar".to_string()),
-                    language: Some("ja".to_string()),
-                }
-            })
-        );
-    }
-
-    #[test]
     fn custom_voice_with_ordered_samples_is_parsed() {
         let text = r#"
 [api]
@@ -992,14 +813,24 @@ audio = "samples/edgar-ja.wav"
         );
     }
 
-    /// 保证仓库中提交的 config.example.toml 始终是合法配置。
+    /// 默认模板必须"结构合法但没填 key"：首启生成的 config.toml 要让校验明确提示
+    /// "未配置 API Key"，而不是看起来正常却连不上（见 paths.rs 的模板测试）。
     #[test]
-    fn example_config_is_valid() {
-        let config = AppConfig::from_toml_str(include_str!("../config.example.toml")).unwrap();
-        assert_eq!(
-            config.api.key.as_deref(),
-            Some("sk-your-dashscope-api-key-here")
+    fn example_config_is_valid_template_without_key() {
+        let raw = include_str!("../config.example.toml");
+
+        let err = AppConfig::from_toml_str(raw).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("未配置 API Key"),
+            "模板应因缺少 key 而校验失败: {err:#}"
         );
+
+        let with_key = raw.replace(
+            "# key = \"sk-your-dashscope-api-key-here\"",
+            "key = \"sk-test\"",
+        );
+        let config = AppConfig::from_toml_str(&with_key).unwrap();
+        assert_eq!(config.api.key.as_deref(), Some("sk-test"));
         assert_eq!(config.api.workspace_host, DEFAULT_WORKSPACE_HOST);
     }
 }

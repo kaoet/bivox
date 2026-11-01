@@ -1,18 +1,20 @@
 # ============================================================
-# kaols 配置示例
+# kaols 默认配置模板
 #
-# 复制为 config.toml 后按需修改（Windows: copy，Linux/macOS: cp）：
-#   cp config.example.toml config.toml
+# 本文件是「默认配置模板」：kaols.exe 首次启动时会在 exe 同目录生成 config.toml，
+# 内容与本文件完全一致（模板已编译进程序，本文件仅供开发参考，不随发布包分发）。
 #
-# 读取规则：默认读取当前工作目录下的 config.toml；
-# 可用全局参数 --config / -c <path> 指定其它路径。
+# 读取规则（便携模式）：
+#   - 只读取 exe 所在目录的 config.toml；
+#   - 不读取 %APPDATA%、不读取当前工作目录、不读取环境变量。
 # 未写出的字段使用内置默认值；未知字段会导致解析失败。
-# 注意：config.toml 含 API Key，已被 .gitignore 忽略，请勿提交。
+# 注意：config.toml 含 API Key，已被 .gitignore 忽略；不要提交，也不要随便分享整个程序目录。
 # ============================================================
 
 [api]
 # 百炼 API Key，必填。获取地址：https://bailian.console.aliyun.com/
-key = "sk-your-dashscope-api-key-here"
+# 首次启动后可在程序的「设置」页填写，或直接取消下面这行的注释后点「重新加载配置」。
+# key = "sk-your-dashscope-api-key-here"
 
 # 百炼接入域名 Host：只填写纯 host，不要带 wss:// 前缀、路径或端口，否则启动会报错。
 # 默认使用百炼通用域名 dashscope.aliyuncs.com；
@@ -73,9 +75,10 @@ key = "sk-your-dashscope-api-key-here"
 # audio = "samples/edgar-ja.wav"
 
 [audio]
-# 不填 = 系统默认设备；设备名称支持模糊匹配（不区分大小写）
-# input_device = "Microphone"
-# output_device = "CABLE Input"
+# 不填 = 系统默认设备。GUI 从下拉框选择后写入**完整设备名**，启动时按精确名称匹配；
+# 设备改名/被拔掉时会明确报错，不会静默回退到默认设备。
+# input_device = "Microphone (USB Audio)"
+# output_device = "CABLE Input (VB-Audio Virtual Cable)"
 
 [vad]
 # 本地 VAD 门控：只上传语音段，节省 ASR 费用（默认开启）
