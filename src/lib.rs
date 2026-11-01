@@ -5,6 +5,10 @@
 //!
 //! 本 crate 只支持 Windows，且只支持便携模式：所有可写文件都在 exe 同目录。
 
+// 渲染后端必须二选一；两个都关掉时给出明确编译错误，而不是运行期黑屏。
+#[cfg(not(any(feature = "renderer-wgpu", feature = "renderer-glow")))]
+compile_error!("必须启用 renderer-wgpu 或 renderer-glow 之一（见 Cargo.toml [features]）");
+
 pub mod app;
 pub mod audio;
 pub mod client;

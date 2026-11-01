@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.8，**M0 与 M4 已完成**，下一步 M1
+> **状态**：草案 v0.9，**M0 与 M4 已完成**（wgpu 后端已恢复），下一步 M1
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -46,7 +46,7 @@
 | 项目 | 现状 |
 |---|---|
 | 代码规模 | 迁移前约 7.4k 行；M0/M4 之后 `src/` 共 7737 行（新增 GUI/admin 约 1.2k，删除 `voice/cli.rs` 931 行） |
-| 依赖 | tokio 全异步、cpal 音频、tokio-tungstenite WebSocket、reqwest、eframe/egui（glow 后端）、log、chrono；clap/colored 现在只被调试 CLI 使用 |
+| 依赖 | tokio 全异步、**cpal 0.18**（0.15 升上来的：设备名走 `DeviceTrait::description`、`sample_rate()` 返回 u32、`build_*_stream` 收 `StreamConfig` 值）、tokio-tungstenite、reqwest、eframe/egui（默认 wgpu/DX12，可切 glow）、log、chrono；clap/colored 只被调试 CLI 使用 |
 | 入口 | `src/main.rs`：eframe GUI 入口；`src/bin/admin.rs`：调试 CLI（M4 已实现） |
 | 音色工具结构 | `voice/cli.rs` 已删除；远程列表/删除逻辑在 `voice/admin.rs`（纯逻辑、可用 mock 测试），终端交互与表格在 bin 里 |
 | 测试 | 全部模块内 `#[cfg(test)]`；`voice/mock_http.rs` 被 `voice/api.rs`、`voice/cache.rs`、`voice/admin.rs`、`voice/mod.rs` 复用；根目录 `tests/` 为空 |
@@ -75,12 +75,19 @@
 ### D1 ✅ GUI 框架：egui + eframe 0.37.0，版本钉死
 
 ```toml
-# 渲染后端用 glow（OpenGL），原因见 D9
+[features]
+# 渲染后端二选一：默认 wgpu（DX12），截图核对时用 glow 变体（见 D9）
+default = ["renderer-wgpu"]
+renderer-wgpu = ["eframe/wgpu"]
+renderer-glow = ["eframe/glow"]
+
+[dependencies]
 eframe = { version = "=0.37.0", default-features = false, features = [
-    "glow", "default_fonts", "system_fonts", "accesskit", "clipboard", "links", "inspection",
+    "default_fonts", "system_fonts", "accesskit", "clipboard", "links", "inspection",
 ] }
 ```
 
+- **两个后端都能用**：默认 `cargo build` 用 wgpu；`cargo build --no-default-features --features renderer-glow` 产出 OpenGL 版（唯一支持 `EFRAME_SCREENSHOT_TO` 截图的组合）。
 - **理由**：纯 Rust、单 exe、零运行时依赖；立即模式使 UI 与状态同处一个函数，最适合"控制面板 + 日志 + 字幕"这类工具；inspection + kittest 让 AI 能"看见并操作"界面。
 - **不启用 `persistence`**：窗口状态不持久化（D17 决定），避免它默认写系统配置目录、破坏便携性。
 - **MSRV**：egui 0.37 要求 Rust ≥ 1.95；本机 1.99.1，满足。
@@ -175,19 +182,22 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 启动阶段致命错误（配置无效、目录不可写、显卡初始化失败）显示整页错误界面，不直接退出。
 - 新代码引入 `let _ =` 必须在 code review / AI 约定中被质疑一次（见 D15）。
 
-### D9 ✅ 渲染后端：用 glow（OpenGL），不是 wgpu
+### D9 ✅ 渲染后端：默认 wgpu（DX12），glow 作为截图/兜底变体
 
-**结论（M0 实测后改定）**：`eframe` 只启用 `glow`，不启用默认的 `wgpu`。
+**结论（v0.9 改定）**：升级 `cpal` 0.15 → **0.18** 后，wgpu 后端可以正常编译与运行，恢复为默认。
 
-原因：`wgpu 30.0.1` 的 `gpu-allocator 0.28` 依赖声明是 `windows = ">=0.53, <=0.62"`，
-而项目的 `cpal 0.15.3` 固定依赖 `windows 0.54`，Cargo 为了去重把 gpu-allocator 的
-`windows` 也解析成 0.54；`wgpu-hal` 自身用 `windows 0.62`，于是 DX12 后端的
-`CreatePlacedResource(heap)` 出现跨版本类型不匹配，**wgpu-hal 直接编译失败**（不是运行期问题）。
+原因回顾（已解决）：`wgpu 30.0.1` 的 `gpu-allocator 0.28` 声明 `windows = ">=0.53, <=0.62"`，
+而旧 `cpal 0.15.3` 固定 `windows 0.54`，Cargo 为去重把 gpu-allocator 的 `windows` 也解析成 0.54，
+与 wgpu-hal 的 0.62 不一致 → DX12 后端跨版本类型不匹配、编译失败。
+`cpal 0.18.2` 已改用 `windows ^0.62`，依赖图里 0.54 彻底消失，gpu-allocator 与 wgpu-hal 对齐。
 
-- 换成 glow 后构建通过（首编 38s，二进制也更小），已用 `EFRAME_SCREENSHOT_TO` 截图确认渲染正常。
-- 代价（记录在案）：OpenGL 在 Windows 远程桌面下可能退回 1.1，导致启动失败。若遇到，
-  表现是 `run_native` 返回错误并写入日志/crash.log；后续可考虑等 wgpu 上游修复或升级 cpal 后再切回。
-- 影响面：M0 已把 `NativeOptions.renderer` 显式设为 `Glow`，Cargo 特性见 D1。
+- **默认**：`renderer-wgpu`（DX12）。本机实测：启动后 wgpu 枚举到 4 个适配器（Vulkan/DX12 的 RTX 5070 Ti、`Microsoft Basic Render Driver`、GL），进程稳定运行。
+- **可选**：`--no-default-features --features renderer-glow` 出 OpenGL 变体。它有两个用途：
+  1. **截图核对**：`eframe` 的 `__screenshot` 只实现了 glow 路径（wgpu 侧是 `assert!` 未实现）；
+  2. 万一某台机器/远程桌面 DX12 初始化失败，用这个变体兜底。
+- **cpal 0.18 带来的代码适配**（已改）：`DeviceTrait::name()` → `description()?.name()`；
+  `sample_rate()` 返回 `u32`（不再 `.0`）；`build_input_stream/build_output_stream` 收 `StreamConfig` 值（用 `supported_config.config()`）。
+- 影响面：`src/app.rs` 按 feature 选择 `eframe::Renderer`；`scripts/dev-run.ps1 -Glow` 可直接跑 OpenGL 变体。
 
 ### D10 ✅ 字体：不打包字体，依赖系统字体按需加载
 
@@ -320,7 +330,8 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 
 | 位置 | 处理 |
 |---|---|
-| `Cargo.toml` | 删 `clap` 在主程序的使用（依赖保留，仅调试工具用）；`colored` 同理保留给调试工具；加 `eframe`、`log`、`toml_edit`、`rfd` |
+| `Cargo.toml` | 删 `clap` 在主程序的使用（依赖保留，仅调试工具用）；`colored` 同理保留给调试工具；加 `eframe`、`log`、`chrono`（已完成），M1/M3 再加 `toml_edit`、`rfd`；**cpal 0.15 → 0.18**（v0.9，见 D9），新增 `renderer-wgpu`/`renderer-glow` feature |
+| `src/audio/device.rs`、`capture.rs`、`playback.rs`、`pipeline/orchestrator.rs` | cpal 0.18 适配：`description()?.name()`（新增 `device_name` 辅助）、`sample_rate()` 返回值、`config()` 代替 `&into()`（v0.9 已完成） |
 | `src/config.rs:2` | 删 `use clap::{Parser, Subcommand};` |
 | `src/config.rs:48-71` | 删 `CliArgs` |
 | `src/config.rs:73-87` | 删 `Command` |
@@ -520,7 +531,7 @@ impl AppPaths {
 
 **实施结果**：
 - 构建/测试：`cargo fmt --check` 通过、`cargo build --bins` 通过、`cargo test` 113 个用例全绿。
-- 截图核对：`target/shot-m0-first-run.png`（首启 → 设置页 + 配置无效错误条）、`target/shot-m0-loaded.png`（配置有效 → 实时页）。
+- 截图核对：`target/shot-m0-first-run.png`（首启 → 设置页 + 配置无效错误条）、`target/shot-m0-loaded.png`（配置有效 → 实时页）。当时用 glow 构建截图（wgpu 默认是 v0.9 才恢复的，截图命令见 §10）。
 - 遇到的坑：① `wgpu` 依赖冲突（见 D9）；② `egui::Grid` 触发 multi-pass，eframe 的 `__screenshot`
   在 multi-pass 下会抓到空帧 —— 已把设置页改成普通横排行，并把这条写进第 10 节。
 **预估**：乐观 0.5 天 / 保守 1 天（实际约 2 小时，其中大半花在 wgpu 冲突排查上）
@@ -614,7 +625,7 @@ impl AppPaths {
 | # | 风险 | 概率 | 影响 | 应对 |
 |---|---|---|---|---|
 | R1 | egui 0.37 预热不足：AI 生成旧 API 代码 | 高 | 中 | 钉版本 + AGENTS.md + 报错贴 `docs.rs/0.37.0` |
-| R2 | wgpu 在远程桌面/虚拟机/老显卡失败或花屏 | 中 | 高 | M0 先验证；切 glow（D9） |
+| R2 | 部分机器/远程桌面下 GPU 初始化失败 | 低 | 中 | 默认 wgpu（DX12，M0 已在本机验证到适配器）；失败时用 glow 变体构建兜底，错误写入日志/crash.log |
 | R3 | 去掉控制台后错误静默 | 中 | 高 | panic hook + 文件日志 + 界面错误条（D8）；禁止 `let _ =` |
 | R4 | 便携目录不可写（Program Files、只读盘） | 中 | 高 | 写探测 + 整页提示（D4-4） |
 | R5 | `toml_edit` 改写把配置写坏 / 丢表外注释 | 中 | 高 | 写前 `from_toml_str` 校验、写前 `.bak`、单测覆盖"其它字段不变"、失败不落盘 |
@@ -629,6 +640,7 @@ impl AppPaths {
 | R14 | 立即模式每帧重算导致高 CPU | 低 | 低 | 仅事件到达时 `request_repaint`；`ScrollArea::show_rows` 虚拟化 |
 | R15 | 便携目录被备份/分享，泄露 Key 与音色缓存 | 中 | 中 | README + 设置页提示；zip 不含 config.toml |
 | R16 | 调试工具删掉仍被 `voice_cache.json` 引用的远端音色 → GUI 合成报"音色不存在" | 中 | 中 | 文档说明：删除 `voice_cache.json` 或改配置触发重新复刻；v2 可做"TTS 报 not-found 时失效缓存并重试一次" |
+| R17 | cpal 0.15→0.18 升级后只验证了设备枚举（能列出输入/输出设备），**录音/播放链路未做真机回归** | 中 | 高 | M2 首次接管线时必须实测：麦克风采集、扬声器播放、断连重连；失败优先看采样格式/重采样分支 |
 
 ---
 
@@ -638,8 +650,9 @@ impl AppPaths {
 2. **每轮门禁**：`cargo fmt --check && cargo build --bins && cargo test`，失败把完整错误贴回模型；不允许 `--no-verify`。
 3. **文件规模**：`gui/` 下每个文件 ≤ 300 行，便于 AI 精确修改与 review。
 4. **运行期观测**：`EGUI_INSPECTION=1` + egui_mcp 让 agent 自己点一遍；kittest 做回归。
-5. **截图核对**：`cargo run --features "eframe/__screenshot"` + `EFRAME_SCREENSHOT_TO=xxx.png`
-   可以无交互截屏后自动退出。⚠️ 但 `egui::Grid` 之类会触发 multi-pass（`request_discard`）的组件
+5. **截图核对**：wgpu 后端不支持 `EFRAME_SCREENSHOT_TO`（上游未实现），需要临时用 glow 变体构建：
+   `$env:EFRAME_SCREENSHOT_TO="xxx.png"; cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"`
+   —— 无交互截屏后自动退出。⚠️ 但 `egui::Grid` 之类会触发 multi-pass（`request_discard`）的组件
    会让它抓到**空帧**（M0 实测）；需要截图核对的页面避免用 Grid，或用 kittest 语义断言替代。
 6. **提交粒度**：一个里程碑一组 commit；提交前按 AGENTS.md 跑全套检查。
 7. **回归测试**：M2 起补 kittest 三条守门用例（见 D14）。
@@ -658,3 +671,4 @@ impl AppPaths {
 | v0.6 | 2026-11-01 | **M0 实施完成**：新增 `src/lib.rs` / `main.rs`（GUI 入口）/ `app.rs` / `paths.rs` / `log_sink.rs` / `gui/*` / `scripts/dev-run.ps1`；删除 `config.rs` 的 CLI 类型与用例；`config.example.toml` 改为内嵌模板（key 注释）。**渲染后端由 wgpu 改为 glow**（D9：wgpu 30.0.1 + gpu-allocator 0.28 被 cpal 的 windows 0.54 拖成版本冲突，wgpu-hal DX12 编译失败）；设置页去掉 `egui::Grid`（multi-pass 会让 eframe `__screenshot` 抓到空帧，已写入 §10）。验证：fmt/build/test（113 用例）全绿，两张截图确认中文与布局正常 |
 | v0.7 | 2026-11-01 | **M4 实施完成**：新增 `voice/admin.rs`（`list_remote_voices` 强制完整分页、`delete_remote_voice` 区分已删除/本来不存在、`delete_all_remote_voices` 三分类报告，7 个 mock 测试）与调试 bin（`-c/--config`、`list`、`delete --voice-id`、`delete-all -y`，交互确认需输入 YES）；**删除 `voice/cli.rs` 931 行**（enroll 与配置/缓存耦合逻辑一并移除）；`Cargo.toml` 加 `default-run = "kaols"`；顺手把 `AppConfig::load` 的错误提示从"复制 config.example.toml"改成"程序会在 exe 同目录自动生成"。验证：`cargo build --bins` + `cargo test`（110 用例）全绿，CLI 帮助/配置缺失/非交互确认三条路径手工验证 |
 | v0.8 | 2026-11-01 | 按你的要求把调试 CLI 改名为 **`admin`**：`src/bin/kaols-voice-admin.rs` → `src/bin/admin.rs`，clap `name = "admin"`，文档与命令示例同步（`cargo run --bin admin -- list`）；功能与参数不变 |
+| v0.9 | 2026-11-01 | **cpal 0.15 → 0.18 升级，wgpu 后端恢复为默认**（D9 重写）：cpal 0.18 改用 `windows ^0.62`，依赖图里 0.54 消失，`gpu-allocator` 与 `wgpu-hal` 对齐，wgpu 编译/运行通过（本机枚举到 4 个适配器，DX12 RTX 5070 Ti 可用）。代码适配：`DeviceTrait::name()`→`description()?.name()`（新增 `audio::device::device_name`）、`sample_rate()` 返回 u32、`build_*_stream` 收 `StreamConfig` 值（`supported_config.config()`）。Cargo 增加 `renderer-wgpu`（默认）/`renderer-glow` 两个 feature，`app.rs` 按 feature 选渲染器；glow 变体保留用于截图核对（wgpu 不支持 `EFRAME_SCREENSHOT_TO`）与 OpenGL 兜底；`dev-run.ps1 -Glow`。验证：两种变体均构建通过，GUI 以 wgpu 启动 6s 稳定运行，cpal 0.18 设备枚举正常（中英文设备名正确），`cargo test` 全绿。新增 R17（音频链路未做真机回归） |

@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2021"
 default-run = "kaols"
 
+[features]
+# 渲染后端二选一：默认 wgpu（DX12，远程桌面也能用）。
+# 需要 `EFRAME_SCREENSHOT_TO` 截图核对时改用：
+#   cargo run --no-default-features --features renderer-glow -- --help
+default = ["renderer-wgpu"]
+renderer-wgpu = ["eframe/wgpu"]
+renderer-glow = ["eframe/glow"]
+
 [dependencies]
 # GUI：立即模式框架，版本钉死（见 GUI_MIGRATION.md D1/D15）。
-# 渲染后端用 glow（OpenGL）：wgpu 30.0.1 + gpu-allocator 0.28 会被 cpal 的
-# windows 0.54 依赖拖成错误版本，导致 wgpu-hal 的 DX12 后端无法编译（D9 兜底方案）。
+# 两个后端共用这些基础特性；渲染后端由上面的 feature 决定。
 eframe = { version = "=0.37.0", default-features = false, features = [
-    "glow",
     "default_fonts",
     "system_fonts",
     "accesskit",
@@ -19,11 +25,10 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 ] }
 log = "0.4"
 chrono = "0.4"
-
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
-cpal = "0.15"
+cpal = "0.18"
 ringbuf = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use colored::Colorize;
-use cpal::traits::DeviceTrait;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -96,10 +95,10 @@ impl PipelineOrchestrator {
         let voice = crate::voice::resolve_active_voice(&self.config).await?;
 
         let in_dev = device_mgr.get_input_device(self.config.audio.input_device.as_deref())?;
-        let in_dev_name = in_dev.name().unwrap_or_else(|_| "默认麦克风".into());
+        let in_dev_name = crate::audio::device::device_name(&in_dev);
 
         let out_dev = device_mgr.get_output_device(self.config.audio.output_device.as_deref())?;
-        let out_dev_name = out_dev.name().unwrap_or_else(|_| "默认扬声器".into());
+        let out_dev_name = crate::audio::device::device_name(&out_dev);
 
         println!(
             "{}",

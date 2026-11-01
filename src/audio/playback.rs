@@ -99,7 +99,7 @@ impl AudioPlaybackEngine {
             .default_output_config()
             .context("获取默认输出音频配置失败")?;
 
-        let native_sample_rate = supported_config.sample_rate().0;
+        let native_sample_rate = supported_config.sample_rate();
         let channels = supported_config.channels() as usize;
         let sample_format = supported_config.sample_format();
 
@@ -116,7 +116,7 @@ impl AudioPlaybackEngine {
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
-                &supported_config.into(),
+                supported_config.config(),
                 move |data: &mut [f32], _| {
                     let mut queue = queue_clone.lock().unwrap();
 
@@ -139,7 +139,7 @@ impl AudioPlaybackEngine {
                 None,
             )?,
             SampleFormat::I16 => device.build_output_stream(
-                &supported_config.into(),
+                supported_config.config(),
                 move |data: &mut [i16], _| {
                     let mut queue = queue_clone.lock().unwrap();
 

@@ -18,7 +18,7 @@ impl AudioCapture {
             .default_input_config()
             .context("获取默认输入配置失败")?;
 
-        let native_sample_rate = supported_config.sample_rate().0;
+        let native_sample_rate = supported_config.sample_rate();
         let channels = supported_config.channels();
         let sample_format = supported_config.sample_format();
 
@@ -54,7 +54,7 @@ impl AudioCapture {
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
-                &supported_config.into(),
+                supported_config.config(),
                 move |data: &[f32], _| {
                     if !capturing_flag.load(Ordering::Relaxed) {
                         return;
@@ -70,7 +70,7 @@ impl AudioCapture {
                 None,
             )?,
             SampleFormat::I16 => device.build_input_stream(
-                &supported_config.into(),
+                supported_config.config(),
                 move |data: &[i16], _| {
                     if !capturing_flag.load(Ordering::Relaxed) {
                         return;

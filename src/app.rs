@@ -241,6 +241,21 @@ pub fn load_config(path: &Path) -> ConfigState {
     }
 }
 
+/// 选择渲染后端（默认构建启用 `renderer-wgpu`）。
+///
+/// 只有 `--no-default-features --features renderer-glow` 构建才有 glow；
+/// 那个组合是唯一支持 `EFRAME_SCREENSHOT_TO` 截图核对的（wgpu 后端上游未实现该调试特性）。
+#[cfg(feature = "renderer-wgpu")]
+fn preferred_renderer() -> eframe::Renderer {
+    eframe::Renderer::Wgpu
+}
+
+/// 选择渲染后端（仅 glow 构建，用于截图核对/OpenGL 兜底）。
+#[cfg(all(feature = "renderer-glow", not(feature = "renderer-wgpu")))]
+fn preferred_renderer() -> eframe::Renderer {
+    eframe::Renderer::Glow
+}
+
 /// GUI 入口：完成启动准备后进入 eframe 事件循环。
 pub fn run(paths: AppPaths) -> ExitCode {
     // 尽可能早地安装崩溃钩子：release 构建没有控制台，这是唯一的崩溃线索。
@@ -301,7 +316,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
     };
 
     let native_options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Glow,
+        renderer: preferred_renderer(),
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
             .with_inner_size([1100.0, 720.0])
