@@ -46,6 +46,13 @@ pub struct SubtitleState {
 }
 
 impl SubtitleState {
+    /// 新会话开始时只清掉「当前句」，**保留历史**（停止/重启管线不清空已识别字幕）。
+    pub fn reset_current(&mut self) {
+        self.current.clear();
+        self.sent_bytes = 0;
+        self.language = None;
+    }
+
     /// 把一条 ASR 事件并入字幕状态（纯逻辑，便于单测）。
     ///
     /// - 非空文本：刷新当前句，记录已送 TTS 的字节前缀与语言；
@@ -134,6 +141,12 @@ pub struct KaolsApp {
     pub session: Option<PipelineSessionHandle>,
     /// 后台事件接收端（与 `session` 同生命周期）。
     pub events_rx: Option<mpsc::UnboundedReceiver<PipelineEvent>>,
+    /// 启动会话时使用的配置指纹（用于判断「运行中配置被改」）。
+    pub running_config_signature: Option<String>,
+    /// 配置变更后等待旧会话退出、再自动重启。
+    pub restart_pending: bool,
+    /// 最近一帧的 egui Context（自动重启时用来请求重绘）。
+    pub egui_ctx: Option<egui::Context>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub config: ConfigState,
@@ -150,6 +163,8 @@ pub struct KaolsApp {
     pub subtitles: SubtitleState,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
+    /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
+    pub vad_active: bool,
     /// 本次启动是否刚刚生成了默认配置。
     pub config_created: bool,
     /// 启动检查发现的问题（写默认配置失败、初始化日志失败等）。
@@ -183,6 +198,9 @@ impl KaolsApp {
             state: SessionState::Idle,
             session: None,
             events_rx: None,
+            running_config_signature: None,
+            restart_pending: false,
+            egui_ctx: None,
             input_device: None,
             output_device: None,
             config,
@@ -193,6 +211,7 @@ impl KaolsApp {
             config_write_error: None,
             subtitles: SubtitleState::default(),
             pipeline_error: None,
+            vad_active: false,
             config_created,
             startup_error,
             crash: None,
@@ -211,6 +230,8 @@ impl KaolsApp {
         // 配置可能删掉了当前选中的音色；清空选择，语音合成页会重新判定。
         self.selected_voice = None;
         info!("已重新加载配置：{}", self.paths.config_file.display());
+        // 运行中改配置（Key/设备等）→ 用新配置自动重启管线
+        self.maybe_restart_session();
     }
 
     /// 把配置里的 Key / 设备同步到界面状态（加载、重载、写回成功后调用）。
@@ -317,11 +338,15 @@ impl KaolsApp {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = PipelineSessionHandle::new();
+        self.restart_pending = false;
+        self.running_config_signature = Some(config_signature(&config));
         self.session = Some(handle.clone());
         self.events_rx = Some(rx);
         self.state = SessionState::Starting;
         self.pipeline_error = None;
-        self.subtitles = SubtitleState::default();
+        self.vad_active = false;
+        // 只清当前未完成的句子；历史字幕保留（用户要求停止管线后不清空历史）
+        self.subtitles.reset_current();
 
         let runtime = self.runtime.handle().clone();
         let events_for_run = tx.clone();
@@ -348,8 +373,30 @@ impl KaolsApp {
         if let Some(session) = &self.session {
             session.stop();
             self.state = SessionState::Stopping;
+            // 停止按钮立即清空「当前句」（历史保留），不用等下次开始
+            self.subtitles.reset_current();
             info!("正在停止实时管线…");
         }
+    }
+
+    /// 运行中配置发生变化时：停掉旧会话，等 Idle 事件后用新配置自动重启。
+    fn maybe_restart_session(&mut self) {
+        if !matches!(self.state, SessionState::Starting | SessionState::Running) {
+            return;
+        }
+        let ConfigState::Loaded(config) = &self.config else {
+            return;
+        };
+        let signature = config_signature(config);
+        if self.running_config_signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        if self.session.is_none() {
+            return;
+        }
+        info!("配置已变更，正在用新配置重启实时管线…");
+        self.restart_pending = true;
+        self.stop_session();
     }
 
     /// 排空后台事件（每帧一次）。
@@ -382,6 +429,18 @@ impl KaolsApp {
                 self.state = state;
                 if matches!(state, SessionState::Idle | SessionState::Failed) {
                     self.session = None;
+                    self.running_config_signature = None;
+                    self.vad_active = false;
+                    // 会话结束：清掉可能残留的「当前句」（历史保留）
+                    self.subtitles.reset_current();
+                    // 配置变更触发的停止：旧会话已退出，用新配置自动重启
+                    if self.restart_pending && !self.closing {
+                        self.restart_pending = false;
+                        if let Some(ctx) = self.egui_ctx.clone() {
+                            info!("旧会话已退出，使用新配置重启实时管线");
+                            self.start_session(ctx);
+                        }
+                    }
                 }
             }
             PipelineEvent::Devices { input, output } => {
@@ -396,6 +455,7 @@ impl KaolsApp {
             } => self
                 .subtitles
                 .apply_asr(&text, is_sentence_end, sent_bytes, language),
+            PipelineEvent::VadActive(active) => self.vad_active = active,
             PipelineEvent::Error { context, detail } => {
                 self.pipeline_error = Some(format!("{context}：{detail}"));
                 error!("{context}：{detail}");
@@ -425,6 +485,7 @@ impl KaolsApp {
         }
         if ctx.input(|input| input.viewport().close_requested()) {
             self.closing = true;
+            self.restart_pending = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint();
             // D13：先请求停止实时管线（后台任务退出前会 drop 音频设备），再关窗。
@@ -488,6 +549,8 @@ impl eframe::App for KaolsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_logs();
         self.pump_events();
+        // 自动重启需要 Context 来 request_repaint（点击「开始」时也会传一份）
+        self.egui_ctx = Some(ui.ctx().clone());
 
         let ctx = ui.ctx().clone();
         if self.request_close(&ctx) {
@@ -504,6 +567,47 @@ impl eframe::App for KaolsApp {
             .show(ui, |ui| gui::log_panel::show(self, ui));
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
     }
+}
+
+/// 配置指纹：用于判断「运行中配置是否变了」。
+///
+/// 不能直接 `format!("{config:?}")`：`custom_voices` 是 `HashMap`，Debug 输出顺序取决于
+/// 每个实例的随机种子，两次解析出的相同配置也会被判定为"变了"（导致每次保存都重启）。
+/// 这里手工拼一个**顺序稳定**的指纹，只包含会影响运行的内容。
+fn config_signature(config: &AppConfig) -> String {
+    use std::fmt::Write as _;
+
+    let mut voices: Vec<_> = config.tts.custom_voices.iter().collect();
+    voices.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut signature = String::new();
+    let _ = write!(
+        signature,
+        "key={:?}\nhost={}\nasr={}\nlangs={:?}\ntts={}\nvoice={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\n",
+        config.api.key,
+        config.api.workspace_host,
+        config.asr.model,
+        config.asr.languages,
+        config.tts.model,
+        config.tts.voice,
+        config.tts.cache_file,
+        config.audio.input_device,
+        config.audio.output_device,
+        config.vad.enabled,
+        config.vad.margin_db,
+        config.vad.hangover_ms,
+        config.vad.tail_ms,
+        config.vad.debug,
+        config.chunking.words,
+    );
+    for (name, voice) in voices {
+        let _ = write!(signature, "voice:{name}:{:?}:", voice.name);
+        for sample in &voice.samples {
+            let _ = write!(signature, "{}={:?};", sample.language, sample.audio);
+        }
+        signature.push('\n');
+    }
+    signature
 }
 
 /// 从指定路径加载配置，失败时返回可展示的错误文本。
@@ -735,5 +839,69 @@ mod tests {
             state.history.last().map(|line| line.text.as_str()),
             Some(format!("第 {MAX_SUBTITLES} 句。").as_str())
         );
+    }
+
+    #[test]
+    fn config_signature_is_stable_across_instances() {
+        // `custom_voices` 是 HashMap，两次解析的同内容配置 Debug 顺序可能不同；
+        // 指纹必须稳定，否则每次保存配置都会误判"配置已变更"而重启管线。
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[tts.custom_voices."a"]
+[[tts.custom_voices."a".samples]]
+language = "zh"
+audio = "a.mp3"
+
+[tts.custom_voices."b"]
+[[tts.custom_voices."b".samples]]
+language = "ja"
+audio = "b.mp3"
+
+[tts.custom_voices."c"]
+[[tts.custom_voices."c".samples]]
+language = "en"
+audio = "c.mp3"
+"#;
+
+        let first = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let signature = config_signature(&first);
+        for _ in 0..20 {
+            let another = crate::config::AppConfig::from_toml_str(toml).unwrap();
+            assert_eq!(config_signature(&another), signature);
+        }
+    }
+
+    #[test]
+    fn config_signature_detects_changes() {
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[audio]
+input_device = "mic-a"
+"#;
+        let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let changed =
+            crate::config::AppConfig::from_toml_str(&toml.replace("mic-a", "mic-b")).unwrap();
+
+        assert_ne!(config_signature(&base), config_signature(&changed));
+    }
+
+    #[test]
+    fn reset_current_keeps_history() {
+        let mut state = SubtitleState::default();
+        apply(&mut state, "第一句。", true, 0, Some("zh"));
+        apply(&mut state, "第二句还没说完", false, 4, Some("zh"));
+
+        state.reset_current();
+
+        assert!(state.current.is_empty());
+        assert_eq!(state.sent_bytes, 0);
+        assert_eq!(state.language, None);
+        // 已结束的句子必须保留（停止/重启管线不清空字幕历史）
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "第一句。");
     }
 }

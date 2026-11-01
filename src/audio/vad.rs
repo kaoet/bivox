@@ -15,6 +15,8 @@
 //!   `sentence_end`，所以语音结束后要补足尾部静音（hangover + tail 合计约 1.5s）。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 16kHz 单声道 PCM16：每毫秒 32 字节
 const BYTES_PER_MS: usize = 32;
@@ -68,6 +70,8 @@ pub struct GateConfig {
     pub keepalive_ms: u32,
     /// 打印每 chunk 的检测/发送决策，用于现场标定阈值
     pub debug: bool,
+    /// 可选：把「当前是否处于语音段」发布到共享标志（GUI 顶栏的 VAD 指示器用）
+    pub active_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GateConfig {
@@ -78,6 +82,7 @@ impl Default for GateConfig {
             tail_ms: 1000,
             keepalive_ms: 10_000,
             debug: false,
+            active_flag: None,
         }
     }
 }
@@ -302,6 +307,10 @@ impl<D: VoiceDetector> SpeechGate<D> {
 
         // 2. 决定本 chunk 是否发送
         let mut out = Vec::new();
+        // 把「当前是否在语音段」发布给 GUI（含 hangover 结束后自动变回 false）
+        if let Some(flag) = &self.config.active_flag {
+            flag.store(self.detector.is_active(), Ordering::Relaxed);
+        }
         if any_active {
             if onset {
                 // 起音：补发 pre-roll（历史 chunk），再发当前 chunk
@@ -354,6 +363,9 @@ impl<D: VoiceDetector> SpeechGate<D> {
         self.pre_roll_bytes = 0;
         self.tail_ms_left = 0;
         self.idle_ms_since_send = 0;
+        if let Some(flag) = &self.config.active_flag {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     fn push_pre_roll(&mut self, chunk: Vec<u8>) {
@@ -414,6 +426,7 @@ mod tests {
             tail_ms: 200,
             keepalive_ms: 500,
             debug: false,
+            active_flag: None,
         }
     }
 

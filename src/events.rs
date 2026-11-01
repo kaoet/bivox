@@ -52,6 +52,8 @@ pub enum PipelineEvent {
         sent_bytes: usize,
         language: Option<String>,
     },
+    /// 本地 VAD 是否处于语音段（顶栏指示器用）。
+    VadActive(bool),
     Error {
         context: String,
         detail: String,

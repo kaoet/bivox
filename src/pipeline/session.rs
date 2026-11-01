@@ -38,6 +38,8 @@ pub struct PipelineSessionHandle {
     running: Arc<AtomicBool>,
     /// 是否为用户主动停止（用于区分"用户停止"与"服务异常自行退出"）。
     stop_requested: Arc<AtomicBool>,
+    /// 本地 VAD 当前是否处于语音段（由 `SpeechGate` 更新，GUI 只读）。
+    vad_active: Arc<AtomicBool>,
 }
 
 impl PipelineSessionHandle {
@@ -45,7 +47,18 @@ impl PipelineSessionHandle {
         Self {
             running: Arc::new(AtomicBool::new(true)),
             stop_requested: Arc::new(AtomicBool::new(false)),
+            vad_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 当前本地 VAD 是否处于语音段。
+    pub fn vad_active(&self) -> bool {
+        self.vad_active.load(Ordering::Relaxed)
+    }
+
+    /// 会话停止/失败后把指示器复位。
+    pub fn reset_vad(&self) {
+        self.vad_active.store(false, Ordering::Relaxed);
     }
 
     /// 请求停止（用户点「停止」或关窗时调用；后台任务会在一个轮询周期内退出）。
@@ -144,6 +157,8 @@ pub async fn run(
             },
             tail_ms: config.vad.tail_ms,
             debug: config.vad.debug,
+            // 把语音段状态发布给 GUI 顶栏的 VAD 指示器
+            active_flag: Some(handle.vad_active.clone()),
             ..Default::default()
         }))
     } else {
@@ -221,6 +236,8 @@ pub async fn run(
     let mut language_state = SentenceLanguageState::new(config.asr.languages.clone());
     // 当前句已判定的语言（首个 chunk 送出前为 None，句终后清空）
     let mut sentence_language: Option<String> = None;
+    // 上一次推给界面的 VAD 状态（避免每 100ms 都发事件）
+    let mut last_vad_active = false;
 
     loop {
         let maybe_event = tokio::select! {
@@ -228,6 +245,12 @@ pub async fn run(
             _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {
                 if handle.is_cancelled() {
                     break;
+                }
+                // 静音期间没有 ASR 事件，也要把 VAD 状态变化推给界面
+                let vad_active = handle.vad_active();
+                if vad_active != last_vad_active {
+                    last_vad_active = vad_active;
+                    emit(PipelineEvent::VadActive(vad_active));
                 }
                 continue;
             }
@@ -278,6 +301,14 @@ pub async fn run(
             sentence_language = None;
         }
         language_state.on_event_end(event.is_sentence_end);
+
+        // 处理 ASR 事件后同样检查 VAD 状态变化（语音段起止）
+        let vad_active = handle.vad_active();
+        if vad_active != last_vad_active {
+            last_vad_active = vad_active;
+            emit(PipelineEvent::VadActive(vad_active));
+        }
+
         if handle.is_cancelled() {
             break;
         }
@@ -285,6 +316,7 @@ pub async fn run(
 
     // 收尾（D13）：先停采集，再关 TTS 通道，最后等后台任务退出。
     handle.abort_background();
+    handle.reset_vad();
     drop(capture);
     drop(tx_tts);
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, async {

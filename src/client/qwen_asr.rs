@@ -478,6 +478,7 @@ mod tests {
             tail_ms: 200,
             keepalive_ms: 500,
             debug: false,
+            active_flag: None,
         });
 
         let ws_url = format!("ws://{}/api-ws/v1/inference", addr);

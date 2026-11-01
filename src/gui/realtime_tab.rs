@@ -13,7 +13,7 @@ const SUBTITLE_FONT_SIZE: f32 = 24.0;
 /// 语言代码字号。
 const LANGUAGE_FONT_SIZE: f32 = 13.0;
 /// 左侧语言列宽（当前句与历史句共用，保证文本左端对齐）。
-const LANGUAGE_COL_WIDTH: f32 = 40.0;
+const LANGUAGE_COL_WIDTH: f32 = 24.0;
 /// 右侧复制图标占位宽（只为历史居留出，避免图标压住文字）。
 const COPY_SLOT_WIDTH: f32 = 24.0;
 /// 复制图标点击区边长。

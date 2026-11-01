@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.24，**M0、M1、M2、M4、D0 已完成**；下一步 M3（音色配置编辑器）
+> **状态**：草案 v0.30，**M0、M1、M2、M4、D0 已完成**；下一步 M3（音色配置编辑器）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -273,8 +273,9 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 字幕**只支持单句复制**（每行一个复制按钮），不提供"复制全部"、不导出。
 - 实时页字幕**不分段、无标题**：当前正在合成的句子在最上面，越早的字幕越靠下；列表顶部对齐（0.37 的 `ScrollArea` 没有 `stick_to_top`，靠默认顶部偏移实现）、字号 24px、行间分隔线。
 - 当前正在合成的句子**不显示复制按钮**；并按 TTS 进度分色：已送入 TTS 的部分用正常色，ASR 已识别但尚未送入 TTS 的部分用弱色（正常色 ×0.45）。`PipelineEvent::Asr` 带 `sent_bytes`（字符边界前缀），由 `TextChunker::emitted_byte_len` 计算；入历史后整句恢复普通色。当前句用 `LayoutJob` 分色时**必须 `Label::new(job).wrap()`**：水平布局里 Label 默认 `wrap_mode = Extend`，会把 `job.wrap.max_width` 覆盖成 `INFINITY`，导致长句不换行直接溢出（v0.24 修复）。
-- 每行最左侧固定宽度显示**本句语言代码**（当前句在语言判定前显示 `…`），当前句与历史句的文本左端对齐。语言列必须用 `allocate_exact_size` 显式占位：用 `allocate_ui_with_layout` 时外层拿的是子 Ui 的 `min_rect`（缩到内容宽度），`…` 比 `ja` 窄会让文本左移（v0.23 修复）。
+- 每行最左侧固定宽度（**24px**）显示**本句语言代码**（当前句在语言判定前显示 `…`），当前句与历史句的文本左端对齐。语言列必须用 `allocate_exact_size` 显式占位：用 `allocate_ui_with_layout` 时外层拿的是子 Ui 的 `min_rect`（缩到内容宽度），`…` 比 `ja` 窄会让文本左移（v0.23 修复）。
 - 历史句的复制按钮改为**行尾图标**（自绘"两张叠纸"，不依赖 emoji 字体），只在鼠标悬停该行时显示；当前句无复制按钮。
+- **停止/重启管线不清空字幕历史**：`stop_session()` 会**立即**清掉「当前正在合成的句子」（含已送 TTS 前缀与语言），历史保留；`start_session()` 同样只清当前句（`SubtitleState::reset_current()`），会话以 Idle/Failed 结束时也会再兜底清一次。
 - 不保存历史会话到磁盘。
 - 日志面板不提供复制/导出。
 
@@ -309,6 +310,27 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - **实现状态（M4 已完成）**：`src/voice/admin.rs` + `src/bin/admin.rs`，命令为
   `admin [-c config.toml] list | delete --voice-id <id> [-y] | delete-all [-y]`；
   已手工验证帮助/配置缺失/非交互确认三条路径，7 个 mock 测试覆盖列表与删除结果分类。
+
+### D20 ✅ 运行中配置热更新：自动重启实时管线
+
+- GUI 写回配置（`[api] key` / `[audio]` 设备）成功后自动重载；若此时管线处于 **Starting / Running** 且"运行时配置指纹"发生变化：
+  1. 标记 `restart_pending`，调用 `stop_session()` 让旧会话收尾（拆 ASR/TTS、释放音频设备）；
+  2. 收到旧会话的 `StateChanged(Idle)` 后用新配置自动 `start_session()`；
+  3. 日志记录「配置已变更，正在用新配置重启实时管线…」「旧会话已退出，使用新配置重启实时管线」。
+- 「重新加载配置」按钮走同一条路径：内容真的变了才重启，没变不重启。
+- Stopping / Idle / Failed 状态不触发自动重启（用户主动停止优先）；关窗时清除 pending，避免退出前又拉起会话。
+- 重启失败只报一次错，不自动重试（避免坏配置/不可用设备造成重启循环）。
+- **指纹必须顺序稳定**：`AppConfig.custom_voices` 是 `HashMap`，`format!("{config:?}")` 的顺序随实例随机种子变化，会导致"每次保存都误判为配置变化"。`config_signature()` 手工拼接固定顺序（自定义音色按配置名排序），并有 2 个单测防回归。
+
+### D21 ✅ 顶栏本地 VAD 指示器
+
+- 位置：Top panel 里、开始/停止按钮**左侧**，显示为 `VAD ● 状态`，三种状态：
+  - **激活**（绿）：本地 VAD 当前处于语音段（含 hangover 维持）；
+  - **静音**（灰）：管线运行中但未检测到语音 / 管线未运行；
+  - **关闭**（灰）：配置里 `[vad] enabled = false`。
+- 数据来源：`SpeechGate` 处理每个采集 chunk 时把「当前是否在语音段」写进共享 `Arc<AtomicBool>`（`GateConfig.active_flag`），`PipelineSessionHandle::vad_active()` 只读；不额外占用通道。
+- 刷新：会话调度循环每 100ms 轮询该标志，变化时发 `PipelineEvent::VadActive(bool)` + `request_repaint()`（静音期没有 ASR 事件也能及时更新）。
+- 生命周期：`start_session` 置 false；会话停止/失败时 `reset_vad()` 并回到「静音」；悬停有状态说明 tooltip。
 
 ---
 
@@ -771,3 +793,9 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.22 | 2026-11-01 | 字幕列表项 UI 重做：①每行最左固定宽度显示**本句语言代码**（当前句也显示，判定前为 `…`）；②当前句与历史句**文本左端对齐**（共用语言列 + 预留复制位）；③历史句复制按钮改为**行尾自绘复制图标**（无文字），仅悬停该行时显示，点击复制整句。数据层：`PipelineEvent::Asr` 增加 `language`，字幕状态收敛为 `SubtitleState { current, sent_bytes, language, history: Vec<SubtitleLine> }`（消除 clippy too_many_arguments）。验证：fmt / clippy 0 警告 / build / 123 测试；临时演示数据截图核对语言列、对齐、悬停图标后已删除演示代码 |
 | v0.23 | 2026-11-01 | 修**字幕文本左端偶发不对齐**：语言列原来用 `allocate_ui_with_layout(vec2(40, 0))`，但外层按子 Ui 的 `min_rect` 分配空间，语言代码窄（当前句未判定时是 `…`）与宽（`ja`）不同导致文本起点差几个像素。改为 `allocate_exact_size` 固定占位 + `painter` 画语言码，宽度稳定。验证：演示数据（当前句语言未知 `…` + 历史句 `ja`）实测两个文本 Label 的 `bounds.x` 均为 56.0；fmt / clippy 0 警告 / build / 123 测试 |
 | v0.24 | 2026-11-01 | 修**当前句长文本溢出屏幕不换行**：当前句分色用 `LayoutJob` + `Label`，但水平布局里 `Label` 的默认 `wrap_mode` 是 `Extend`，会把 `job.wrap.max_width` 覆盖为 `INFINITY`（历史句因为显式 `.wrap()` 才正常）。改为 `Label::new(job).wrap()`，长句在行宽处正常折行。验证：演示数据长英文句截图确认两行显示（第一行正常色/第二行弱色）；fmt / clippy 0 警告 / build / 123 测试 |
+| v0.25 | 2026-11-01 | 新增 **D20 运行中配置热更新**：写回 Key/设备或「重新加载配置」后，若管线正在 Starting/Running 且配置指纹变化 → 停止旧会话，收到 Idle 后自动用新配置重启；Stopping/Idle/Failed 不重启，关窗清除 pending，失败不循环重试。`config_signature()` 手工稳定拼接（HashMap Debug 顺序不稳定，曾导致每次保存都重启）；新增 2 个单测（跨实例稳定、能识别设备变化）。验证：egui_mcp 实测设备变更/真实配置重载各重启一次并回到「运行中」，重复「恢复系统默认」与保存相同 Key 不再重启；fmt / clippy 0 警告 / **125** 测试 |
+| v0.26 | 2026-11-01 | 按用户要求：**停止/重启管线不再清空字幕历史**。`start_session` 原来整体重置 `SubtitleState`，现在改为 `reset_current()`——只清「当前未说完的句子（含已送 TTS 前缀与语言）」，`history` 保留；新增单测 `reset_current_keeps_history`。验证：演示数据（历史 + 未完成当前句）点「开始」后历史仍在、当前句被清；fmt / clippy 0 警告 / **126** 测试 |
+| v0.27 | 2026-11-01 | 字幕语言列宽度 40px → **30px**（用户觉得偏宽）；文本左端仍对齐。验证：演示数据实测当前句与历史句文本 Label 的 `bounds.x` 均为 46.0（40px 时为 56.0）；fmt / clippy 0 警告 / 126 测试 |
+| v0.28 | 2026-11-01 | 字幕语言列宽度再收窄到 **24px**；含 3 字母代码（`yue`）实测不溢出、各行情景仍对齐。验证：fmt / clippy 0 警告 / 126 测试 |
+| v0.29 | 2026-11-01 | 新增 **D21 顶栏本地 VAD 指示器**（开始/停止按钮左侧）：`SpeechGate` 通过 `GateConfig.active_flag: Arc<AtomicBool>` 发布语音段状态，会话调度循环每 100ms 轮询变化并发 `PipelineEvent::VadActive`；UI 显示「VAD ● 激活（绿）/ 静音（灰）/ 关闭（灰，[vad] enabled=false）」，带 tooltip。验证：egui_mcp 实测 空闲=静音 → 运行中说话=激活（绿，同时出现 ASR 字幕）→ 停止后回到静音；fmt / clippy 0 警告 / build / 126 测试 |
+| v0.30 | 2026-11-01 | 按用户要求：**按「停止」立即清空当前字幕**（不再等下次「开始」）。`stop_session()` 调用 `subtitles.reset_current()`；会话以 Idle/Failed 结束时也兜底清一次；历史字幕仍保留（已完成的句子照常进入历史）。验证：egui_mcp 实测运行中识别到「哈，你说吧…」→ 点停止后该行立刻从“当前句”移除（悬停出现复制图标，说明它已是历史句）；fmt / clippy 0 警告 / 126 测试 |
