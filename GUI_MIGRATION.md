@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.10，**M0 与 M4 已完成**（wgpu 后端已恢复），下一步 M1（或先做 D0 工具链：§11）
+> **状态**：草案 v0.11，**M0、M4、D0（egui_mcp 工具链）已完成**，下一步 M1
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -661,6 +661,8 @@ impl AppPaths {
 
 ## 11. 开发工具链：egui_mcp（D0，非产品里程碑）
 
+> **状态（2026-11-01）：已验证通过。** DSH 重启后工具列表出现 15 个 `mcp__egui__*`；启动 GUI（`EGUI_INSPECTION=1`）后 `attach` → `widget_tree` → `screenshot` 全链路成功（截图：`target/mcp-egui-shot.png`，1100×720，读到了工具栏按钮、三个页签、设置页路径与"未配置 API Key"错误文案）。
+
 **时机**：建议现在就做（M1 之前）。它不改变产品代码，只影响开发期自测方式；M1/M3 的 UI 验证最需要它。最晚在 M2 接实时管线前完成即可。
 
 ### 11.1 应用侧（已就绪，无需改代码）
@@ -682,14 +684,16 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 
 2. **加一条 profile patch**，追加到 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 末尾：
    ```yaml
-   - id: mcp-egui
-     name: '@deepseek-ai/dsh-mcp-client'
-     config:
-       serverName: egui
-       transport: stdio
-       command: 'C:\Users\kaoet\.cargo\bin\egui-mcp.exe'
-       args: []
+   - insert:
+       - id: mcp-egui
+         name: '@deepseek-ai/dsh-mcp-client'
+         config:
+           serverName: egui
+           transport: stdio
+           command: 'C:\Users\kaoet\.cargo\bin\egui-mcp.exe'
+           args: []
    ```
+   ⚠️ **必须用 `- insert:` 包装**：只写 `- id: ...` 会被 Loader 当成「覆盖已有行」，而 `mcp-egui` 不是任何 bundle 预先插入的行 → Loader 只打一条 stderr 警告并跳过（桌面版不落盘，表现就是"完全没生效、也看不到报错"）。`dsh-base` 的 patch 本身也是 `- insert:` 形式。
    （`serverName` 会变成工具名前缀；可用 `env` 覆盖环境变量，见该插件 README。）
 
 3. **重启 DSH**（Cordis profile 在启动时加载）。重启后**新会话**的工具列表里会出现 `mcp__egui__*`；当前会话不会热加载。
@@ -714,6 +718,7 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 
 - inspection 只监听 `127.0.0.1`（eframe 默认）；不要把端口暴露到外网。
 - `attach` 失败时按顺序排查：GUI 是否带 `EGUI_INSPECTION=1` 启动 → 5719 是否被占用 → egui_mcp 版本是否仍匹配 egui 0.37。
+- **profile patch 加新插件必须用 `- insert:`**；写成按 id 覆盖只会得到一条不落盘的 stderr 警告（本次踩过）。
 - 如果不想动 DSH 配置：可以退化为在仓库里写一个直连 inspection 协议的小 devtool（shell 调用），成本更高，不推荐。
 - 重启 DSH 会中断当前会话；建议安排在不影响手头工作的时候做。
 
@@ -733,3 +738,4 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.8 | 2026-11-01 | 按你的要求把调试 CLI 改名为 **`admin`**：`src/bin/kaols-voice-admin.rs` → `src/bin/admin.rs`，clap `name = "admin"`，文档与命令示例同步（`cargo run --bin admin -- list`）；功能与参数不变 |
 | v0.9 | 2026-11-01 | **cpal 0.15 → 0.18 升级，wgpu 后端恢复为默认**（D9 重写）：cpal 0.18 改用 `windows ^0.62`，依赖图里 0.54 消失，`gpu-allocator` 与 `wgpu-hal` 对齐，wgpu 编译/运行通过（本机枚举到 4 个适配器，DX12 RTX 5070 Ti 可用）。代码适配：`DeviceTrait::name()`→`description()?.name()`（新增 `audio::device::device_name`）、`sample_rate()` 返回 u32、`build_*_stream` 收 `StreamConfig` 值（`supported_config.config()`）。Cargo 增加 `renderer-wgpu`（默认）/`renderer-glow` 两个 feature，`app.rs` 按 feature 选渲染器；glow 变体保留用于截图核对（wgpu 不支持 `EFRAME_SCREENSHOT_TO`）与 OpenGL 兜底；`dev-run.ps1 -Glow`。验证：两种变体均构建通过，GUI 以 wgpu 启动 6s 稳定运行，cpal 0.18 设备枚举正常（中英文设备名正确），`cargo test` 全绿。新增 R17（音频链路未做真机回归） |
 | v0.10 | 2026-11-01 | 新增 **§11 开发工具链：egui_mcp（D0）**：明确时机为 M1 之前（不影响产品代码）；应用侧已就绪（`inspection` feature + `EGUI_INSPECTION=1` 开 5719，截图需窗口可见）；DSH 侧只需三步——`cargo install egui_mcp`（crates.io 0.3.0，依赖 egui/egui_inspection ^0.37，与本项目匹配）、在 `~/.dsh/profiles/desktop/cordis.patch.yml` 追加 `@deepseek-ai/dsh-mcp-client` 插件条目（DSH 内置该插件，无需另装）、重启 DSH 后新会话生效；给出与 kittest/静态截图的分工与排障清单 |
+| v0.11 | 2026-11-01 | **D0 工具链验证通过（egui_mcp 可用）**。排障结论：`cordis.patch.yml` 里新增未随 bundle 挂载的插件必须用 `- insert:` 包装，否则 Loader 按 id 覆盖找不到行、只打一条不落盘的 stderr 警告（表现为"无进程/无工具/无报错"）。修正后 DSH 重启：工具列表出现 15 个 `mcp__egui__*`；GUI 以 `EGUI_INSPECTION=1` 启动后 `attach` → `widget_tree`（读到工具栏/页签/设置页文案）→ `screenshot`（1100×720，`target/mcp-egui-shot.png`）全链路成功。§11 已补 insert 写法与踩坑说明 |
