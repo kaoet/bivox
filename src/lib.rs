@@ -13,6 +13,7 @@ pub mod app;
 pub mod audio;
 pub mod client;
 pub mod config;
+pub mod config_edit;
 pub mod gui;
 pub mod language;
 pub mod log_sink;

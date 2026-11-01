@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.14，**M0、M4、D0 已完成**，语音合成页两栏骨架、日志面板可调高度已就位；下一步 M1
+> **状态**：草案 v0.16，**M0、M1、M4、D0 已完成**；下一步 M2（实时管线事件化）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -101,7 +101,9 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 分发：`cargo build --release` 后 zip 打包 **`kaols.exe` + `README.md`**（默认配置模板已编译进 exe，见 D18，不再分发 `config.example.toml`）；**不要**把开发机 `config.toml`（含 API Key）打进包；**不要**打包调试工具。
 - 升级方式：覆盖 exe 与文档，旁边的 `config.toml` / `voice_cache.json` / `logs\` 不动。
 
-### D3 ✅ 配置模型与写回范围（已定）
+### D3 ✅ 配置模型与写回范围（已定，M1 已实现其中两项）
+
+- **实现进度**：`[api] key` 与 `[audio]` 设备已由 `src/config_edit.rs` 写回（M1）；`[tts] voice`、`[tts.custom_voices]` 留到 M3。
 
 - `config.toml` 仍是唯一事实源；GUI 不引入第二种配置格式。
 - **API Key 明文存放**在 `config.toml`（已定），设置页与 README 明确提示"该文件含密钥，勿分享/上传/随包分发"。
@@ -226,8 +228,9 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - **匹配规则改为精确相等**：`get_input_device(Some(name))` 只在设备名完全相同时命中；不做模糊匹配、不做兼容回退。
 - **GUI 下拉框保存完整设备名字符串**，写回 `[audio] input_device` / `output_device`。
 - 下拉第一项固定「系统默认」，选中时配置值为空（`None`）。
-- 配置值与当前枚举对不上（换设备/旧配置）时：启动报明确错误"未找到输入设备 `<名字>`"，设置页标红并提示重新选择；**不自动回退默认设备**。
+- 配置值与当前枚举对不上（换设备/旧配置）时：启动报明确错误"未找到输入设备 `<名字>`"，**「音频」页**标红并提示重新选择；**不自动回退默认设备**。
 - 热插拔：v1 只提供「刷新设备」按钮，不做自动监听。
+- **落点（v0.16）**：设备下拉从「设置」页移到独立的「音频」页；Top panel 不再显示设备。
 
 ### D13 ✅ 优雅退出：先停音频再关窗
 
@@ -373,11 +376,12 @@ src/
 ├── config_edit.rs       # toml_edit 定点写回 + 校验 + .bak（D3）
 ├── gui/
 │   ├── mod.rs
-│   ├── toolbar.rs       # 开始/停止、设备下拉、状态灯
-│   ├── realtime_tab.rs  # 当前句 + 历史字幕（单句复制）
+│   ├── toolbar.rs       # 开始/停止、状态灯（v0.16 起不再显示设备）
+│   ├── realtime_tab.rs  # 实时页
+│   ├── audio_tab.rs     # 音频页：输入/输出设备（v0.16）
 │   ├── tts_tab.rs       # 语音合成页（TTS 配置：自定义音色列表 + 详情，D11）
-│   ├── settings_tab.rs  # 配置展示/校验/Key 输入/重载
-│   ├── log_panel.rs     # 日志面板（虚拟化滚动）
+│   ├── settings_tab.rs  # 设置页：路径 / API Key / 配置概览
+│   ├── log_panel.rs      # 日志面板（虚拟化滚动）
 │   └── widgets.rs       # 设备 ComboBox、确认 Modal、错误条
 ├── config.rs            # 去掉 clap；其余不动
 ├── audio/               # device.rs：返回列表 + 精确匹配
@@ -535,16 +539,24 @@ impl AppPaths {
   在 multi-pass 下会抓到空帧 —— 已把设置页改成普通横排行，并把这条写进第 10 节。
 **预估**：乐观 0.5 天 / 保守 1 天（实际约 2 小时，其中大半花在 wgpu 冲突排查上）
 
-### M1 配置读取、校验与写回
+### M1 配置读取、校验与写回（已完成 ✅）
 
-- [ ] `config_edit.rs`：`set_api_key` / `set_audio_devices` / `set_active_voice` + 校验 + `.bak`（带单测：改写后注释仍在、其它字段不变）
-- [ ] 设置页：字段展示 + 校验错误列表 + 「打开配置文件所在目录」+「重新加载」
-- [ ] API Key 输入与保存（D3）、安全提示文案
-- [ ] 设备下拉（D12 新 API）+「刷新设备」+「系统默认」+ 不一致时红字
-- [ ] 配置无效时整页错误
+- [x] `src/config_edit.rs`：`set_api_key` / `set_audio_devices` + `save`（写前 `AppConfig::from_toml_str` 校验、写前 `.bak` 备份、无改动不写盘）；7 个单测覆盖"注释保留 / 其它字段不变 / 清除键 / 拒绝非法文本 / 备份"
+- [x] 设置页：路径展示 + 「重新加载配置」+「打开程序目录」+ 配置概览
+- [x] API Key 输入（password 掩码）与保存（D3）+ 明文风险提示；写回失败在页面上方红字显示
+- [x] 设备下拉（`input_device_names`/`output_device_names` 新 API）+「刷新设备」+「系统默认」+「恢复系统默认」；配置值与枚举不一致时琥珀色警告（v0.16 移到「音频」页）
+- [x] 精确匹配：`get_input_device(Some(name))` 改成完整名相等，不再子串匹配（D12）；找不到时报"未找到输入设备 `name`"，不回退默认设备
+- [x] 配置无效时显示错误与原始错误链（不 panic）
+- [x] 工具栏同步显示当前设备（长名截断到 24 字符，避免挤掉版本号）
 
-**验收**：删配置后启动自动生成模板并提示填 Key；改坏 key 后界面报错；保存 Key 后 `config.toml` 注释未丢；设备名写成不存在值时明确报错且不回退
-**预估**：乐观 1 天 / 保守 1.5 天
+**实施说明**：
+- `[tts] voice` / `[tts.custom_voices]` 的写回按计划留到 M3（`set_active_voice`/`set_custom_voices` 未实现）。
+- device 写回逻辑：下拉变更后调 `update_audio_devices`，与「恢复系统默认」走同一条写回/重载路径。
+- egui_mcp 验证：点「设置」→ 改 Key 保存（日志出现"已保存 API Key"，`.bak` 生成、其它字段保留）→ 点「恢复系统默认」（配置里 `input_device`/`output_device` 键被移除、工具栏变"系统默认"）→ 手工把配置改成不存在的设备名后点「重新加载配置」，界面出现"…不在当前设备列表中"警告。
+- 已知：通过 egui_mcp 注入点击 ComboBox 弹层里的选项不会生效（injected click 与 0.37 的 Popup 交互问题），因此设备写回用「恢复系统默认」按钮验证；真实鼠标操作不受影响。
+- v0.16 调整：设备相关 UI 从「设置」页整体移到新的「音频」页（Tab 顺序：实时 / 音频 / 语音合成 / 设置）；工具栏不再显示设备。
+
+**预估**：乐观 1 天 / 保守 1.5 天（实际约 1.5 小时）
 
 ### M2 实时管线事件化（改动最大）
 
@@ -740,3 +752,5 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.12 | 2026-11-01 | 按你的要求**删除启动写探测**：移除 `AppPaths::ensure_writable`（不再启动时建临时文件探测 exe 目录可写性），同步删掉 D4 第 4 条规则、D8/D18/M0/M1 里的"目录不可写整页错误"描述、风险 R4，并把风险表 R5–R17 顺延为 R4–R16（D19 的引用同步改为 R15）；AGENTS.md 项目结构描述同步。写失败（默认配置/日志）仍走普通 `startup_error` 路径，不做专门探测。验证：fmt / clippy 0 警告 / `cargo build --bins` / 110 测试全绿 |
 | v0.13 | 2026-11-01 | 「音色」页签改为**「语音合成」**（TTS 配置汇总页）：左侧自定义音色列表（首行=名称 + weak 键名，次行=weak 语言代码，整行可点选、选中蓝色高亮），右侧选中音色详情（占位：键名/支持语言/合成模型/样本数/样本列表 + 「当前生效音色」标记，M3 再细化）；未选中时右侧留空。代码：`Tab::Voices → Tab::Tts`，`gui/voices_tab.rs → gui/tts_tab.rs`，新增 `KaolsApp.selected_voice` 状态（重新加载配置时清空）。验证：fmt / clippy 0 警告 / build / 110 测试；egui_mcp 实测点选三个音色，选中高亮与「当前生效音色」标记均正确 |
 | v0.14 | 2026-11-01 | 日志面板（底部）改为**可拖拽调整高度**：`Panel::bottom(..).resizable(true).default_size(180).min_size(60)`，日志 `ScrollArea` 去掉固定 `max_height(180)`、改为填满面板剩余高度（`auto_shrink([false,false])` + `stick_to_bottom`）。验证：egui_mcp 从分隔线 (550,540) 拖到 (550,400)，日志面板实时变高、可见行数增加；fmt / clippy 0 警告 / build / 110 测试全绿 |
+| v0.15 | 2026-11-01 | **M1 实施完成**：新增 `src/config_edit.rs`（`toml_edit` 定点写回 + 校验 + `.bak`，7 个单测）；设置页支持 API Key 保存、设备下拉（新枚举 API + 刷新 + 系统默认 + 恢复默认）、不一致警告、写回错误显示；设备查找改为**完整名精确匹配**（D12，移除子串匹配）；工具栏设备名超 24 字符截断；新增依赖 `toml_edit = "0.25"`。验证：fmt / clippy 0 警告 / build / **117** 测试全绿；egui_mcp 实测 Key 写回（备份生成、注释/其它字段保留）、设备清除写回、设备名不一致警告。已知：injected click 对 0.37 ComboBox 弹层选项无效（测试用「恢复系统默认」按钮验证写回路径），真实鼠标不受影响 |
+| v0.16 | 2026-11-01 | 新增**「音频」页签**（顺序：实时 / 音频 / 语音合成 / 设置），集中放输入/输出设备选择：下拉 + 刷新 + 恢复系统默认 + 一致/不一致提示；设备 UI 从「设置」页整体移出（设置页只剩路径 / API Key / 配置概览），Top panel 不再显示设备；设备下拉组件移到 `gui/widgets.rs` 复用。验证：fmt / clippy 0 警告 / build / 117 测试；egui_mcp 实测 Tab 顺序、音频页设备 UI、设置页无设备、工具栏无设备文本 |

@@ -3,6 +3,7 @@
 //! 约定（D15）：这里的函数只负责绘制和把用户操作转成状态变更，
 //! 不直接做 IO、网络或阻塞调用；耗时动作交给 `app` 里的后台任务。
 
+pub mod audio_tab;
 pub mod log_panel;
 pub mod realtime_tab;
 pub mod settings_tab;

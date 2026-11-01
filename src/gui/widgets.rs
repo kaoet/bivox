@@ -29,3 +29,25 @@ pub fn kv_row(ui: &mut egui::Ui, label: &str, value: &str) {
 pub fn path_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {
     kv_row(ui, label, &path.display().to_string());
 }
+
+/// 设备下拉：`None` = 系统默认；选项来自设备枚举结果（D12，完整名精确匹配）。
+///
+/// 用 `from_id_salt` + 单独的 label，避免 0.37 的 `ComboBox::from_label` 把标签画在下拉框右侧。
+pub fn device_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<String>,
+    names: &[String],
+    default_label: &str,
+) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(label)
+        .selected_text(value.as_deref().unwrap_or(default_label))
+        .width(280.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, default_label);
+            for name in names {
+                ui.selectable_value(value, Some(name.clone()), name.as_str());
+            }
+        });
+}

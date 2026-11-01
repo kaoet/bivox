@@ -1,3 +1,8 @@
+//! 音频设备枚举与查找。
+//!
+//! 设备名规则（GUI_MIGRATION.md D12）：GUI 只保存**完整设备名**，查找时按字符串
+//! **精确相等**匹配；找不到就报错让用户在设置页重选，不做模糊匹配、也不静默回退到默认设备。
+
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::Device;
@@ -30,54 +35,53 @@ impl AudioDeviceManager {
         }
     }
 
-    /// 打印可用设备（M1 会给 GUI 提供返回 `Vec<String>` 的枚举 API）。
-    pub fn list_devices(&self) -> Result<()> {
-        println!("\n=== 可用音频输入设备 (Microphones) ===");
-        let default_in = self
+    /// 全部输入设备的完整名称（顺序由 cpal 决定）。
+    pub fn input_device_names(&self) -> Result<Vec<String>> {
+        let devices = self
             .host
-            .default_input_device()
-            .map(|device| device_name(&device));
-        for (i, dev) in self.host.input_devices()?.enumerate() {
-            let name = device_name(&dev);
-            let is_default = default_in.as_deref() == Some(name.as_str());
-            println!(
-                "  [{}] {}{}",
-                i + 1,
-                name,
-                if is_default { " (默认)" } else { "" }
-            );
-        }
-
-        println!("\n=== 可用音频输出设备 (Speakers / Virtual Cables) ===");
-        let default_out = self
-            .host
-            .default_output_device()
-            .map(|device| device_name(&device));
-        for (i, dev) in self.host.output_devices()?.enumerate() {
-            let name = device_name(&dev);
-            let is_default = default_out.as_deref() == Some(name.as_str());
-            println!(
-                "  [{}] {}{}",
-                i + 1,
-                name,
-                if is_default { " (默认)" } else { "" }
-            );
-        }
-        println!();
-        Ok(())
+            .input_devices()
+            .map_err(|err| anyhow!("枚举输入设备失败：{err}"))?;
+        Ok(devices.map(|device| device_name(&device)).collect())
     }
 
-    pub fn get_input_device(&self, name_filter: Option<&str>) -> Result<Device> {
-        if let Some(target) = name_filter {
-            for dev in self.host.input_devices()? {
-                if device_name(&dev)
-                    .to_lowercase()
-                    .contains(&target.to_lowercase())
-                {
-                    return Ok(dev);
+    /// 全部输出设备的完整名称。
+    pub fn output_device_names(&self) -> Result<Vec<String>> {
+        let devices = self
+            .host
+            .output_devices()
+            .map_err(|err| anyhow!("枚举输出设备失败：{err}"))?;
+        Ok(devices.map(|device| device_name(&device)).collect())
+    }
+
+    /// 系统默认输入设备名（无默认设备时为 `None`）。
+    pub fn default_input_name(&self) -> Option<String> {
+        self.host
+            .default_input_device()
+            .map(|device| device_name(&device))
+    }
+
+    /// 系统默认输出设备名（无默认设备时为 `None`）。
+    pub fn default_output_name(&self) -> Option<String> {
+        self.host
+            .default_output_device()
+            .map(|device| device_name(&device))
+    }
+
+    /// 按完整设备名精确查找输入设备；`None` = 系统默认输入设备。
+    pub fn get_input_device(&self, exact_name: Option<&str>) -> Result<Device> {
+        if let Some(target) = exact_name {
+            for device in self
+                .host
+                .input_devices()
+                .map_err(|err| anyhow!("枚举输入设备失败：{err}"))?
+            {
+                if device_name(&device) == target {
+                    return Ok(device);
                 }
             }
-            return Err(anyhow!("未找到匹配的输入音频设备: '{}'", target));
+            return Err(anyhow!(
+                "未找到输入设备 {target:?}；请在设置页重新选择（设备可能已改名或被拔掉）"
+            ));
         }
 
         self.host
@@ -85,17 +89,21 @@ impl AudioDeviceManager {
             .ok_or_else(|| anyhow!("系统未检测到默认输入音频设备"))
     }
 
-    pub fn get_output_device(&self, name_filter: Option<&str>) -> Result<Device> {
-        if let Some(target) = name_filter {
-            for dev in self.host.output_devices()? {
-                if device_name(&dev)
-                    .to_lowercase()
-                    .contains(&target.to_lowercase())
-                {
-                    return Ok(dev);
+    /// 按完整设备名精确查找输出设备；`None` = 系统默认输出设备。
+    pub fn get_output_device(&self, exact_name: Option<&str>) -> Result<Device> {
+        if let Some(target) = exact_name {
+            for device in self
+                .host
+                .output_devices()
+                .map_err(|err| anyhow!("枚举输出设备失败：{err}"))?
+            {
+                if device_name(&device) == target {
+                    return Ok(device);
                 }
             }
-            return Err(anyhow!("未找到匹配的输出音频设备: '{}'", target));
+            return Err(anyhow!(
+                "未找到输出设备 {target:?}；请在设置页重新选择（设备可能已改名或被拔掉）"
+            ));
         }
 
         self.host

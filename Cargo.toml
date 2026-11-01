@@ -33,6 +33,8 @@ cpal = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
+# GUI 定点写回配置：保留注释与未改动的字段（见 GUI_MIGRATION.md D3）
+toml_edit = "0.25"
 # clap / colored 仅供调试 CLI（src/bin/admin.rs），GUI 主程序不用
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"

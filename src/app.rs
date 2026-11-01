@@ -1,7 +1,7 @@
 //! GUI 应用主体：启动准备、全局状态、面板布局、退出流程。
 //!
-//! 阶段说明：M0 只搭骨架（窗口 + 工具栏 + 三个页签 + 日志面板 + 便携路径/崩溃处理）。
-//! 实时管线（M2）、设备下拉（M1）、音色编辑（M3）分别在后续里程碑接入。
+//! 阶段说明：M0 搭好骨架（窗口 + 三个页签 + 日志面板 + 便携路径/崩溃处理）；
+//! M1 接入配置写回（API Key / 音频设备）；实时管线（M2）、音色编辑（M3）后续接入。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -10,7 +10,9 @@ use std::process::ExitCode;
 use eframe::egui;
 use log::{error, info, warn};
 
+use crate::audio::device::AudioDeviceManager;
 use crate::config::AppConfig;
+use crate::config_edit;
 use crate::gui;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::paths::AppPaths;
@@ -53,16 +55,18 @@ impl SessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Realtime,
+    Audio,
     Tts,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Realtime, Tab::Tts, Tab::Settings];
+    pub const ALL: [Tab; 4] = [Tab::Realtime, Tab::Audio, Tab::Tts, Tab::Settings];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Realtime => "实时",
+            Self::Audio => "音频",
             Self::Tts => "语音合成",
             Self::Settings => "设置",
         }
@@ -90,6 +94,13 @@ pub struct KaolsApp {
     pub config: ConfigState,
     /// 语音合成页左栏当前选中的自定义音色（配置键名）；`None` = 未选中。
     pub selected_voice: Option<String>,
+    /// 设置页的 API Key 草稿（点「保存」才写回 config.toml）。
+    pub api_key_input: String,
+    /// 设备下拉的可选项（启动时与「刷新设备」时重新枚举）。
+    pub input_devices: Vec<String>,
+    pub output_devices: Vec<String>,
+    /// 最近一次写回配置失败的原因（成功时清空）。
+    pub config_write_error: Option<String>,
     /// 本次启动是否刚刚生成了默认配置。
     pub config_created: bool,
     /// 启动检查发现的问题（写默认配置失败、初始化日志失败等）。
@@ -116,7 +127,7 @@ impl KaolsApp {
             Tab::Realtime
         };
 
-        Self {
+        let mut app = Self {
             paths,
             runtime,
             tab,
@@ -125,20 +136,103 @@ impl KaolsApp {
             output_device: None,
             config,
             selected_voice: None,
+            api_key_input: String::new(),
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
+            config_write_error: None,
             config_created,
             startup_error,
             crash: None,
             log: VecDeque::new(),
             closing: false,
-        }
+        };
+        app.sync_from_config();
+        app.refresh_devices();
+        app
     }
 
-    /// 重新从磁盘读取配置（设置页「重新加载」）。
+    /// 重新从磁盘读取配置（设置页「重新加载」；写回成功后也会调用）。
     pub fn reload_config(&mut self) {
         self.config = load_config(&self.paths.config_file);
+        self.sync_from_config();
         // 配置可能删掉了当前选中的音色；清空选择，语音合成页会重新判定。
         self.selected_voice = None;
         info!("已重新加载配置：{}", self.paths.config_file.display());
+    }
+
+    /// 把配置里的 Key / 设备同步到界面状态（加载、重载、写回成功后调用）。
+    fn sync_from_config(&mut self) {
+        match &self.config {
+            ConfigState::Loaded(config) => {
+                self.api_key_input = config.api.key.clone().unwrap_or_default();
+                self.input_device = config.audio.input_device.clone();
+                self.output_device = config.audio.output_device.clone();
+            }
+            ConfigState::Invalid { .. } => {
+                self.api_key_input.clear();
+                self.input_device = None;
+                self.output_device = None;
+            }
+        }
+    }
+
+    /// 重新枚举音频设备（启动时与「刷新设备」按钮调用）。
+    pub fn refresh_devices(&mut self) {
+        let manager = AudioDeviceManager::new();
+        match manager.input_device_names() {
+            Ok(names) => self.input_devices = names,
+            Err(err) => warn!("枚举输入设备失败：{err:#}"),
+        }
+        match manager.output_device_names() {
+            Ok(names) => self.output_devices = names,
+            Err(err) => warn!("枚举输出设备失败：{err:#}"),
+        }
+    }
+
+    /// 保存 API Key 到 config.toml（写前校验、写前备份，见 D3）。
+    pub fn save_api_key(&mut self) {
+        let key = self.api_key_input.trim().to_string();
+        if key.is_empty() {
+            self.config_write_error = Some("API Key 不能为空".to_string());
+            warn!("保存 API Key 失败：输入为空");
+            return;
+        }
+        let result = self.write_config(|text| config_edit::set_api_key(text, Some(&key)));
+        self.finish_config_write(result, "已保存 API Key");
+    }
+
+    /// 更新 `[audio]` 设备（`None` = 系统默认）；设备名是完整名称（D12）。
+    pub fn update_audio_devices(&mut self, input: Option<String>, output: Option<String>) {
+        let result = self.write_config(|text| {
+            config_edit::set_audio_devices(text, input.as_deref(), output.as_deref())
+        });
+        self.finish_config_write(result, "已保存音频设备");
+    }
+
+    /// 读原文 → 定点修改 → 校验并写回。
+    fn write_config(
+        &mut self,
+        edit: impl FnOnce(&str) -> anyhow::Result<String>,
+    ) -> anyhow::Result<()> {
+        let original = config_edit::read(&self.paths.config_file)?;
+        let updated = edit(&original)?;
+        config_edit::save(&self.paths.config_file, &original, &updated)
+    }
+
+    fn finish_config_write(&mut self, result: anyhow::Result<()>, success_message: &str) {
+        match result {
+            Ok(()) => {
+                self.config_write_error = None;
+                self.reload_config();
+                self.config_created = false;
+                info!("{success_message}（{}）", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.config_write_error = Some(message.clone());
+                warn!("写回配置失败：{message}");
+            }
+        }
     }
 
     /// 打开程序目录（Windows 资源管理器）。
@@ -211,6 +305,7 @@ impl KaolsApp {
 
         match self.tab {
             Tab::Realtime => gui::realtime_tab::show(self, ui),
+            Tab::Audio => gui::audio_tab::show(self, ui),
             Tab::Tts => gui::tts_tab::show(self, ui),
             Tab::Settings => gui::settings_tab::show(self, ui),
         }

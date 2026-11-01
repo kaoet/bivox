@@ -51,8 +51,9 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 - `src/lib.rs`：库入口，暴露全部模块（两个 bin 共用）。
 - `src/app.rs`：应用状态、面板布局、事件泵、关闭流程、启动准备（日志/崩溃/默认配置）。
 - `src/paths.rs`：便携路径解析 + 内置默认配置模板。
+- `src/config_edit.rs`：用 `toml_edit` 定点写回配置（只写 Key / 设备等指定字段），写前校验 + `.bak` 备份。
 - `src/log_sink.rs`：`log` 门面 → 内存环形缓冲（界面日志面板）+ 按天文件日志 + panic 钩子。
-- `src/gui/`：工具栏、实时/语音合成/设置页签、日志面板、通用部件（每个文件 ≤ 300 行）。
+- `src/gui/`：工具栏、实时/音频/语音合成/设置页签、日志面板、通用部件（每个文件 ≤ 300 行）。
 - `src/config.rs`：TOML 配置加载与校验（API Key、业务空间域名、设备、ASR/TTS 模型、
   `[asr] languages`、多语言自定义音色样本、VAD 参数）。
 - `src/language.rs`：语言代码集合、合成 `instruction` 映射、ASR 文本脚本统计与
