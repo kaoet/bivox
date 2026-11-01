@@ -26,46 +26,7 @@ cp config.example.toml config.toml     # Windows: copy config.example.toml confi
 key = "sk-your-dashscope-api-key-here"
 ```
 
-`config.toml` 已被 `.gitignore` 忽略，不会被提交。所有配置项都有默认值，完整字段见 [`config.example.toml`](config.example.toml)：
-
-```toml
-[api]
-key = "sk-..."
-# workspace_host = "dashscope.aliyuncs.com"
-
-[asr]
-# model = "qwen-audio-3.1-asr-flash-streaming"
-# languages = ["zh"]          # 用户可能说的语言（有序，首个为默认）
-
-[tts]
-# model = "qwen-audio-3.1-tts-flash"
-# voice = "qiaoxiaojiao_v3.1" # 系统音色 / voice_id / custom:<配置名>
-# cache_file = "voice_cache.json"
-
-# 自定义音色（可选，多语言声线样本）
-# [tts.custom_voices.edgar]
-# name = "异环 - 埃德嘉"
-# [[tts.custom_voices.edgar.samples]]
-# language = "zh"
-# audio = "samples/edgar-zh.wav"
-# [[tts.custom_voices.edgar.samples]]
-# language = "ja"
-# audio = "samples/edgar-ja.wav"
-
-[audio]
-# input_device = "Microphone"
-# output_device = "CABLE Input"
-
-[vad]
-# enabled = true
-# margin_db = 9.0
-# hangover_ms = 500
-# tail_ms = 1000
-# debug = false
-
-[chunking]
-# words = 6
-```
+`config.toml` 已被 `.gitignore` 忽略，不会被提交。所有配置项都有默认值，完整字段见 [`config.example.toml`](config.example.toml)。
 
 默认读取当前工作目录下的 `config.toml`；也可以指定其它路径：
 
@@ -93,8 +54,6 @@ workspace_host = "ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com"
 ```
 
 `workspace_host` 只填写纯 host，不要带 `wss://` 前缀、路径或端口；格式不规范时程序会在启动阶段直接报错。语音识别/合成的 WebSocket 连接与音色管理的 HTTP 接口都使用这个域名。
-
-> ASR 固定使用近场 VAD 模型（`vad_model=near_meeting_16k`），适配“识别自己麦克风近讲”的使用场景。
 
 ---
 
@@ -150,11 +109,8 @@ tail_ms = 1000
 languages = ["zh", "ja", "en"]
 ```
 
-- 有序列表，**首个元素是默认语言**（没有“上一句”时的语言）；
+- 有序列表，**首个元素是默认语言**；
 - 只写一个元素（如 `["ja"]`）相当于强提示只按该语言识别；
-- 程序对 ASR 文本做本地语言判定，判定范围始终是**完整列表**；
-- 传给 ASR API 的 `language_hints` 最多 4 个（官方限制），超出会截断并打印一次警告；
-  截断只影响 API 提示，不影响本地判定的完整范围。
 
 ### 2. 语言判定规则（不等待整句、不回溯）
 

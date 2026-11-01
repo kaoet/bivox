@@ -49,9 +49,8 @@ cargo run --release      # 默认运行：读取 ./config.toml，实时语音识
   `LanguageTracker`（强证据 + 粘性 + `han >= 6` 切中文等规则）。
 - `src/audio/`：`cpal` 采集/播放、设备枚举、重采样、本地能量 VAD 门控。
 - `src/client/`：
-  - `qwen_asr.rs`：百炼 Qwen Audio 实时双向流式识别（run-task 协议；透传 `language_hints`，>4 截断警告）。
-  - `qwen_tts.rs`：Qwen-Audio-TTS 流式语音合成（run-task 协议，单连接复用；
-    每个句子按上游给出的 voice / language 填 `language_hints` + `instruction`）。
+  - `qwen_asr.rs`：百炼 Qwen Audio 实时双向流式识别。
+  - `qwen_tts.rs`：Qwen-Audio-TTS 流式语音合成。
   - `ws.rs`：鉴权建连、握手、Ping 保活、断线指数退避重连的公共骨架。
 - `src/pipeline/`：`chunker.rs` 流式文本分块，`orchestrator.rs` 编排 ASR -> 语言判定 -> 分块 -> TTS。
 - `src/voice/`：自定义（复刻）音色。
@@ -66,8 +65,8 @@ cargo run --release      # 默认运行：读取 ./config.toml，实时语音识
 - 涉及 WebSocket 协议、重连、VAD、音色 HTTP 接口等逻辑时，测试使用本地 `tokio` mock 服务（`src/voice/mock_http.rs` 是纯手写的 HTTP mock），不依赖真实百炼网络。
 - 自定义音色结构：`[[tts.custom_voices.<名>.samples]]` 是**有序数组**，`samples[0]` 是默认声线；
   每个样本按（模型, 音频内容哈希）单独复刻/缓存；合成时按判定语言选样本，缺语言回退 `samples[0]`。
-- 语言策略：`[asr] languages` 有序（首个默认），只截断传给 ASR API 的 `language_hints`（≤4），
-  **本地判定始终使用完整列表**；判定规则见 `language.rs`（假名/谚文强证据、纯汉字 ≥6 切中文、
+- 语言策略：`[asr] languages` 有序（首个默认），整份列表原样传给 ASR API 的 `language_hints`
+  （数量上限由服务端处理），**本地判定始终使用完整列表**；判定规则见 `language.rs`（假名/谚文强证据、纯汉字 ≥6 切中文、
   拉丁需主导、短文本粘性），不要改成"等整句再判"（会破坏低延迟）。
 - 合成时始终传 `language_hints`（目标语言），非中英语种附带内置 `instruction`；这两者与复刻样本语种无关。
 - 自定义音色缓存是「模型 -> 样例音频内容 SHA256 -> voice_id」两层结构，**不要让每次合成都重新上传/复刻**；同一音频在不同模型下分别缓存，切换模型不应覆盖其它模型的记录。

@@ -13,7 +13,6 @@ use uuid::Uuid;
 use crate::audio::vad::SpeechGate;
 use crate::client::ws::{self, AudioStreamState, ReconnectingSession, SessionEnd, WsStream};
 use crate::client::AsrEvent;
-use crate::config::ASR_LANGUAGE_HINTS_LIMIT;
 
 /// 近场识别：本项目输入始终为说话人自己的麦克风（耳机/桌面近讲），
 /// 服务端默认远场 vad_model（far_field_meeting_16k）会降低近讲场景的 VAD 灵敏度。
@@ -58,7 +57,6 @@ pub(crate) struct AsrRuntime {
     api_key: String,
     model: String,
     ws_url: String,
-    /// 传给 ASR API 的 `language_hints`（已截断到上限）
     language_hints: Vec<String>,
     io: AudioStreamState,
     /// 本地 VAD 发送门控；None 表示关闭（全量上传）
@@ -98,20 +96,6 @@ impl QwenAsrClient {
         tx_events: Sender<AsrEvent>,
         is_running: Arc<AtomicBool>,
     ) -> Result<()> {
-        // 填充 ASR API 时最多传前 4 个语言；检测范围仍由上层使用完整列表。
-        if language_hints.len() > ASR_LANGUAGE_HINTS_LIMIT {
-            eprintln!(
-                "⚠️ [asr] languages 共 {} 个，ASR API 的 language_hints 最多支持 {} 个，只传前 {} 个（语言检测仍使用完整列表）",
-                language_hints.len(),
-                ASR_LANGUAGE_HINTS_LIMIT,
-                ASR_LANGUAGE_HINTS_LIMIT
-            );
-        }
-        let language_hints: Vec<String> = language_hints
-            .into_iter()
-            .take(ASR_LANGUAGE_HINTS_LIMIT)
-            .collect();
-
         let mut state = AsrRuntime {
             api_key,
             model,
@@ -544,9 +528,9 @@ mod tests {
         server.abort();
     }
 
-    /// run-task 里应带上配置的语言提示，且填充 ASR API 时截断到最多 4 个。
+    /// run-task 里应带上配置的全部语言提示。
     #[tokio::test]
-    async fn sends_language_hints_truncated_to_api_limit() {
+    async fn sends_all_language_hints() {
         use std::time::Duration;
         use tokio::net::TcpListener;
         use tokio::sync::oneshot;
@@ -592,8 +576,8 @@ mod tests {
             .expect("run-task 解析失败");
         assert_eq!(
             value["payload"]["parameters"]["language_hints"],
-            json!(["zh", "ja", "en", "ko"]),
-            "language_hints 应截断到 4 个"
+            json!(["zh", "ja", "en", "ko", "fr"]),
+            "language_hints 应原样传给服务端"
         );
 
         is_running.store(false, Ordering::SeqCst);

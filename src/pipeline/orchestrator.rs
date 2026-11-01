@@ -248,8 +248,8 @@ impl PipelineOrchestrator {
                     language,
                 };
                 println!(
-                    "Queue chunk lang={} voice={} end={}: {}",
-                    req.language, req.voice, req.is_sentence_end, req.text
+                    "Queue chunk lang={} end={}: {}",
+                    req.language, req.is_sentence_end, req.text
                 );
 
                 if tx_tts.send(req).await.is_err() {

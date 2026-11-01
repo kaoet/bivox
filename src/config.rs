@@ -33,9 +33,6 @@ pub const DEFAULT_VOICE_CACHE_FILE: &str = "voice_cache.json";
 /// 百炼音色前缀最大长度（官方：数字+英文字母，不超过 10 个字符）。
 pub const MAX_VOICE_PREFIX_LEN: usize = 10;
 
-/// ASR `language_hints` 单次最多传入的语言数。
-pub const ASR_LANGUAGE_HINTS_LIMIT: usize = 4;
-
 /// 本地 VAD 默认起音余量（dB）。
 pub const DEFAULT_VAD_MARGIN_DB: f32 = 9.0;
 
@@ -181,8 +178,8 @@ pub struct AsrConfig {
     /// 用户可能说的语言列表（有序）：
     /// - 首个元素是没有"上一句"时的默认语言；
     /// - 只写一个元素 = 强提示只按该语言识别；
-    /// - 检测用户当前说哪种语言时，永远以完整列表为范围（不截断）；
-    /// - 填充 ASR API 的 `language_hints` 时最多用前 4 个。
+    /// - 检测用户当前说哪种语言时，永远以完整列表为范围；
+    /// - 整个列表会作为 ASR API 的 `language_hints` 传递（数量上限由服务端处理）。
     pub languages: Vec<String>,
 }
 
@@ -421,8 +418,8 @@ impl AppConfig {
                 bail!("配置项 [asr] languages 中存在重复语言 {lang:?}");
             }
         }
-        // 超过 ASR API 上限（4）时只在填充 API 时截断并警告；
-        // 本地语言判定始终使用完整列表。
+        // language_hints 原样传给 ASR API（数量上限由服务端处理），
+        // 本地语言判定也使用完整列表。
         Ok(())
     }
 
@@ -760,7 +757,7 @@ words = 10
 
     #[test]
     fn asr_languages_more_than_four_are_kept_for_detection() {
-        // 配置层不截断（截断只发生在填充 ASR API 时）
+        // 配置层不限制语言数量；ASR language_hints 原样传递
         let config = AppConfig::from_toml_str(
             "[api]\nkey = \"sk-test\"\n[asr]\nlanguages = [\"zh\",\"ja\",\"en\",\"ko\",\"fr\"]\n",
         )
