@@ -49,7 +49,7 @@ impl AudioCapture {
             }
         };
 
-        let err_fn = |err| eprintln!("麦克风输入流异常: {:?}", err);
+        let err_fn = |err| log::warn!("麦克风输入流异常: {:?}", err);
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(

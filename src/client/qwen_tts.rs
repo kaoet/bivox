@@ -74,16 +74,19 @@ impl TtsRuntime {
         self.pending_attempts += 1;
         if self.pending_attempts >= MAX_PENDING_ATTEMPTS {
             if let Some(chunk) = self.pending_chunk.take() {
-                eprintln!(
+                log::warn!(
                     "⚠️ TTS 同一句连续 {} 次启动失败，丢弃该句: {:?}",
-                    self.pending_attempts, chunk.text
+                    self.pending_attempts,
+                    chunk.text
                 );
             }
             self.pending_attempts = 0;
         } else if let Some(chunk) = self.pending_chunk.as_ref() {
-            eprintln!(
+            log::warn!(
                 "⚠️ TTS 该句启动失败（第 {}/{} 次），重连后重试: {:?}",
-                self.pending_attempts, MAX_PENDING_ATTEMPTS, chunk.text
+                self.pending_attempts,
+                MAX_PENDING_ATTEMPTS,
+                chunk.text
             );
         }
     }
@@ -129,7 +132,7 @@ impl QwenTtsClient {
     async fn run_connection(state: &mut TtsRuntime, is_running: &AtomicBool) -> Result<SessionEnd> {
         let ws_stream =
             ws::connect_authenticated(&state.config.api_key, &state.config.ws_url).await?;
-        println!("✨ 百炼 TTS WebSocket 连接已建立...");
+        log::info!("✨ 百炼 TTS WebSocket 连接已建立...");
 
         // 连接只 split 一次并长期持有：空闲等待时也要 poll 读半边，
         // 才能消费 Ping/Pong、及时发现服务端 Close，并用写半边发送保活 Ping。
@@ -279,7 +282,7 @@ impl QwenTtsClient {
                                     continue;
                                 };
                                 if let Some(err) = resp.header.error_message {
-                                    eprintln!("TTS 服务端报错: {}", err);
+                                    log::warn!("TTS 服务端报错: {}", err);
                                     return Ok(SessionEnd::Disconnected(format!(
                                         "TTS 服务端报错: {}",
                                         err

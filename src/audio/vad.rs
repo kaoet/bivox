@@ -331,7 +331,7 @@ impl<D: VoiceDetector> SpeechGate<D> {
             } else {
                 "idle"
             };
-            eprintln!(
+            log::warn!(
                 "🎚️ VAD db={:.1} noise={:.1} thr={:.1} {} -> emitted {}chunk(s), tail_left={}ms",
                 self.detector.last_frame_dbfs(),
                 self.detector.noise_dbfs(),

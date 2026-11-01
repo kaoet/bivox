@@ -286,6 +286,13 @@ impl TextChunker {
     pub fn reset(&mut self) {
         self.emitted_text.clear();
     }
+
+    /// 已发射（已送入 TTS）的内容在 `full_text` 中对应的**字节前缀长度**。
+    ///
+    /// 返回值一定是 UTF-8 字符边界；用于界面上把"已送 TTS / 尚未送 TTS"两部分分色显示。
+    pub fn emitted_byte_len(&self, full_text: &str) -> usize {
+        find_unconsumed_byte_offset(full_text, &self.emitted_text).min(full_text.len())
+    }
 }
 
 #[cfg(test)]

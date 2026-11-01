@@ -189,10 +189,10 @@ where
         match P::run_once(state, is_running).await {
             Ok(SessionEnd::Shutdown) => return Ok(()),
             Ok(SessionEnd::Disconnected(reason)) => {
-                eprintln!("⚠️ {name} 会话断开: {reason}");
+                log::warn!("⚠️ {name} 会话断开: {reason}");
             }
             Err(e) => {
-                eprintln!("⚠️ {name} 建连/握手失败: {e:#}");
+                log::warn!("⚠️ {name} 建连/握手失败: {e:#}");
             }
         }
 
@@ -206,7 +206,7 @@ where
             backoff = BASE_BACKOFF;
         }
 
-        eprintln!(
+        log::warn!(
             "🔄 {:.1}s 后重连 {name}（累计第 {} 次连接尝试）...",
             backoff.as_secs_f64(),
             attempts
@@ -235,7 +235,7 @@ impl AudioStreamState {
             dropped += 1;
         }
         if dropped > 0 {
-            eprintln!("🧹 已丢弃断连期间积压的 {} 个音频包", dropped);
+            log::warn!("🧹 已丢弃断连期间积压的 {} 个音频包", dropped);
         }
 
         // 空文本 + 句终 = 下游 chunker 的重置信号

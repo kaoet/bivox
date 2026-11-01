@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.16，**M0、M1、M4、D0 已完成**；下一步 M2（实时管线事件化）
+> **状态**：草案 v0.24，**M0、M1、M2、M4、D0 已完成**；下一步 M3（音色配置编辑器）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -271,6 +271,10 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 
 - 日志面板上限 **5000 行**；字幕上限 **500 句**，均环形裁剪。
 - 字幕**只支持单句复制**（每行一个复制按钮），不提供"复制全部"、不导出。
+- 实时页字幕**不分段、无标题**：当前正在合成的句子在最上面，越早的字幕越靠下；列表顶部对齐（0.37 的 `ScrollArea` 没有 `stick_to_top`，靠默认顶部偏移实现）、字号 24px、行间分隔线。
+- 当前正在合成的句子**不显示复制按钮**；并按 TTS 进度分色：已送入 TTS 的部分用正常色，ASR 已识别但尚未送入 TTS 的部分用弱色（正常色 ×0.45）。`PipelineEvent::Asr` 带 `sent_bytes`（字符边界前缀），由 `TextChunker::emitted_byte_len` 计算；入历史后整句恢复普通色。当前句用 `LayoutJob` 分色时**必须 `Label::new(job).wrap()`**：水平布局里 Label 默认 `wrap_mode = Extend`，会把 `job.wrap.max_width` 覆盖成 `INFINITY`，导致长句不换行直接溢出（v0.24 修复）。
+- 每行最左侧固定宽度显示**本句语言代码**（当前句在语言判定前显示 `…`），当前句与历史句的文本左端对齐。语言列必须用 `allocate_exact_size` 显式占位：用 `allocate_ui_with_layout` 时外层拿的是子 Ui 的 `min_rect`（缩到内容宽度），`…` 比 `ja` 窄会让文本左移（v0.23 修复）。
+- 历史句的复制按钮改为**行尾图标**（自绘"两张叠纸"，不依赖 emoji 字体），只在鼠标悬停该行时显示；当前句无复制按钮。
 - 不保存历史会话到磁盘。
 - 日志面板不提供复制/导出。
 
@@ -347,7 +351,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 | `src/audio/device.rs:49-81` | 模糊匹配改为精确相等（D12） |
 | `src/audio/playback.rs:42-53` | `interrupt()` 从 `#[allow(dead_code)]` 变为正式 API |
 | `src/pipeline/orchestrator.rs:104-160` | 启动横幅 `println!` → `PipelineEvent` |
-| `src/pipeline/orchestrator.rs:250-253` | chunk `println!` → `PipelineEvent::TtsChunk` |
+| `src/pipeline/orchestrator.rs:250-253` | chunk 的 `println!`：v0.21 起直接删除（不记录日志、也不转事件，见用户要求） |
 | `config.example.toml` | 改为**内嵌模板源**：`[api] key` 行改成注释；顶部说明改为"程序首次启动会自动生成 `config.toml`（内容即本文件），本文件仅作模板源，不随包分发"；删除 `--config` 与"当前工作目录"描述 |
 | `src/config.rs` 测试段 | 删除 `cli_*` 三个用例；`example_config_is_valid` 改为 `..._template_without_key`（M0 已做） |
 | `README.md` | 改写为 GUI + 便携模式说明（配置/缓存/日志/备份/安全提示） |
@@ -388,8 +392,7 @@ src/
 ├── client/              # 不动
 ├── pipeline/
 │   ├── chunker.rs
-│   ├── orchestrator.rs
-│   └── session.rs       # PipelineSession
+│   └── session.rs       # PipelineSession：会话启停/事件上报（取代 orchestrator.rs）
 ├── language.rs          # 不动
 └── voice/
     ├── mod.rs, api.rs, cache.rs, mock_http.rs   # 不动
@@ -415,12 +418,10 @@ pub enum SessionState { Idle, Starting, Running, Stopping, Failed }
 pub enum PipelineEvent {
     StateChanged(SessionState),
     Devices { input: String, output: String },
-    VoiceResolved { display: String, languages: Vec<String> },
-    /// ASR 当前句（持续修订，is_sentence_end 表示这句结束）
-    Asr { text: String, is_sentence_end: bool },
-    /// 已送入 TTS 的 chunk（日志/诊断用）
-    TtsChunk { language: String, is_sentence_end: bool, text: String },
-    /// 本地 VAD 电平（"正在说话"指示；vad.debug 时才有）
+    VoiceInfo { display: String },
+    /// ASR 当前句（持续修订，is_sentence_end 表示这句结束；sent_bytes = 已送入 TTS 的字节前缀）
+    Asr { text: String, is_sentence_end: bool, sent_bytes: usize },
+    /// 本地 VAD 电平（"正在说话"指示；vad.debug 时才有，规划中）
     Level { db: f32 },
     Log { level: log::Level, message: String },
     Error { context: String, detail: String },
@@ -430,21 +431,24 @@ pub enum PipelineEvent {
 ### 7.2 会话
 
 ```rust
-// src/pipeline/session.rs
-pub struct PipelineSession {
-    cancel: Arc<AtomicBool>,
-    capture: AudioCapture,                 // 必须保活，drop 即停止采集
-    playback: AudioPlaybackHandle,
+// src/pipeline/session.rs（v0.17 起的实际实现）
+pub struct PipelineSessionHandle {          // Send + Clone，GUI 只持有它
+    running: Arc<AtomicBool>,               // 传给 ASR/TTS，初值 true
+    stop_requested: Arc<AtomicBool>,        // 区分用户停止 / 服务异常退出
+}
+impl PipelineSessionHandle {
+    pub fn stop(&self);
+    pub fn is_cancelled(&self) -> bool;
+    pub fn was_stopped_by_user(&self) -> bool;
 }
 
-impl PipelineSession {
-    /// 启动：解析音色（可能触发上传复刻）→ 建设备 → 起 ASR/TTS 任务 → 起调度循环
-    pub async fn start(config: AppConfig, events: mpsc::Sender<PipelineEvent>) -> Result<Self>;
-    /// 「停止播放」（复用 AudioPlaybackHandle::interrupt）
-    pub fn interrupt_playback(&self);
-    /// 优雅停止（D13）
-    pub async fn stop(self) -> Result<()>;
-}
+/// 正常停止发 `StateChanged(Idle)`；失败返回 `Err`（由 GUI 转成 Error + Failed）
+pub async fn run(
+    config: AppConfig,
+    events: UnboundedSender<PipelineEvent>,
+    repaint: egui::Context,
+    handle: PipelineSessionHandle,
+) -> Result<()>;
 ```
 
 ### 7.3 配置写回（D3）
@@ -558,19 +562,24 @@ impl AppPaths {
 
 **预估**：乐观 1 天 / 保守 1.5 天（实际约 1.5 小时）
 
-### M2 实时管线事件化（改动最大）
+### M2 实时管线事件化（已完成 ✅）
 
-- [ ] `events.rs` 契约落地
-- [ ] `orchestrator.rs` 拆分 → `session.rs::PipelineSession::start/stop`
-- [ ] 全部 `println!`（横幅、chunk、错误）→ 事件/日志
-- [ ] `app.rs` 事件泵：字幕、状态灯、日志
-- [ ] 工具栏开始/停止（三态）+ 「停止播放」接 `interrupt()`
-- [ ] 字幕：当前句 + 历史句（上限 500、单句复制）
-- [ ] 停止后设备释放（连续 3 次开始/停止）
-- [ ] 失败路径：无 Key、设备名不匹配、设备被占用、网络失败
+- [x] `src/events.rs`：`PipelineEvent`（StateChanged/Devices/VoiceInfo/Asr/Error）+ `SessionState`（`TtsChunk` 已在 v0.21 删除）
+- [x] `orchestrator.rs` → `pipeline/session.rs`：`PipelineSessionHandle`（`Send + Clone`，持有 running/stop_requested/playback 句柄）+ `session::run()`；GUI 不持有 cpal Stream，停止时 drop `AudioCapture` 再等任务收尾（D13）
+- [x] 库内 `println!`/`eprintln!` 全部改为 `log::*!`（audio/client/voice/app；`admin` 与 `main` 启动前保留终端输出）
+- [x] `app.rs`：事件泵（每帧排空）、字幕状态、状态机、开始/停止、关窗先停会话
+- [x] 工具栏：开始 / 停止（按状态启用），状态灯颜色（「停止播放」按钮已在 v0.20 按用户要求移除）
+- [x] 字幕：当前句 + 历史句（上限 500、单句复制、全部复制、自动滚到底）
+- [x] 停止后设备释放：实测连续 3 次开始→运行中→停止→空闲，无设备占用错误
+- [x] 失败路径：设备名不匹配实测得到 `Failed` + 红色错误横幅（"未找到输入设备 …"）；后台服务异常退出会被识别并上报 `Error`（用无效 Key 实测 401 场景）；无 Key 在 `start_session` 阶段直接提示
 
-**验收**：说话 → 字幕刷新、chunk 入日志、听到合成音；停止→开始可恢复，重复 3 次不掉设备
-**预估**：乐观 1.5 天 / 保守 2.5 天
+**实施要点**：
+- ASR/TTS 的 `is_running` 语义是「初值 true，false = 停止」，`PipelineSessionHandle.running` 按此初始化；`stop_requested` 用于区分"用户停止"（不弹错误条）与"服务异常退出"（弹错误条）。
+- 停止流程：`stop()` → 调度循环 100ms 内退出 → drop 采集 → 关闭 TTS 通道 → 等 ASR/TTS 任务最多 3s → 发 `StateChanged(Idle)`。
+- 字幕逻辑抽成纯函数 `ingest_asr_text`，4 个单测覆盖修订/清空/去重/500 上限。
+
+**验收**：实测说话 → 当前句刷新、历史句出现、TTS 音频有输出；停止→开始可恢复，连续 3 次不掉设备
+**预估**：乐观 1.5 天 / 保守 2.5 天（实际约 2 小时，含以 log 化与事件化重构）
 
 ### M3 音色配置编辑器（D11）
 
@@ -754,3 +763,11 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.14 | 2026-11-01 | 日志面板（底部）改为**可拖拽调整高度**：`Panel::bottom(..).resizable(true).default_size(180).min_size(60)`，日志 `ScrollArea` 去掉固定 `max_height(180)`、改为填满面板剩余高度（`auto_shrink([false,false])` + `stick_to_bottom`）。验证：egui_mcp 从分隔线 (550,540) 拖到 (550,400)，日志面板实时变高、可见行数增加；fmt / clippy 0 警告 / build / 110 测试全绿 |
 | v0.15 | 2026-11-01 | **M1 实施完成**：新增 `src/config_edit.rs`（`toml_edit` 定点写回 + 校验 + `.bak`，7 个单测）；设置页支持 API Key 保存、设备下拉（新枚举 API + 刷新 + 系统默认 + 恢复默认）、不一致警告、写回错误显示；设备查找改为**完整名精确匹配**（D12，移除子串匹配）；工具栏设备名超 24 字符截断；新增依赖 `toml_edit = "0.25"`。验证：fmt / clippy 0 警告 / build / **117** 测试全绿；egui_mcp 实测 Key 写回（备份生成、注释/其它字段保留）、设备清除写回、设备名不一致警告。已知：injected click 对 0.37 ComboBox 弹层选项无效（测试用「恢复系统默认」按钮验证写回路径），真实鼠标不受影响 |
 | v0.16 | 2026-11-01 | 新增**「音频」页签**（顺序：实时 / 音频 / 语音合成 / 设置），集中放输入/输出设备选择：下拉 + 刷新 + 恢复系统默认 + 一致/不一致提示；设备 UI 从「设置」页整体移出（设置页只剩路径 / API Key / 配置概览），Top panel 不再显示设备；设备下拉组件移到 `gui/widgets.rs` 复用。验证：fmt / clippy 0 警告 / build / 117 测试；egui_mcp 实测 Tab 顺序、音频页设备 UI、设置页无设备、工具栏无设备文本 |
+| v0.17 | 2026-11-01 | **M2 实施完成**：新增 `src/events.rs`（`PipelineEvent`/`SessionState`）与 `src/pipeline/session.rs`（`PipelineSessionHandle` + `session::run()`，取代 `orchestrator.rs`）；库内所有 `println!/eprintln!` 改为 `log::*!`；`app.rs` 接事件泵（字幕/状态/错误条）与开始/停止/停止播放；字幕当前句+历史（500、单句复制、自动滚动）；工具栏三态按钮；关闭先停会话。修 ASR/TTS `is_running` 语义（初值 true）并用 `stop_requested` 区分用户停止与异常退出。验证：fmt / clippy 0 警告 / **121** 测试；egui_mcp 实测 3 次开始→运行中→停止→空闲、实际说话字幕与 `chunk [zh] 句终` 日志、无效 Key 401 与设备名不匹配两条失败路径 |
+| v0.18 | 2026-11-01 | 实时页按你的要求重做：**去掉所有标题/状态行**；字幕不再分「当前句/历史」，合并为**单个列表**——最新一句（正在合成）在最上，越早越靠下，`stick top`，行间分隔线，字号加大到 24px，仍保留单句「复制」。验证：fmt / clippy 0 警告 / build / 121 测试；用临时演示数据截图核对布局后已删除演示代码 |
+| v0.19 | 2026-11-01 | 实时页当前句展示细化：①当前句不显示复制按钮；②当前句按 TTS 进度分色——已送入 TTS 的部分正常色，ASR 已识别但未送入的部分弱色（×0.45）。实现：`PipelineEvent::Asr` 增加 `sent_bytes`（字符边界前缀），`TextChunker` 新增 `emitted_byte_len()`，`app::ingest_asr_text` 记录/校验前缀并新增 2 个单测，当前句用 `LayoutJob` 拼接两段 `TextFormat`。验证：fmt / clippy 0 警告 / **123** 测试；临时演示数据截图核对分色与无复制按钮后已删除演示代码 |
+| v0.20 | 2026-11-01 | 按用户要求**移除工具栏「停止播放」按钮**（保留「停止」= 结束会话）；同步删除 `app::interrupt_playback`、`PipelineSessionHandle` 的 playback 槽/`interrupt_playback`，简化句柄为 `running + stop_requested`。验证：fmt / clippy 0 警告 / build / 123 测试；egui_mcp 实测工具栏仅剩开始/停止，运行中→停止→空闲正常 |
+| v0.21 | 2026-11-01 | 按用户要求**删除 TTS chunk 日志**，并连带删除 `PipelineEvent::TtsChunk`（它只服务于这条日志）：`session.rs` 不再为每个 chunk 发事件，`app.rs` 对应 match 分支移除；语言判定/voice 解析/送入 TTS 的逻辑不变。验证：fmt / clippy 0 警告 / build / 123 测试 |
+| v0.22 | 2026-11-01 | 字幕列表项 UI 重做：①每行最左固定宽度显示**本句语言代码**（当前句也显示，判定前为 `…`）；②当前句与历史句**文本左端对齐**（共用语言列 + 预留复制位）；③历史句复制按钮改为**行尾自绘复制图标**（无文字），仅悬停该行时显示，点击复制整句。数据层：`PipelineEvent::Asr` 增加 `language`，字幕状态收敛为 `SubtitleState { current, sent_bytes, language, history: Vec<SubtitleLine> }`（消除 clippy too_many_arguments）。验证：fmt / clippy 0 警告 / build / 123 测试；临时演示数据截图核对语言列、对齐、悬停图标后已删除演示代码 |
+| v0.23 | 2026-11-01 | 修**字幕文本左端偶发不对齐**：语言列原来用 `allocate_ui_with_layout(vec2(40, 0))`，但外层按子 Ui 的 `min_rect` 分配空间，语言代码窄（当前句未判定时是 `…`）与宽（`ja`）不同导致文本起点差几个像素。改为 `allocate_exact_size` 固定占位 + `painter` 画语言码，宽度稳定。验证：演示数据（当前句语言未知 `…` + 历史句 `ja`）实测两个文本 Label 的 `bounds.x` 均为 56.0；fmt / clippy 0 警告 / build / 123 测试 |
+| v0.24 | 2026-11-01 | 修**当前句长文本溢出屏幕不换行**：当前句分色用 `LayoutJob` + `Label`，但水平布局里 `Label` 的默认 `wrap_mode` 是 `Extend`，会把 `job.wrap.max_width` 覆盖为 `INFINITY`（历史句因为显式 `.wrap()` 才正常）。改为 `Label::new(job).wrap()`，长句在行宽处正常折行。验证：演示数据长英文句截图确认两行显示（第一行正常色/第二行弱色）；fmt / clippy 0 警告 / build / 123 测试 |

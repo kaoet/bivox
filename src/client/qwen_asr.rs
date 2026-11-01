@@ -169,7 +169,7 @@ impl QwenAsrClient {
             bail!("Qwen ASR 握手失败 [{}]: {}", err_code, err_msg);
         }
 
-        println!("✨ Qwen-Audio-3.1 极速语音识别通道已就绪...");
+        log::info!("✨ Qwen-Audio-3.1 极速语音识别通道已就绪...");
         Ok((stream, task_id))
     }
 

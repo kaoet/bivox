@@ -112,7 +112,7 @@ impl AudioPlaybackEngine {
         let resampler = MonoResampler::new(input_sample_rate, native_sample_rate)?
             .map(|r| Arc::new(Mutex::new(r)));
 
-        let err_fn = |err| eprintln!("扬声器输出流异常: {:?}", err);
+        let err_fn = |err| log::warn!("扬声器输出流异常: {:?}", err);
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(

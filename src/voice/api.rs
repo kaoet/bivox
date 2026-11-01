@@ -314,7 +314,7 @@ impl BailianVoiceApi {
                 );
             }
             if started.elapsed() >= timeout {
-                eprintln!(
+                log::warn!(
                     "⚠️ 音色 {voice_id} 在 {}s 内仍未就绪（最后状态: {last_status:?}），先继续使用",
                     timeout.as_secs()
                 );

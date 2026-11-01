@@ -153,7 +153,7 @@ pub async fn resolve_custom_voice(
                 groups.entry(hash.clone()).or_default().push(index);
             }
             PreparedSource::Cached { hash, entry } => {
-                println!(
+                log::info!(
                     "🎙️ 自定义音色「{}」语言 {} 命中缓存（样例音频不可读，复用原路径记录）: {}",
                     display_name,
                     sample.canonical_language,
@@ -184,7 +184,7 @@ pub async fn resolve_custom_voice(
             if !entry.voice_id.is_empty() {
                 match verify_cached_voice(api, &entry.voice_id).await {
                     CachedVoiceState::Usable => {
-                        println!(
+                        log::info!(
                             "🎙️ 自定义音色「{}」语言 {} 命中缓存: {}",
                             display_name,
                             canonical_language,
@@ -193,12 +193,13 @@ pub async fn resolve_custom_voice(
                         entries.insert(hash.clone(), entry);
                         continue;
                     }
-                    CachedVoiceState::Missing => println!(
+                    CachedVoiceState::Missing => log::info!(
                         "♻️ 自定义音色「{}」语言 {} 的缓存 voice_id 已不存在，将重新复刻",
-                        display_name, canonical_language
+                        display_name,
+                        canonical_language
                     ),
                     CachedVoiceState::Unverified(reason) => {
-                        eprintln!(
+                        log::warn!(
                             "⚠️ 无法校验音色 {} 是否仍有效（{reason}），先继续使用缓存",
                             entry.voice_id
                         );
@@ -230,7 +231,7 @@ pub async fn resolve_custom_voice(
 
     // 并行注册（首次多语言会同时创建多个音色）
     if !enroll_jobs.is_empty() {
-        println!(
+        log::info!(
             "⬆️ 共有 {} 个语言样本需要注册，正在并行处理...",
             enroll_jobs.len()
         );
@@ -301,7 +302,7 @@ pub async fn resolve_custom_voice(
         language::canonical_language(&prepared[0].canonical_language).to_string();
     let mut languages: Vec<String> = voices.keys().cloned().collect();
     languages.sort_unstable();
-    println!(
+    log::info!(
         "🎙️ 自定义音色「{}」已就绪，语言声线: {}（默认 {}）",
         display_name,
         languages.join(", ").cyan(),
@@ -362,7 +363,7 @@ async fn prepare_sample(
             if let Some((hash, entry)) =
                 cache.find_with_hash_by_audio_path(&config.tts.model, &audio_path_text)
             {
-                eprintln!(
+                log::warn!(
                     "⚠️ 读取样例音频 {} 失败（{read_err}），但缓存中有该路径对应的语言 {} 音色，\
                      继续复用 voice_id: {}（未校验云端状态；如需替换音频请恢复该文件）",
                     audio_path.display(),
@@ -431,17 +432,19 @@ async fn enroll_one(
     file_name: &str,
     bytes: Vec<u8>,
 ) -> Result<VoiceCacheEntry> {
-    println!(
+    log::info!(
         "⬆️ 自定义音色「{}」语言 {}：上传样例音频...",
-        display_name, language_code
+        display_name,
+        language_code
     );
     let uploaded = api
         .upload_audio(file_name, bytes)
         .await
         .with_context(|| format!("上传「{display_name}」语言 {language_code} 的样例音频失败"))?;
-    println!(
+    log::info!(
         "  ⬆️ 已上传样例音频: {}（file_id: {}）",
-        uploaded.name, uploaded.file_id
+        uploaded.name,
+        uploaded.file_id
     );
 
     let enroll_result = async {
@@ -449,7 +452,7 @@ async fn enroll_one(
             .file_download_url(&uploaded.file_id)
             .await
             .with_context(|| format!("获取上传文件 {} 的下载地址失败", uploaded.file_id))?;
-        println!(
+        log::info!(
             "🎨 自定义音色「{}」语言 {}：创建复刻音色（模型 {}，前缀 {}）...",
             display_name,
             language_code,
@@ -459,21 +462,21 @@ async fn enroll_one(
         let voice_id = api
             .create_voice(target_model, prefix, &audio_url, Some(language_code))
             .await?;
-        println!("⏳ 音色 {voice_id} 已创建，等待百炼完成复刻部署...");
+        log::info!("⏳ 音色 {voice_id} 已创建，等待百炼完成复刻部署...");
         api.wait_until_ready(&voice_id, READY_TIMEOUT).await?;
         Ok::<String, anyhow::Error>(voice_id)
     }
     .await;
 
     if let Err(e) = api.delete_file(&uploaded.file_id).await {
-        eprintln!(
+        log::warn!(
             "⚠️ 清理百炼临时上传文件 {} 失败（不影响使用，可忽略）: {e:#}",
             uploaded.file_id
         );
     }
     let voice_id = enroll_result
         .with_context(|| format!("自定义音色「{display_name}」语言 {language_code} 注册失败"))?;
-    println!(
+    log::info!(
         "{}",
         format!(
             "✅ 自定义音色「{}」语言 {} 已注册: {}",
@@ -539,7 +542,7 @@ fn check_audio_duration(bytes: &[u8], display_name: &str, language_code: &str) -
         );
     }
     if seconds > RECOMMENDED_MAX_SECONDS {
-        eprintln!(
+        log::warn!(
             "⚠️ 自定义音色「{display_name}」语言 {language_code} 的样例音频较长（{seconds:.1} 秒），\
              建议裁剪到 10~20 秒（官方建议单条不超过 60 秒）以获得更好的复刻效果"
         );

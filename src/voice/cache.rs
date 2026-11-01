@@ -85,7 +85,7 @@ impl VoiceCache {
                         Ok(_) => format!("已备份为 {}", backup.display()),
                         Err(copy_err) => format!("备份失败: {copy_err}"),
                     };
-                    eprintln!(
+                    log::warn!(
                         "⚠️ 自定义音色缓存文件 {} 无法读取（{e:#}），{backup_note}；将重新建立缓存",
                         path.display()
                     );

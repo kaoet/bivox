@@ -63,7 +63,8 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
   - `qwen_asr.rs`：百炼 Qwen Audio 实时双向流式识别。
   - `qwen_tts.rs`：Qwen-Audio-TTS 流式语音合成。
   - `ws.rs`：鉴权建连、握手、Ping 保活、断线指数退避重连的公共骨架。
-- `src/pipeline/`：`chunker.rs` 流式文本分块，`orchestrator.rs` 编排 ASR -> 语言判定 -> 分块 -> TTS。
+- `src/pipeline/`：`chunker.rs` 流式文本分块，`session.rs` 实时会话（ASR → 语言判定 → 分块 → TTS，启停/事件上报）。
+- `src/events.rs`：后台 → GUI 的事件契约（`PipelineEvent` / `SessionState`）。
 - `src/voice/`：自定义（复刻）音色。
   - `api.rs`：调百炼 HTTP 接口（文件上传、音色复刻/查询/列表/删除），不依赖 SDK。
   - `cache.rs`：`voice_cache.json`（模型 -> 音频 SHA256 -> voice_id）读写。

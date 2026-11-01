@@ -1,7 +1,6 @@
-//! GUI 应用主体：启动准备、全局状态、面板布局、退出流程。
+//! GUI 应用主体：启动准备、全局状态、面板布局、事件泵、退出流程。
 //!
-//! 阶段说明：M0 搭好骨架（窗口 + 三个页签 + 日志面板 + 便携路径/崩溃处理）；
-//! M1 接入配置写回（API Key / 音频设备）；实时管线（M2）、音色编辑（M3）后续接入。
+//! 阶段说明：M0 骨架；M1 配置写回；M2 实时管线（`PipelineSession` + 事件泵 + 字幕）。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -9,44 +8,87 @@ use std::process::ExitCode;
 
 use eframe::egui;
 use log::{error, info, warn};
+use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
 use crate::config::AppConfig;
 use crate::config_edit;
+use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::paths::AppPaths;
+use crate::pipeline::session::PipelineSessionHandle;
 
 /// 窗口标题。
 pub const WINDOW_TITLE: &str = "kaols — 实时语音识别与合成";
 
-/// 会话状态机（M2 起由 `PipelineSession` 驱动）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionState {
-    Idle,
-    Starting,
-    Running,
-    Stopping,
-    Failed,
+/// 字幕历史保留上限（D16）。
+pub const MAX_SUBTITLES: usize = 500;
+
+/// 一条已结束的字幕：本句语言代码 + 文本。
+#[derive(Debug, Clone)]
+pub struct SubtitleLine {
+    pub language: String,
+    pub text: String,
 }
 
-impl SessionState {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "空闲",
-            Self::Starting => "启动中",
-            Self::Running => "运行中",
-            Self::Stopping => "停止中",
-            Self::Failed => "已失败",
-        }
-    }
+/// 实时字幕状态（当前句 + 历史）。
+#[derive(Debug, Default)]
+pub struct SubtitleState {
+    /// 当前句（ASR 持续修订）。
+    pub current: String,
+    /// 当前句已送入 TTS 的字节前缀长度。
+    pub sent_bytes: usize,
+    /// 当前句已判定的语言代码（首个 chunk 送出前为 `None`）。
+    pub language: Option<String>,
+    /// 已结束的句子（上限 `MAX_SUBTITLES`），带本句语言代码。
+    pub history: Vec<SubtitleLine>,
+}
 
-    pub fn color(self) -> egui::Color32 {
-        match self {
-            Self::Idle => egui::Color32::GRAY,
-            Self::Starting | Self::Stopping => egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
-            Self::Running => egui::Color32::from_rgb(0x3c, 0xc9, 0x6f),
-            Self::Failed => egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+impl SubtitleState {
+    /// 把一条 ASR 事件并入字幕状态（纯逻辑，便于单测）。
+    ///
+    /// - 非空文本：刷新当前句，记录已送 TTS 的字节前缀与语言；
+    /// - 空文本 + 句终：ASR 重置信号，清空当前句；
+    /// - 句终：当前句（连同语言代码）落进历史，与上一句文本相同则不重复，
+    ///   超过 `MAX_SUBTITLES` 丢最旧的。
+    fn apply_asr(
+        &mut self,
+        text: &str,
+        is_sentence_end: bool,
+        sent: usize,
+        language: Option<String>,
+    ) {
+        if text.is_empty() {
+            if is_sentence_end {
+                self.current.clear();
+                self.sent_bytes = 0;
+                self.language = None;
+            }
+        } else {
+            self.current.clear();
+            self.current.push_str(text);
+            // 防御：只接受字符边界且不超过当前文本长度的前缀
+            self.sent_bytes = sent.min(self.current.len());
+            while self.sent_bytes > 0 && !self.current.is_char_boundary(self.sent_bytes) {
+                self.sent_bytes -= 1;
+            }
+            // 语言在本句首个 chunk 送出前是未知的；一旦判定就沿用本句
+            if language.is_some() {
+                self.language = language;
+            }
+        }
+
+        if is_sentence_end && !self.current.is_empty() {
+            let text = std::mem::take(&mut self.current);
+            self.sent_bytes = 0;
+            let language = self.language.take().unwrap_or_default();
+            if self.history.last().map(|line| line.text.as_str()) != Some(text.as_str()) {
+                self.history.push(SubtitleLine { language, text });
+                if self.history.len() > MAX_SUBTITLES {
+                    self.history.remove(0);
+                }
+            }
         }
     }
 }
@@ -84,11 +126,14 @@ pub enum ConfigState {
 /// 应用状态。
 pub struct KaolsApp {
     pub paths: AppPaths,
-    /// 后台运行时；M2 起用它 spawn ASR/TTS 任务（现在只保活，等待接入）。
-    #[allow(dead_code)]
+    /// 后台运行时：M2 起用它 spawn `PipelineSession`。
     pub runtime: tokio::runtime::Runtime,
     pub tab: Tab,
     pub state: SessionState,
+    /// 正在运行的实时会话（`None` = 未启动）。
+    pub session: Option<PipelineSessionHandle>,
+    /// 后台事件接收端（与 `session` 同生命周期）。
+    pub events_rx: Option<mpsc::UnboundedReceiver<PipelineEvent>>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub config: ConfigState,
@@ -101,6 +146,10 @@ pub struct KaolsApp {
     pub output_devices: Vec<String>,
     /// 最近一次写回配置失败的原因（成功时清空）。
     pub config_write_error: Option<String>,
+    /// 实时字幕状态（当前句 + 历史句）。
+    pub subtitles: SubtitleState,
+    /// 实时管线报错（顶部横幅显示，可手动清除）。
+    pub pipeline_error: Option<String>,
     /// 本次启动是否刚刚生成了默认配置。
     pub config_created: bool,
     /// 启动检查发现的问题（写默认配置失败、初始化日志失败等）。
@@ -132,6 +181,8 @@ impl KaolsApp {
             runtime,
             tab,
             state: SessionState::Idle,
+            session: None,
+            events_rx: None,
             input_device: None,
             output_device: None,
             config,
@@ -140,6 +191,8 @@ impl KaolsApp {
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             config_write_error: None,
+            subtitles: SubtitleState::default(),
+            pipeline_error: None,
             config_created,
             startup_error,
             crash: None,
@@ -245,6 +298,111 @@ impl KaolsApp {
         }
     }
 
+    // ---- M2：实时管线（PipelineSession）----
+
+    /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。
+    pub fn start_session(&mut self, ctx: egui::Context) {
+        if self.session.is_some() {
+            return;
+        }
+        let config = match &self.config {
+            ConfigState::Loaded(config) => (**config).clone(),
+            ConfigState::Invalid { .. } => {
+                self.pipeline_error =
+                    Some("配置无效，无法启动实时管线（请先在「设置」页填写 API Key）".to_string());
+                warn!("启动实时管线失败：配置无效");
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = PipelineSessionHandle::new();
+        self.session = Some(handle.clone());
+        self.events_rx = Some(rx);
+        self.state = SessionState::Starting;
+        self.pipeline_error = None;
+        self.subtitles = SubtitleState::default();
+
+        let runtime = self.runtime.handle().clone();
+        let events_for_run = tx.clone();
+        let repaint = ctx.clone();
+        runtime.spawn(async move {
+            if let Err(err) =
+                crate::pipeline::session::run(config, events_for_run, repaint.clone(), handle).await
+            {
+                let detail = format!("{err:#}");
+                // best-effort: 界面可能已退出，事件丢弃即可
+                let _ = tx.send(PipelineEvent::Error {
+                    context: "实时管线启动/运行失败".to_string(),
+                    detail,
+                });
+                let _ = tx.send(PipelineEvent::StateChanged(SessionState::Failed));
+                repaint.request_repaint();
+            }
+        });
+        info!("正在启动实时管线…");
+    }
+
+    /// 「停止」：请求后台收尾；回到 Idle 要等 `StateChanged(Idle)` 事件。
+    pub fn stop_session(&mut self) {
+        if let Some(session) = &self.session {
+            session.stop();
+            self.state = SessionState::Stopping;
+            info!("正在停止实时管线…");
+        }
+    }
+
+    /// 排空后台事件（每帧一次）。
+    fn pump_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.events_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.events_rx = None;
+        }
+        for event in events {
+            self.apply_event(event);
+        }
+    }
+
+    fn apply_event(&mut self, event: PipelineEvent) {
+        match event {
+            PipelineEvent::StateChanged(state) => {
+                self.state = state;
+                if matches!(state, SessionState::Idle | SessionState::Failed) {
+                    self.session = None;
+                }
+            }
+            PipelineEvent::Devices { input, output } => {
+                info!("实时管线设备已打开：输入 {input} / 输出 {output}");
+            }
+            PipelineEvent::VoiceInfo { display } => info!("合成音色：{display}"),
+            PipelineEvent::Asr {
+                text,
+                is_sentence_end,
+                sent_bytes,
+                language,
+            } => self
+                .subtitles
+                .apply_asr(&text, is_sentence_end, sent_bytes, language),
+            PipelineEvent::Error { context, detail } => {
+                self.pipeline_error = Some(format!("{context}：{detail}"));
+                error!("{context}：{detail}");
+            }
+        }
+    }
+
     /// 把日志模块累计的行搬到界面状态里（每帧一次，避免每帧复制全部历史）。
     fn pump_logs(&mut self) {
         for line in log_sink::take_lines() {
@@ -269,7 +427,10 @@ impl KaolsApp {
             self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint();
-            // M2：在这里停止 PipelineSession（先停音频再关窗）
+            // D13：先请求停止实时管线（后台任务退出前会 drop 音频设备），再关窗。
+            if let Some(session) = &self.session {
+                session.stop();
+            }
             info!("收到关闭请求，正在退出");
             return true;
         }
@@ -293,6 +454,17 @@ impl KaolsApp {
                 egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
             );
         }
+        if let Some(detail) = self.pipeline_error.clone() {
+            gui::widgets::banner(
+                ui,
+                "实时管线错误",
+                &detail,
+                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+            );
+            if ui.button("清除错误").clicked() {
+                self.pipeline_error = None;
+            }
+        }
 
         ui.horizontal(|ui| {
             for tab in Tab::ALL {
@@ -315,6 +487,7 @@ impl KaolsApp {
 impl eframe::App for KaolsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_logs();
+        self.pump_events();
 
         let ctx = ui.ctx().clone();
         if self.request_close(&ctx) {
@@ -378,7 +551,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
     let config_created = match paths.ensure_default_config() {
         Ok(created) => {
             if created {
-                eprintln!("已生成默认配置：{}", paths.config_file.display());
+                info!("已生成默认配置：{}", paths.config_file.display());
             }
             created
         }
@@ -444,8 +617,123 @@ pub fn run(paths: AppPaths) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!("GUI 启动失败：{err}");
-            eprintln!("GUI 启动失败：{err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apply(
+        state: &mut SubtitleState,
+        text: &str,
+        is_end: bool,
+        sent: usize,
+        language: Option<&str>,
+    ) {
+        state.apply_asr(text, is_end, sent, language.map(str::to_string));
+    }
+
+    #[test]
+    fn asr_revision_updates_current_sentence() {
+        let mut state = SubtitleState::default();
+
+        apply(&mut state, "今天天气", false, 0, None);
+        assert_eq!(state.current, "今天天气");
+        assert!(state.history.is_empty());
+
+        apply(&mut state, "今天天气真不错。", true, 0, Some("zh"));
+        assert_eq!(state.current, "");
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "今天天气真不错。");
+        assert_eq!(state.history[0].language, "zh");
+    }
+
+    #[test]
+    fn sent_prefix_tracks_tts_progress_and_resets() {
+        let mut state = SubtitleState::default();
+
+        // 已送 TTS 的前 6 个字节 = "今天"
+        apply(
+            &mut state,
+            "今天天气真不错",
+            false,
+            "今天".len(),
+            Some("zh"),
+        );
+        assert_eq!(state.sent_bytes, "今天".len());
+        assert_eq!(state.language.as_deref(), Some("zh"));
+        assert!(state.current.is_char_boundary(state.sent_bytes));
+
+        // 句终时落进历史、前缀清零、语言随句带走
+        apply(&mut state, "今天天气真不错", true, 0, Some("zh"));
+        assert_eq!(state.sent_bytes, 0);
+        assert_eq!(state.language, None);
+        assert_eq!(
+            state.history.last().map(|line| line.text.as_str()),
+            Some("今天天气真不错")
+        );
+        assert_eq!(
+            state.history.last().map(|line| line.language.as_str()),
+            Some("zh")
+        );
+    }
+
+    #[test]
+    fn sent_prefix_is_clamped_to_char_boundary() {
+        let mut state = SubtitleState::default();
+
+        // 1 字节落在汉字中间，应退回到 0，避免 &str 切片 panic
+        apply(&mut state, "今天天气", false, 1, None);
+        assert_eq!(state.sent_bytes, 0);
+
+        // 超过文本长度也会被截断
+        apply(&mut state, "今天天气", false, 999, None);
+        assert_eq!(state.sent_bytes, "今天天气".len());
+    }
+
+    #[test]
+    fn empty_sentence_end_clears_current() {
+        let mut state = SubtitleState {
+            current: "残留".to_string(),
+            sent_bytes: "残留".len(),
+            language: Some("ja".to_string()),
+            ..Default::default()
+        };
+
+        apply(&mut state, "", true, 0, None);
+        assert_eq!(state.current, "");
+        assert_eq!(state.sent_bytes, 0);
+        assert_eq!(state.language, None);
+        assert!(state.history.is_empty());
+    }
+
+    #[test]
+    fn same_sentence_is_not_pushed_twice() {
+        let mut state = SubtitleState::default();
+        apply(&mut state, "重复句。", true, 0, Some("zh"));
+        apply(&mut state, "重复句。", true, 0, Some("zh"));
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "重复句。");
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut state = SubtitleState::default();
+        for index in 0..=MAX_SUBTITLES {
+            apply(&mut state, &format!("第 {index} 句。"), true, 0, Some("zh"));
+        }
+
+        assert_eq!(state.history.len(), MAX_SUBTITLES);
+        assert_eq!(
+            state.history.first().map(|line| line.text.as_str()),
+            Some("第 1 句。")
+        );
+        assert_eq!(
+            state.history.last().map(|line| line.text.as_str()),
+            Some(format!("第 {MAX_SUBTITLES} 句。").as_str())
+        );
     }
 }
