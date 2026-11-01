@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.9，**M0 与 M4 已完成**（wgpu 后端已恢复），下一步 M1
+> **状态**：草案 v0.10，**M0 与 M4 已完成**（wgpu 后端已恢复），下一步 M1（或先做 D0 工具链：§11）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -262,7 +262,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
   - 每轮改动必须 `cargo fmt --check && cargo build && cargo test` 全绿。
   ```
 
-- 调试：`EGUI_INSPECTION=1` + egui_mcp（`cargo install --git https://github.com/rerun-io/kittest_inspector egui_mcp`）。
+- 调试：`EGUI_INSPECTION=1` + egui_mcp（`cargo install egui_mcp`；DSH 的具体接法见 §11）。
 
 ### D16 ✅ 字幕与日志留存
 
@@ -649,7 +649,7 @@ impl AppPaths {
 1. **版本钉死**：`eframe = "=0.37.0"`、`egui_kittest = "=0.37.0"`（dev）。
 2. **每轮门禁**：`cargo fmt --check && cargo build --bins && cargo test`，失败把完整错误贴回模型；不允许 `--no-verify`。
 3. **文件规模**：`gui/` 下每个文件 ≤ 300 行，便于 AI 精确修改与 review。
-4. **运行期观测**：`EGUI_INSPECTION=1` + egui_mcp 让 agent 自己点一遍；kittest 做回归。
+4. **运行期观测**：`EGUI_INSPECTION=1` + egui_mcp 让 agent 自己点一遍（DSH 接法见 §11）；kittest 做回归。
 5. **截图核对**：wgpu 后端不支持 `EFRAME_SCREENSHOT_TO`（上游未实现），需要临时用 glow 变体构建：
    `$env:EFRAME_SCREENSHOT_TO="xxx.png"; cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"`
    —— 无交互截屏后自动退出。⚠️ 但 `egui::Grid` 之类会触发 multi-pass（`request_discard`）的组件
@@ -659,7 +659,67 @@ impl AppPaths {
 
 ---
 
-## 11. 变更记录
+## 11. 开发工具链：egui_mcp（D0，非产品里程碑）
+
+**时机**：建议现在就做（M1 之前）。它不改变产品代码，只影响开发期自测方式；M1/M3 的 UI 验证最需要它。最晚在 M2 接实时管线前完成即可。
+
+### 11.1 应用侧（已就绪，无需改代码）
+
+- `eframe` 的 `inspection` feature 已在 D1 的依赖里启用（运行期默认关闭，只认环境变量）。
+- 启动方式：`$env:EGUI_INSPECTION=1; .\scripts\dev-run.ps1` → 应用在 `127.0.0.1:5719` 开 inspection 端口；不设置该变量则完全关闭。
+- 说明：这是**开发期调试开关**，不属于 D4「不读环境变量」的配置路径规则（不改变配置/路径语义，release 也只在显式设置时才开端口）。
+- 截图限制：inspection 的 screenshot 需要窗口可见（最小化/完全遮挡时拿不到帧）；另外 eframe 的 `EFRAME_SCREENSHOT_TO` 在 wgpu 下不可用，静态截图仍走 glow 变体（§10）。
+
+### 11.2 DSH（DeepSeek Harness）侧：一次性改动
+
+DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v0.2.1-rc.5），不用装插件，只需要：
+
+1. **安装 MCP server**（crates.io 已有 0.3.0；依赖 `egui ^0.37` / `egui_inspection ^0.37`，与本项目 0.37 匹配）：
+   ```powershell
+   cargo install egui_mcp
+   ```
+   产物在 `%USERPROFILE%\.cargo\bin\egui-mcp.exe`（该目录已在 PATH）。
+
+2. **加一条 profile patch**，追加到 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 末尾：
+   ```yaml
+   - id: mcp-egui
+     name: '@deepseek-ai/dsh-mcp-client'
+     config:
+       serverName: egui
+       transport: stdio
+       command: 'C:\Users\kaoet\.cargo\bin\egui-mcp.exe'
+       args: []
+   ```
+   （`serverName` 会变成工具名前缀；可用 `env` 覆盖环境变量，见该插件 README。）
+
+3. **重启 DSH**（Cordis profile 在启动时加载）。重启后**新会话**的工具列表里会出现 `mcp__egui__*`；当前会话不会热加载。
+
+4. egui-mcp 是 stdio server，不需要端口/防火墙；它主动去连本机 5719。
+
+### 11.3 使用流程
+
+1. 终端：`$env:EGUI_INSPECTION=1` 后启动 GUI（保持窗口可见）。
+2. 新会话里让 agent：`attach` → 读 `widget_tree` / `get_widget` → `click` / `type` / `press keys` → `screenshot` 核对。
+3. 工具名形如 `mcp__egui__attach`、`mcp__egui__click`、`mcp__egui__screenshot`（以实际工具列表为准）。
+
+### 11.4 与其它验证手段的分工
+
+| 需求 | 手段 |
+|---|---|
+| CI/离线的语义回归（按钮状态、错误文案） | `egui_kittest`（D14） |
+| agent 操作真实窗口、复现交互 bug、截图核对 | egui_mcp + inspection（本节） |
+| 静态截图产物（可保存/对比） | glow 变体 + `EFRAME_SCREENSHOT_TO`（§10） |
+
+### 11.5 注意
+
+- inspection 只监听 `127.0.0.1`（eframe 默认）；不要把端口暴露到外网。
+- `attach` 失败时按顺序排查：GUI 是否带 `EGUI_INSPECTION=1` 启动 → 5719 是否被占用 → egui_mcp 版本是否仍匹配 egui 0.37。
+- 如果不想动 DSH 配置：可以退化为在仓库里写一个直连 inspection 协议的小 devtool（shell 调用），成本更高，不推荐。
+- 重启 DSH 会中断当前会话；建议安排在不影响手头工作的时候做。
+
+---
+
+## 12. 变更记录
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
@@ -672,3 +732,4 @@ impl AppPaths {
 | v0.7 | 2026-11-01 | **M4 实施完成**：新增 `voice/admin.rs`（`list_remote_voices` 强制完整分页、`delete_remote_voice` 区分已删除/本来不存在、`delete_all_remote_voices` 三分类报告，7 个 mock 测试）与调试 bin（`-c/--config`、`list`、`delete --voice-id`、`delete-all -y`，交互确认需输入 YES）；**删除 `voice/cli.rs` 931 行**（enroll 与配置/缓存耦合逻辑一并移除）；`Cargo.toml` 加 `default-run = "kaols"`；顺手把 `AppConfig::load` 的错误提示从"复制 config.example.toml"改成"程序会在 exe 同目录自动生成"。验证：`cargo build --bins` + `cargo test`（110 用例）全绿，CLI 帮助/配置缺失/非交互确认三条路径手工验证 |
 | v0.8 | 2026-11-01 | 按你的要求把调试 CLI 改名为 **`admin`**：`src/bin/kaols-voice-admin.rs` → `src/bin/admin.rs`，clap `name = "admin"`，文档与命令示例同步（`cargo run --bin admin -- list`）；功能与参数不变 |
 | v0.9 | 2026-11-01 | **cpal 0.15 → 0.18 升级，wgpu 后端恢复为默认**（D9 重写）：cpal 0.18 改用 `windows ^0.62`，依赖图里 0.54 消失，`gpu-allocator` 与 `wgpu-hal` 对齐，wgpu 编译/运行通过（本机枚举到 4 个适配器，DX12 RTX 5070 Ti 可用）。代码适配：`DeviceTrait::name()`→`description()?.name()`（新增 `audio::device::device_name`）、`sample_rate()` 返回 u32、`build_*_stream` 收 `StreamConfig` 值（`supported_config.config()`）。Cargo 增加 `renderer-wgpu`（默认）/`renderer-glow` 两个 feature，`app.rs` 按 feature 选渲染器；glow 变体保留用于截图核对（wgpu 不支持 `EFRAME_SCREENSHOT_TO`）与 OpenGL 兜底；`dev-run.ps1 -Glow`。验证：两种变体均构建通过，GUI 以 wgpu 启动 6s 稳定运行，cpal 0.18 设备枚举正常（中英文设备名正确），`cargo test` 全绿。新增 R17（音频链路未做真机回归） |
+| v0.10 | 2026-11-01 | 新增 **§11 开发工具链：egui_mcp（D0）**：明确时机为 M1 之前（不影响产品代码）；应用侧已就绪（`inspection` feature + `EGUI_INSPECTION=1` 开 5719，截图需窗口可见）；DSH 侧只需三步——`cargo install egui_mcp`（crates.io 0.3.0，依赖 egui/egui_inspection ^0.37，与本项目匹配）、在 `~/.dsh/profiles/desktop/cordis.patch.yml` 追加 `@deepseek-ai/dsh-mcp-client` 插件条目（DSH 内置该插件，无需另装）、重启 DSH 后新会话生效；给出与 kittest/静态截图的分工与排障清单 |
