@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.42，**M0、M1、M2、M3、M4、D0 已完成**；下一步 M5（打包/图标/单实例/README）
+> **状态**：草案 v0.52，**M0、M1、M2、M3、M4、D0 已完成**；下一步 M5（打包/图标/单实例/README）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -273,8 +273,9 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 字幕**只支持单句复制**（每行一个复制按钮），不提供"复制全部"、不导出。
 - 实时页字幕**不分段、无标题**：当前正在合成的句子在最上面，越早的字幕越靠下；列表顶部对齐（0.37 的 `ScrollArea` 没有 `stick_to_top`，靠默认顶部偏移实现）、字号 24px、行间分隔线。
 - 当前正在合成的句子**不显示复制按钮**；并按 TTS 进度分色：已送入 TTS 的部分用正常色，ASR 已识别但尚未送入 TTS 的部分用弱色（正常色 ×0.45）。`PipelineEvent::Asr` 带 `sent_bytes`（字符边界前缀），由 `TextChunker::emitted_byte_len` 计算；入历史后整句恢复普通色。当前句用 `LayoutJob` 分色时**必须 `Label::new(job).wrap()`**：水平布局里 Label 默认 `wrap_mode = Extend`，会把 `job.wrap.max_width` 覆盖成 `INFINITY`，导致长句不换行直接溢出（v0.24 修复）。
-- 每行最左侧固定宽度（**24px**）显示**本句语言代码**（当前句在语言判定前显示 `…`），当前句与历史句的文本左端对齐。语言列必须用 `allocate_exact_size` 显式占位：用 `allocate_ui_with_layout` 时外层拿的是子 Ui 的 `min_rect`（缩到内容宽度），`…` 比 `ja` 窄会让文本左移（v0.23 修复）。
+- 每行最左侧固定宽度（**24px**）显示**本句语言代码**（当前句在语言判定前显示 `…`），严格等于该句 **TTS task 首 chunk 实际使用的语言**（不是后续 chunk 的判定结果）；当前句与历史句的文本左端对齐。语言列必须用 `allocate_exact_size` 显式占位：用 `allocate_ui_with_layout` 时外层拿的是子 Ui 的 `min_rect`（缩到内容宽度），`…` 比 `ja` 窄会让文本左移（v0.23 修复）。
 - 历史句的复制按钮改为**行尾图标**（自绘"两张叠纸"，不依赖 emoji 字体），只在鼠标悬停该行时显示；当前句无复制按钮。
+- 历史句的去重按**服务端 `sentence_id`**：同一句被重复下发最终结果时只记一次；两次真实发音即使文本完全相同（不同 id）也各自保留。空文本 + 句终的重置信号会忘掉上一句 id（断线重连后 id 可能重新计数）。
 - **停止/重启管线不清空字幕历史**：`stop_session()` 会**立即**清掉「当前正在合成的句子」（含已送 TTS 前缀与语言），历史保留；`start_session()` 同样只清当前句（`SubtitleState::reset_current()`），会话以 Idle/Failed 结束时也会再兜底清一次。
 - 不保存历史会话到磁盘。
 - 日志面板不提供复制/导出。
@@ -331,6 +332,20 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 数据来源：`SpeechGate` 处理每个采集 chunk 时把「当前是否在语音段」写进共享 `Arc<AtomicBool>`（`GateConfig.active_flag`），`PipelineSessionHandle::vad_active()` 只读；不额外占用通道。
 - 刷新：会话调度循环每 100ms 轮询该标志，变化时发 `PipelineEvent::VadActive(bool)` + `request_repaint()`（静音期没有 ASR 事件也能及时更新）。
 - 生命周期：`start_session` 置 false；会话停止/失败时 `reset_vad()` 并回到「静音」；悬停有状态说明 tooltip。
+
+### D22 ✅ 语音合成页「当前音色」选择（内置音色无列表 API）
+
+- 顶部 Radio 二选一，未选中那一种的控件禁用：
+  - **现有音色**：输入框，填内置音色名或任意 voice_id（如 `qiaoxiaojiao_v3.1`）；
+  - **自定义音色**：下拉 `[tts.custom_voices]`，选中后写 `custom:<键名>`。
+- **Tab 级「保存 / 放弃更改」**（页面右上角）：
+  - 「保存」把「当前音色」与「自定义音色草稿」合并成**一次** `toml_edit` 写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启；
+  - 「放弃更改」同时还原两者（`[tts] voice` 与 `[tts.custom_voices]` 草稿），并按行号恢复左侧选中项；
+  - 只有存在改动时按钮才可用，改动时显示「● 未保存」，失败信息显示在标题下方。
+- 内置音色为什么用输入框：官方只为 `MiniMax/speech-2.8-turbo` 提供 `get_voice` 查询接口；qwen-audio 系列系统音色只有[静态文档列表](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-voice-list)，没有按模型查询 voice 的 HTTP API。
+- 移除所有旧的「当前音色」UI：列表的「当前生效」标记、右侧的「设为当前音色」按钮、右侧标题旁的标记，以及原来的「应用」按钮和左栏「保存/放弃修改」按钮。
+- 编辑自定义音色时，若顶部下拉正选中该音色：改「配置键名」后下拉选中项同步跟随新键名（不会退化成显示旧键名的原始文本）；删除被下拉选中的音色时切到剩余第一个（没有则清空）。
+- 删除当前生效的自定义音色并保存时：若同时改了「当前音色」则以新选择为准；否则自动切到剩余第一个自定义音色，没有自定义音色则回退默认内置 `qiaoxiaojiao_v3.1`。
 
 ---
 
@@ -598,7 +613,7 @@ impl AppPaths {
 **实施要点**：
 - ASR/TTS 的 `is_running` 语义是「初值 true，false = 停止」，`PipelineSessionHandle.running` 按此初始化；`stop_requested` 用于区分"用户停止"（不弹错误条）与"服务异常退出"（弹错误条）。
 - 停止流程：`stop()` → 调度循环 100ms 内退出 → drop 采集 → 关闭 TTS 通道 → 等 ASR/TTS 任务最多 3s → 发 `StateChanged(Idle)`。
-- 字幕逻辑抽成纯函数 `ingest_asr_text`，4 个单测覆盖修订/清空/去重/500 上限。
+- 字幕逻辑抽成纯函数 `apply_asr`，5 个单测覆盖修订/清空/同一句重复下发去重/相同文本不同句都保留/500 上限。
 
 **验收**：实测说话 → 当前句刷新、历史句出现、TTS 音频有输出；停止→开始可恢复，连续 3 次不掉设备
 **预估**：乐观 1.5 天 / 保守 2.5 天（实际约 2 小时，含以 log 化与事件化重构）
@@ -816,3 +831,13 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.40 | 2026-11-01 | 修「编辑音色配置键名时列表取消选中、右侧编辑界面消失」：选中状态按**配置键名**记录，键名一改就匹配不上。现在每帧写回草稿后同步 `selected_voice` 为新键名；列表项交互 id 改用行号（避免键名变化导致 id 抖动）；「放弃修改」后按键名/显示名找回原选中音色，不再丢选择。验证：egui_mcp 实测把 `kaoet` 改成 `kaoet2` 时左侧保持高亮、右侧编辑器不消失；点放弃修改后键名恢复 `kaoet` 且仍选中该音色；fmt / clippy 0 警告 / 134 测试 |
 | v0.41 | 2026-11-01 | 「放弃修改」后的选中恢复改为**按行号**（草稿顺序与配置排序一致），不再匹配显示名：显示名/键名同时被编辑时也能找回同一音色。验证：egui_mcp 实测把「东雪莲」的显示名改成「测试名」、键名改成 `dongxue2` 后点放弃修改，列表仍选中「东雪莲」且右侧编辑器保持打开；fmt / clippy 0 警告 / 134 测试 |
 | v0.42 | 2026-11-01 | 点击「＋ 新增音色」后左侧列表自动滚到末尾：`KaolsApp.voice_list_scroll_to_end` 标记下一帧用 `ui.scroll_to_rect(last_item, Align::BOTTOM)`（`ScrollArea::stick_to_bottom` 只在已经贴底时才生效，不能把顶部列表拉到底）。验证：窗口缩到 900×560 后新增音色，列表滚到底部并显示新项 `voice1`；fmt / clippy 0 警告 / 134 测试 |
+| v0.43 | 2026-11-01 | 修语音合成页左右分栏三处：①按住分割线往左拖到极限时，egui 会把面板钳在内容最小宽度、内容 Ui 仍按指针的较小宽度布局，导致列表右侧空白——把「＋新增音色/保存/放弃修改」改为可换行布局降低内容最小宽度，并给左侧面板设很小 `min_size(110)`，使面板按指针宽度收缩、不再出现空白；②左侧面板设 `max_size = 可用宽度 - 360`，保证右侧编辑区至少 360 宽；③右侧内容与分割线之间加 12px 缩进。验证：用 Win32 模拟「按住鼠标拖到 128px 不松手」截图对比（修复前列表右侧空白、修复后铺满），松手后同样铺满；向右拖到极限时分割线停在 740px、右侧保留 360px；fmt / clippy 0 警告 / 134 测试 |
+| v0.44 | 2026-11-01 | 声线样本改为**拖拽排序**：每个样本标题行左侧加「≡」拖拽手柄（`Sense::drag` + Grab/Grabbing 光标），拖动时在目标插入位置画横线，松手按指针位置插入；去掉原来的「↑ 上移 / ↓ 下移」按钮（只保留「删除」）。拖动状态存在 egui 临时数据里，排序直接改草稿，保存/放弃逻辑不变。验证：egui_mcp 实测把样本 1（zh）拖到末尾 → 顺序变 ja/en/zh、样本 1 变 ja 并显示「默认声线」、列表左侧语言同步为 "ja, en, zh"、出现未保存标记；再把样本 3 拖回顶部 → 恢复 zh/ja/en；点放弃修改回到初始顺序；fmt / clippy 0 警告 / 134 测试 |
+| v0.45 | 2026-11-01 | 语音合成页右侧编辑区的普通标签（标题、样本说明、语言/音频说明等）禁用文本选择：`ui.style_mut().interaction.selectable_labels = false`，拖动样本时鼠标划过不会再出现蓝色选中，输入框不受影响。验证：egui_mcp 三击「声线样本（有序…）」标题无选中高亮；fmt / clippy 0 警告 / 134 测试 |
+| v0.46 | 2026-11-01 | 声线样本项改为左右分栏布局：左侧拖拽手柄（先留 18px 列、右侧内容排完后再用 `ui.put` 放到内容块垂直中心），右侧两行——标题行（样本 N/默认声线）与设置行（语言、音频、选择…、删除），删除按钮从单独一行移到设置行末尾。验证：egui_mcp 截图确认布局与手柄居中，拖动手柄把样本 1 拖到末尾仍生效（顺序 ja/en/zh、默认声线跟随），放弃修改可还原；fmt / clippy 0 警告 / 134 测试 |
+| v0.47 | 2026-11-01 | 修样本拖拽指示线的歧义位置：插入目标原来按标题行矩形计算，末尾位置的指示线会画在最后一个样本的标题与设置行之间（看起来像"两个等价停靠位置"）。现在按整块样本（标题行+设置行）的矩形计算，指示线只画在块与块的边界上；拖到末尾时画在最后一个样本块的下方。验证：Win32 模拟按住拖到列表末尾截图，只有一条位于末尾块下方的蓝线；松手后顺序正确、放弃修改可还原；fmt / clippy 0 警告 / 134 测试 |
+| v0.48 | 2026-11-01 | 语音合成页新增顶部「当前音色」选择（D22）：Radio 两行——「现有音色」输入框（内置名/任意 voice_id）、「自定义音色」下拉（写 `custom:<键名>`），未选中侧的控件禁用；显式「应用」写回 `[tts] voice` 并触发 D20。删除所有旧「当前音色」UI：列表「当前生效」标记、右侧「设为当前音色」按钮、标题旁标记。实现：`app.rs` 增加 `VoiceMode` + `voice_input`/`voice_custom_key`/`voice_apply_error` 与 `sync_voice_inputs`/`voice_draft_value`/`voice_input_dirty`/`apply_voice`；删除 `set_active_voice_custom`；删除生效自定义音色且没有其它自定义音色时回退默认内置音色。探索结论：qwen-audio 系列无「按模型列内置音色」API（官方仅对 MiniMax/speech-2.8-turbo 提供 `get_voice`），故内置音色用输入框。验证：egui_mcp 实测「现有音色」填 `yuxiaoyun_v3.1` 应用成功、写回配置并记日志；切换到「自定义音色」后输入框禁用、下拉可选并应用 `custom:kaoet`；未选中侧控件均禁用；树里已无「当前生效」「设为当前音色」；fmt / clippy 0 警告 / 134 测试 |
+| v0.49 | 2026-11-01 | 按用户要求把「保存 / 放弃更改」提升为**语音合成 Tab 级按钮**（页面右上角），删除顶部「应用」与左栏「保存/放弃修改」：`app.rs` 新增 `save_tts_tab`（`[tts.custom_voices]` 草稿 + 顶部「当前音色」合并成一次原子写回，一次校验/一份 `.bak`，成功后重载并按 D20 热重启）与 `reset_tts_tab`（同时还原两者并按行号恢复左侧选中）；删除 `apply_voice`/`save_voice_drafts`/`reset_voice_drafts`/`try_save_voice_drafts` 与 `voice_apply_error`；保存错误统一显示在标题下方。验证：egui_mcp 实测同时改「当前音色=yuxiaoyun_v3.1」与自定义音色显示名 `Kaoet2` → 一次保存后配置两处都更新、脏标记清除；再改显示名 Kaoet3 → 点「放弃更改」恢复为配置里的 Kaoet2；fmt / clippy 0 警告 / 134 测试 |
+| v0.50 | 2026-11-01 | 修顶部「自定义音色」下拉与下方编辑器的键名同步：下拉正选中某音色时，在下方把配置键名 `kaoet` 改成 `kaoet2`，原来下拉会因找不到旧键名而退化成显示原始 `kaoet`；现在写回草稿时同步更新 `voice_custom_key`（删除该音色时切到剩余第一个/清空）。验证：egui_mcp 实测改名后下拉立即显示 `Kaoet（kaoet2）`，保存后配置生成 `[tts.custom_voices.kaoet2]` 且 `voice = "custom:kaoet2"`；fmt / clippy 0 警告 / 134 测试 |
+| v0.51 | 2026-11-01 | 修字幕历史去重把「两次相同的真实发音」也合并成一条的问题：原来按"与上一句文本相同"去重；现在把 ASR 的 `sentence_id` 一路透传（`AsrSentence` → `AsrEvent` → `PipelineEvent::Asr` → `SubtitleState`），只在**同一 sentence_id 重复下发最终结果**时忽略，相同文本的不同句（不同 id）都保留；空文本+句终的重置信号会清掉记录的 id（断线重连后 id 可能重新计数）。新增/调整 2 个单测（同 id 只记一次、相同文本不同 id 两条），ASR 解析测试断言 id；fmt / clippy 0 警告 / **135** 测试 |
+| v0.52 | 2026-11-01 | 修字幕语言列与 TTS 实际使用语言不一致：TTS 每个 task 在**首 chunk** 固定 `voice` / `language_hints` / `instruction`，而会话原来在**每个 ASR 句终事件**就清空 `sentence_language`——若该句终事件没有产生新的句终 chunk（chunker 已消费完），TTS task 仍开着，下一句的 chunk 会作为旧 task 的续写（沿用旧语言），GUI 却已按新判定显示语言。现在会话跟踪 `tts_task_language`：只有真正启动 TTS task 的首 chunk 才设置，直到该 task 收到 `is_sentence_end` chunk 才清空，`PipelineEvent::Asr.language` 直接用它；ASR 句终但没有新文本时补发「空文本 + is_sentence_end」请求结束旧 task，`qwen_tts` 对空文本请求只发 finish-task（不追加空 continue-task；空闲收到则忽略），避免音色/语言漏到下一句。新增单测 `empty_final_chunk_only_sends_finish_task`；fmt / clippy 0 警告 / **136** 测试 |

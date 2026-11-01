@@ -234,8 +234,10 @@ pub async fn run(
     // 调度中枢：ASR 事件 -> 句子级语言判定 -> 分块 -> 带 voice/语言推入 TTS
     let mut chunker = TextChunker::new(config.chunking.words);
     let mut language_state = SentenceLanguageState::new(config.asr.languages.clone());
-    // 当前句已判定的语言（首个 chunk 送出前为 None，句终后清空）
-    let mut sentence_language: Option<String> = None;
+    // 当前 TTS task 的语言（首个 chunk 送出时固定，task 结束后清空）。
+    // TTS 每个 task 只认首 chunk 的 voice/language_hints，所以界面字幕语言必须用它，
+    // 而不是后续 chunk 的语言判定结果（否则显示与实际合成不一致）。
+    let mut tts_task_language: Option<String> = None;
     // 上一次推给界面的 VAD 状态（避免每 100ms 都发事件）
     let mut last_vad_active = false;
 
@@ -263,14 +265,17 @@ pub async fn run(
         language_state.on_event(&event.text, event.is_sentence_end);
 
         let chunks = chunker.process_stream(&event.text, event.is_sentence_end);
+        let mut sent_sentence_end = false;
         for chunk in chunks {
             if handle.is_cancelled() {
                 break;
             }
 
             let language = language_state.language_for_chunk();
-            if sentence_language.is_none() {
-                sentence_language = Some(language.clone());
+            // TTS 在 task 首个 chunk 时固定 voice / language_hints，后续 chunk 的这两个
+            // 字段会被忽略；界面语言因此取 task 首 chunk 的语言，保证显示与实际合成一致。
+            if tts_task_language.is_none() {
+                tts_task_language = Some(language.clone());
             }
             let voice_id = voice.voice_for(&language).to_string();
             let is_sentence_end = chunk.is_sentence_end;
@@ -285,20 +290,40 @@ pub async fn run(
                 // TTS 任务已退出：结束会话
                 break;
             }
+            if is_sentence_end {
+                sent_sentence_end = true;
+            }
             language_state.on_chunk(is_sentence_end);
         }
 
+        // 句终但本事件没有可送的新文本（chunker 已消费完）：TTS 侧 task 还开着，
+        // 补一个「只结束、不追加文本」的请求，避免下一句的音色/语言漏进旧 task。
+        if event.is_sentence_end && !sent_sentence_end {
+            if let Some(language) = tts_task_language.clone() {
+                let req = TtsChunkRequest {
+                    text: String::new(),
+                    is_sentence_end: true,
+                    voice: voice.voice_for(&language).to_string(),
+                    language,
+                };
+                if tx_tts.send(req).await.is_ok() {
+                    sent_sentence_end = true;
+                }
+            }
+        }
+
         // 带上「已送入 TTS 的字节前缀」：界面把这段显示为正常色，其余显示为弱色；
-        // 同时带上本句已判定的语言，界面在最左侧显示语言代码。
+        // language 取当前 TTS task 实际使用的语言（首 chunk 决定），与实际合成严格一致。
         emit(PipelineEvent::Asr {
             text: event.text.clone(),
             is_sentence_end: event.is_sentence_end,
             sent_bytes: chunker.emitted_byte_len(&event.text),
-            language: sentence_language.clone(),
+            language: tts_task_language.clone(),
+            sentence_id: event.sentence_id,
         });
 
-        if event.is_sentence_end {
-            sentence_language = None;
+        if sent_sentence_end {
+            tts_task_language = None;
         }
         language_state.on_event_end(event.is_sentence_end);
 

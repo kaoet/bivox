@@ -46,11 +46,13 @@ pub enum PipelineEvent {
     /// `sent_bytes`：`text` 中已送入 TTS 的字节前缀长度（一定是字符边界），
     /// 界面据此把"已合成 / 尚未合成"两部分用不同颜色显示。
     /// `language`：本句已判定的语言代码（首个 chunk 送出前为 `None`）。
+    /// `sentence_id`：服务端句子 id（重复下发同一句时相同，用于字幕去重）。
     Asr {
         text: String,
         is_sentence_end: bool,
         sent_bytes: usize,
         language: Option<String>,
+        sentence_id: Option<u64>,
     },
     /// 本地 VAD 是否处于语音段（顶栏指示器用）。
     VadActive(bool),

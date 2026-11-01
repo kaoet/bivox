@@ -11,7 +11,7 @@ use log::{error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE};
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
@@ -22,6 +22,15 @@ use crate::voice::editor::{self, VoiceDraft};
 
 /// 窗口标题。
 pub const WINDOW_TITLE: &str = "kaols — 实时语音识别与合成";
+
+/// 语音合成页顶部「当前音色」的选择方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMode {
+    /// 现有音色：内置音色名或任意 voice_id（输入框）。
+    Existing,
+    /// 自定义音色：从 `[tts.custom_voices]` 里选（下拉菜单），写 `custom:<键名>`。
+    Custom,
+}
 
 /// 字幕历史保留上限（D16）。
 pub const MAX_SUBTITLES: usize = 500;
@@ -44,6 +53,8 @@ pub struct SubtitleState {
     pub language: Option<String>,
     /// 已结束的句子（上限 `MAX_SUBTITLES`），带本句语言代码。
     pub history: Vec<SubtitleLine>,
+    /// 上一条已落历史的句子 id：只用于丢弃「同一句被服务端重复下发」的最终结果。
+    pub last_finalized_sentence_id: Option<u64>,
 }
 
 impl SubtitleState {
@@ -52,26 +63,29 @@ impl SubtitleState {
         self.current.clear();
         self.sent_bytes = 0;
         self.language = None;
+        self.last_finalized_sentence_id = None;
     }
 
     /// 把一条 ASR 事件并入字幕状态（纯逻辑，便于单测）。
     ///
     /// - 非空文本：刷新当前句，记录已送 TTS 的字节前缀与语言；
-    /// - 空文本 + 句终：ASR 重置信号，清空当前句；
-    /// - 句终：当前句（连同语言代码）落进历史，与上一句文本相同则不重复，
-    ///   超过 `MAX_SUBTITLES` 丢最旧的。
+    /// - 空文本 + 句终：ASR 重置信号，清空当前句（同时忘掉上一句 id）；
+    /// - 句终：当前句（连同语言代码）落进历史；**同一 `sentence_id` 重复下发只记一次**，
+    ///   不同 id 的相同文本是两次真实发音，必须各自保留；超过 `MAX_SUBTITLES` 丢最旧的。
     fn apply_asr(
         &mut self,
         text: &str,
         is_sentence_end: bool,
         sent: usize,
         language: Option<String>,
+        sentence_id: Option<u64>,
     ) {
         if text.is_empty() {
             if is_sentence_end {
                 self.current.clear();
                 self.sent_bytes = 0;
                 self.language = None;
+                self.last_finalized_sentence_id = None;
             }
         } else {
             self.current.clear();
@@ -91,7 +105,12 @@ impl SubtitleState {
             let text = std::mem::take(&mut self.current);
             self.sent_bytes = 0;
             let language = self.language.take().unwrap_or_default();
-            if self.history.last().map(|line| line.text.as_str()) != Some(text.as_str()) {
+            let duplicated =
+                sentence_id.is_some() && self.last_finalized_sentence_id == sentence_id;
+            if let Some(id) = sentence_id {
+                self.last_finalized_sentence_id = Some(id);
+            }
+            if !duplicated {
                 self.history.push(SubtitleLine { language, text });
                 if self.history.len() > MAX_SUBTITLES {
                     self.history.remove(0);
@@ -168,6 +187,12 @@ pub struct KaolsApp {
     pub voice_list_scroll_to_end: bool,
     /// 音色编辑的校验/保存错误（红色显示）。
     pub voice_edit_error: Option<String>,
+    /// 「当前音色」选项：现有音色 / 自定义音色。
+    pub voice_mode: VoiceMode,
+    /// 「当前音色」→ 现有音色的输入框草稿。
+    pub voice_input: String,
+    /// 「当前音色」→ 自定义音色的配置键名草稿。
+    pub voice_custom_key: String,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
     /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
@@ -220,6 +245,9 @@ impl KaolsApp {
             voice_drafts: Vec::new(),
             voice_list_scroll_to_end: false,
             voice_edit_error: None,
+            voice_mode: VoiceMode::Existing,
+            voice_input: String::new(),
+            voice_custom_key: String::new(),
             pipeline_error: None,
             vad_active: false,
             config_created,
@@ -229,6 +257,7 @@ impl KaolsApp {
             closing: false,
         };
         app.sync_from_config();
+        app.sync_voice_inputs();
         app.refresh_devices();
         app
     }
@@ -237,6 +266,7 @@ impl KaolsApp {
     pub fn reload_config(&mut self) {
         self.config = load_config(&self.paths.config_file);
         self.sync_from_config();
+        self.sync_voice_inputs();
         // 选中的音色若仍存在就保留（保存后不丢选择），否则清空
         let selected_exists = self
             .selected_voice
@@ -264,6 +294,144 @@ impl KaolsApp {
                 self.input_device = None;
                 self.output_device = None;
                 self.voice_drafts.clear();
+            }
+        }
+    }
+
+    /// 从配置同步语音合成页顶部「当前音色」的草稿值。
+    pub fn sync_voice_inputs(&mut self) {
+        let ConfigState::Loaded(config) = &self.config else {
+            self.voice_mode = VoiceMode::Existing;
+            self.voice_input.clear();
+            self.voice_custom_key.clear();
+            return;
+        };
+        if let Some(name) = config.custom_voice_name() {
+            self.voice_mode = VoiceMode::Custom;
+            self.voice_custom_key = name.to_string();
+            if self.voice_input.trim().is_empty() {
+                self.voice_input = DEFAULT_VOICE.to_string();
+            }
+        } else {
+            self.voice_mode = VoiceMode::Existing;
+            self.voice_input = config.tts.voice.trim().to_string();
+            if self.voice_custom_key.is_empty() {
+                self.voice_custom_key = config
+                    .tts
+                    .custom_voices
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+    }
+
+    /// 顶部「当前音色」的草稿值（`[tts] voice` 形态）。
+    pub fn voice_draft_value(&self) -> String {
+        match self.voice_mode {
+            VoiceMode::Existing => self.voice_input.trim().to_string(),
+            VoiceMode::Custom => {
+                let key = self.voice_custom_key.trim();
+                if key.is_empty() {
+                    String::new()
+                } else {
+                    format!("{CUSTOM_VOICE_PREFIX}{key}")
+                }
+            }
+        }
+    }
+
+    /// 顶部「当前音色」是否与配置文件不同。
+    pub fn voice_input_dirty(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => self.voice_draft_value() != config.tts.voice.trim(),
+            ConfigState::Invalid { .. } => true,
+        }
+    }
+
+    /// 保存语音合成页的全部改动：`[tts.custom_voices]` 草稿 + 顶部「当前音色」。
+    ///
+    /// 两者合并成一次原子写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启。
+    pub fn save_tts_tab(&mut self) {
+        if !self.voice_drafts_dirty() && !self.voice_input_dirty() {
+            return;
+        }
+        match self.try_save_tts_tab() {
+            Ok(()) => {
+                self.voice_edit_error = None;
+                self.reload_config();
+                info!("已保存语音合成设置（{}）", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.voice_edit_error = Some(message.clone());
+                warn!("保存语音合成设置失败：{message}");
+            }
+        }
+    }
+
+    fn try_save_tts_tab(&self) -> anyhow::Result<()> {
+        let drafts_dirty = self.voice_drafts_dirty();
+        let voice_dirty = self.voice_input_dirty();
+        let wanted_voice = self.voice_draft_value();
+        let ConfigState::Loaded(config) = &self.config else {
+            anyhow::bail!("配置无效，无法保存语音合成设置");
+        };
+
+        let original = config_edit::read(&self.paths.config_file)?;
+        let mut updated = original.clone();
+
+        if drafts_dirty {
+            let entries = editor::drafts_to_entries(&self.voice_drafts)?;
+            // 样例音频必须存在（相对路径按配置文件目录解析）
+            for (key, voice) in &entries {
+                for sample in &voice.samples {
+                    let path = config.resolve_path(&sample.audio);
+                    if !path.is_file() {
+                        anyhow::bail!("音色 `{key}` 的样例音频不存在：{}", path.display());
+                    }
+                }
+            }
+            updated = config_edit::set_custom_voices(&updated, &entries)?;
+
+            // 没有显式改当前音色时：生效自定义音色被删除/改名 → 自动回退
+            if !voice_dirty {
+                if let Some(current) = config.custom_voice_name() {
+                    if !entries.iter().any(|(key, _)| key == current) {
+                        let fallback = entries
+                            .first()
+                            .map(|(first, _)| format!("{CUSTOM_VOICE_PREFIX}{first}"))
+                            .unwrap_or_else(|| DEFAULT_VOICE.to_string());
+                        updated = config_edit::set_active_voice(&updated, &fallback)?;
+                    }
+                }
+            }
+        }
+
+        if voice_dirty {
+            if wanted_voice.is_empty() {
+                anyhow::bail!("当前音色不能为空");
+            }
+            updated = config_edit::set_active_voice(&updated, &wanted_voice)?;
+        }
+
+        config_edit::save(&self.paths.config_file, &original, &updated)
+    }
+
+    /// 放弃语音合成页的全部改动：自定义音色草稿 + 顶部「当前音色」。
+    pub fn reset_tts_tab(&mut self) {
+        // 放弃修改后按行号恢复左侧选中项（与编辑器里的排序/改名无关）
+        let wanted_index = self
+            .selected_voice
+            .as_ref()
+            .and_then(|key| self.voice_drafts.iter().position(|draft| &draft.key == key));
+        self.sync_from_config();
+        self.sync_voice_inputs();
+        self.voice_edit_error = None;
+        if let Some(index) = wanted_index {
+            if let Some(draft) = self.voice_drafts.get(index) {
+                self.selected_voice = Some(draft.key.clone());
             }
         }
     }
@@ -334,69 +502,6 @@ impl KaolsApp {
         match &self.config {
             ConfigState::Loaded(config) => self.voice_drafts != editor::drafts_from_config(config),
             ConfigState::Invalid { .. } => !self.voice_drafts.is_empty(),
-        }
-    }
-
-    /// 保存音色草稿到 `config.toml`（`[tts.custom_voices]`；必要时同步修正 `[tts] voice`）。
-    pub fn save_voice_drafts(&mut self) {
-        match self.try_save_voice_drafts() {
-            Ok(()) => {
-                self.voice_edit_error = None;
-                self.reload_config();
-                info!("已保存自定义音色（{}）", self.paths.config_file.display());
-            }
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.voice_edit_error = Some(message.clone());
-                warn!("保存自定义音色失败：{message}");
-            }
-        }
-    }
-
-    fn try_save_voice_drafts(&self) -> anyhow::Result<()> {
-        let entries = editor::drafts_to_entries(&self.voice_drafts)?;
-        let ConfigState::Loaded(config) = &self.config else {
-            anyhow::bail!("配置无效，无法保存音色");
-        };
-
-        // 样例音频必须存在（相对路径按配置文件目录解析）
-        for (key, voice) in &entries {
-            for sample in &voice.samples {
-                let path = config.resolve_path(&sample.audio);
-                if !path.is_file() {
-                    anyhow::bail!("音色 `{key}` 的样例音频不存在：{}", path.display());
-                }
-            }
-        }
-
-        let original = config_edit::read(&self.paths.config_file)?;
-        let mut updated = config_edit::set_custom_voices(&original, &entries)?;
-
-        // 生效音色引用的自定义音色被删除/改名时，自动切到第一个自定义音色
-        if let Some(current) = config.custom_voice_name() {
-            if !entries.iter().any(|(key, _)| key == current) {
-                if let Some((first, _)) = entries.first() {
-                    updated = config_edit::set_active_voice(&updated, &format!("custom:{first}"))?;
-                }
-            }
-        }
-
-        config_edit::save(&self.paths.config_file, &original, &updated)
-    }
-
-    /// 放弃音色编辑，回到配置文件里的内容。
-    pub fn reset_voice_drafts(&mut self) {
-        self.sync_from_config();
-        self.voice_edit_error = None;
-    }
-
-    /// 把某个自定义音色设为生效音色（写 `[tts] voice = "custom:<key>"`）。
-    pub fn set_active_voice_custom(&mut self, key: &str) {
-        let voice = format!("custom:{key}");
-        let result = self.write_config(|text| config_edit::set_active_voice(text, &voice));
-        self.finish_config_write(result, "已切换生效音色");
-        if let Some(err) = &self.config_write_error {
-            self.voice_edit_error = Some(err.clone());
         }
     }
 
@@ -543,9 +648,11 @@ impl KaolsApp {
                 is_sentence_end,
                 sent_bytes,
                 language,
-            } => self
-                .subtitles
-                .apply_asr(&text, is_sentence_end, sent_bytes, language),
+                sentence_id,
+            } => {
+                self.subtitles
+                    .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id)
+            }
             PipelineEvent::VadActive(active) => self.vad_active = active,
             PipelineEvent::Error { context, detail } => {
                 self.pipeline_error = Some(format!("{context}：{detail}"));
@@ -828,7 +935,23 @@ mod tests {
         sent: usize,
         language: Option<&str>,
     ) {
-        state.apply_asr(text, is_end, sent, language.map(str::to_string));
+        state.apply_asr(text, is_end, sent, language.map(str::to_string), None);
+    }
+
+    fn apply_with_id(
+        state: &mut SubtitleState,
+        text: &str,
+        is_end: bool,
+        language: Option<&str>,
+        sentence_id: u64,
+    ) {
+        state.apply_asr(
+            text,
+            is_end,
+            0,
+            language.map(str::to_string),
+            Some(sentence_id),
+        );
     }
 
     #[test]
@@ -906,12 +1029,23 @@ mod tests {
     }
 
     #[test]
-    fn same_sentence_is_not_pushed_twice() {
+    fn same_sentence_id_is_not_pushed_twice() {
         let mut state = SubtitleState::default();
-        apply(&mut state, "重复句。", true, 0, Some("zh"));
-        apply(&mut state, "重复句。", true, 0, Some("zh"));
+        apply_with_id(&mut state, "重复句。", true, Some("zh"), 1);
+        // 服务端重复下发同一句的最终结果（id 相同）→ 忽略
+        apply_with_id(&mut state, "重复句。", true, Some("zh"), 1);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].text, "重复句。");
+    }
+
+    #[test]
+    fn identical_sentences_with_different_ids_are_both_kept() {
+        let mut state = SubtitleState::default();
+        apply_with_id(&mut state, "同样的句。", true, Some("zh"), 1);
+        apply_with_id(&mut state, "同样的句。", true, Some("zh"), 2);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[0].text, "同样的句。");
+        assert_eq!(state.history[1].text, "同样的句。");
     }
 
     #[test]

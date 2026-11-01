@@ -1,7 +1,9 @@
-//! 语音合成页：TTS 配置与自定义音色编辑器（M3 / D11）。
+//! 语音合成页：当前音色选择 + 自定义音色编辑器（M3 / D11）。
 //!
-//! 左栏是音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线与样例音频。
-//! 草稿只在点「保存到 config.toml」后写回（`[tts.custom_voices]`，同时校验并备份）；
+//! 顶部选择「当前音色」：现有音色（输入框，填内置音色名或任意 voice_id）或
+//! 自定义音色（下拉，写 `custom:<键名>`），点「应用」写回 `[tts] voice`。
+//! 下方左栏是自定义音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线与样例音频。
+//! 草稿只在点「保存」后写回（`[tts.custom_voices]`，同时校验并备份）；
 //! 保存后自动重载配置（运行中会按 D20 自动重启实时管线）。
 
 use std::collections::HashSet;
@@ -9,64 +11,79 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::{KaolsApp, VoiceMode};
 use crate::language::CLONING_LANGUAGES;
 use crate::voice::editor::{config_audio_path, SampleDraft, VoiceDraft};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
-const GREEN: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xc9, 0x6f);
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
-    ui.heading("语音合成");
+    // Tab 级操作：保存 / 放弃更改 作用于「当前音色 + 自定义音色草稿」全部改动
+    let mut save = false;
+    let mut reset = false;
+    ui.horizontal(|ui| {
+        ui.heading("语音合成");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let dirty = app.voice_drafts_dirty() || app.voice_input_dirty();
+            if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
+                save = true;
+            }
+            if ui
+                .add_enabled(dirty, egui::Button::new("放弃更改"))
+                .clicked()
+            {
+                reset = true;
+            }
+            if dirty {
+                ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+            }
+        });
+    });
+    if save {
+        app.save_tts_tab();
+    }
+    if reset {
+        app.reset_tts_tab();
+    }
+    if let Some(error) = &app.voice_edit_error {
+        ui.colored_label(RED, format!("保存失败：{error}"));
+    }
     ui.label(
         egui::RichText::new(
-            "自定义音色在这里编辑：显示名、各语言声线与样例音频。\
-             点「保存到 config.toml」才写回；运行中保存会自动重启实时管线以应用新配置。",
+            "上方选择「当前音色」；下方编辑自定义音色。改动后点右上角「保存」一次写回 config.toml\
+             （运行中会自动重启实时管线），或点「放弃更改」还原。",
         )
         .weak(),
     );
     ui.add_space(6.0);
 
-    let active_voice = match &app.config {
-        ConfigState::Loaded(config) => config.tts.voice.clone(),
-        ConfigState::Invalid { .. } => String::new(),
-    };
+    draw_current_voice(app, ui);
+    ui.add_space(6.0);
+
     let exe_dir = app.paths.exe_dir.clone();
 
     let mut clicked_key: Option<String> = None;
     let mut add_new = false;
-    let mut save = false;
-    let mut reset = false;
     // 新增音色后，下一次绘制把列表滚到底（新音色追加在末尾）
     let scroll_to_end = app.voice_list_scroll_to_end;
+    // 左侧面板只限制最大宽度（保证右侧编辑区不被挤没）；最小宽度保持很小，
+    // 让面板按指针宽度收缩——内容最小宽度若大于指针宽度，egui 会把面板钳在
+    // 较大值而内容仍按指针宽度布局，右侧就会出现空白。
+    const LEFT_MIN_WIDTH: f32 = 110.0;
+    const RIGHT_MIN_WIDTH: f32 = 360.0;
+    let left_max_width = (ui.available_width() - RIGHT_MIN_WIDTH).max(LEFT_MIN_WIDTH);
     egui::Panel::left("tts_voice_list_panel")
         .resizable(true)
         .default_size(280.0)
+        .min_size(LEFT_MIN_WIDTH)
+        .max_size(left_max_width)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("自定义音色").strong());
-                if app.voice_drafts_dirty() {
-                    ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-                }
             });
-            let dirty = app.voice_drafts_dirty();
-            ui.horizontal(|ui| {
-                if ui.button("＋ 新增音色").clicked() {
-                    add_new = true;
-                }
-                if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
-                    save = true;
-                }
-                if ui
-                    .add_enabled(dirty, egui::Button::new("放弃修改"))
-                    .clicked()
-                {
-                    reset = true;
-                }
-            });
-            if dirty {
-                ui.label(egui::RichText::new("有未保存修改：点「保存」写回 config.toml").weak());
+            if ui.button("＋ 新增音色").clicked() {
+                add_new = true;
             }
             ui.add_space(4.0);
             egui::ScrollArea::vertical()
@@ -85,18 +102,9 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let is_selected = selected.as_deref() == Some(draft.key.as_str());
-                        let is_active = active_voice == format!("custom:{}", draft.key.as_str());
                         // 新增音色后把列表滚到末尾（最后一项底部对齐）
                         let scroll_here = scroll_to_end && index + 1 == app.voice_drafts.len();
-                        if voice_item(
-                            ui,
-                            index,
-                            draft,
-                            &languages,
-                            is_selected,
-                            is_active,
-                            scroll_here,
-                        ) {
+                        if voice_item(ui, index, draft, &languages, is_selected, scroll_here) {
                             clicked_key = Some(draft.key.clone());
                         }
                     }
@@ -128,28 +136,6 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
         app.voice_list_scroll_to_end = false;
     }
 
-    // 保存 / 放弃修改作用于整份草稿，不依赖「当前选中项」：
-    // 删掉选中的音色后列表会变空，这两个按钮也必须继续可用。
-    if save {
-        app.save_voice_drafts();
-    }
-    if reset {
-        // 放弃修改后保持选中：记录当前选中项的行号（草稿顺序与配置排序一致），
-        // 重置后按行号找回；编辑过键名/显示名都不影响行号。
-        let wanted_index = app
-            .selected_voice
-            .as_ref()
-            .and_then(|key| app.voice_drafts.iter().position(|draft| &draft.key == key));
-        app.reset_voice_drafts();
-        // 放弃修改时一并清掉上一次保存失败的错误提示
-        app.voice_edit_error = None;
-        if let Some(index) = wanted_index {
-            if let Some(draft) = app.voice_drafts.get(index) {
-                app.selected_voice = Some(draft.key.clone());
-            }
-        }
-    }
-
     let Some(key) = app.selected_voice.clone() else {
         return;
     };
@@ -159,94 +145,79 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     };
 
     let mut draft = app.voice_drafts[index].clone();
-    let mut set_active = false;
     let mut delete_voice = false;
-    // 样本操作在滚出闭包后统一应用（避免同时借用 app）
-    let mut move_up: Option<usize> = None;
-    let mut move_down: Option<usize> = None;
+    // 样本删除在滚出闭包后统一应用（避免同时借用 app）；排序在 edit_samples 内直接改草稿
     let mut remove_sample: Option<usize> = None;
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .id_salt("tts_voice_detail_scroll")
+    // 右侧内容与中间分割线之间留出间距
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 0,
+            top: 0,
+            bottom: 0,
+        })
         .show(ui, |ui| {
-            ui.add_space(4.0);
-            let is_active = active_voice == format!("custom:{key}");
-            ui.horizontal_wrapped(|ui| {
-                ui.heading(if draft.display_name.trim().is_empty() {
-                    draft.key.as_str()
-                } else {
-                    draft.display_name.as_str()
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .id_salt("tts_voice_detail_scroll")
+                .show(ui, |ui| {
+                    // 这里的标题/说明都是普通标签，不参与文本选择（否则拖动样本时
+                    // 鼠标划过会把文字选成蓝色）。输入框不受这个开关影响。
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading(if draft.display_name.trim().is_empty() {
+                            draft.key.as_str()
+                        } else {
+                            draft.display_name.as_str()
+                        });
+                    });
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("显示名");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.display_name)
+                                .desired_width(300.0)
+                                .hint_text("留空则显示配置键名"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("配置键名");
+                        ui.add(egui::TextEdit::singleline(&mut draft.key).desired_width(180.0));
+                        ui.label(egui::RichText::new("用于 [tts] voice = custom:<键名>").weak());
+                    });
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("声线样本（有序，第一个是默认声线）").strong());
+                    edit_samples(ui, &mut draft, &exe_dir, &mut remove_sample);
+
+                    if ui.button("＋ 添加样本").clicked() {
+                        let used: HashSet<&str> = draft
+                            .samples
+                            .iter()
+                            .map(|sample| sample.language.as_str())
+                            .collect();
+                        let language = CLONING_LANGUAGES
+                            .iter()
+                            .find(|code| !used.contains(**code))
+                            .copied()
+                            .unwrap_or("zh");
+                        draft.samples.push(SampleDraft {
+                            language: language.to_string(),
+                            audio: String::new(),
+                        });
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("删除这个音色").clicked() {
+                            delete_voice = true;
+                        }
+                    });
                 });
-                if is_active {
-                    ui.colored_label(GREEN, "当前生效音色");
-                }
-            });
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                ui.label("显示名");
-                ui.add(
-                    egui::TextEdit::singleline(&mut draft.display_name)
-                        .desired_width(300.0)
-                        .hint_text("留空则显示配置键名"),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("配置键名");
-                ui.add(egui::TextEdit::singleline(&mut draft.key).desired_width(180.0));
-                ui.label(egui::RichText::new("用于 [tts] voice = custom:<键名>").weak());
-            });
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("声线样本（有序，第一个是默认声线）").strong());
-            edit_samples(
-                ui,
-                &mut draft,
-                &exe_dir,
-                &mut move_up,
-                &mut move_down,
-                &mut remove_sample,
-            );
-
-            if ui.button("＋ 添加样本").clicked() {
-                let used: HashSet<&str> = draft
-                    .samples
-                    .iter()
-                    .map(|sample| sample.language.as_str())
-                    .collect();
-                let language = CLONING_LANGUAGES
-                    .iter()
-                    .find(|code| !used.contains(**code))
-                    .copied()
-                    .unwrap_or("zh");
-                draft.samples.push(SampleDraft {
-                    language: language.to_string(),
-                    audio: String::new(),
-                });
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
-            if let Some(error) = &app.voice_edit_error {
-                ui.colored_label(RED, format!("保存失败：{error}"));
-            }
-            let dirty = app.voice_drafts_dirty();
-            let config_loaded = matches!(app.config, ConfigState::Loaded(_));
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !dirty && config_loaded && !is_active,
-                        egui::Button::new("设为当前音色"),
-                    )
-                    .clicked()
-                {
-                    set_active = true;
-                }
-                if ui.button("删除这个音色").clicked() {
-                    delete_voice = true;
-                }
-            });
         });
 
     // 把编辑后的草稿写回，并处理样本移动/删除（在草稿上进行）
@@ -257,24 +228,88 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     if app.selected_voice.as_deref() != Some(current_key.as_str()) {
         app.selected_voice = Some(current_key.clone());
     }
-    if let Some(i) = move_up {
-        app.voice_drafts[index].samples.swap(i, i - 1);
-    }
-    if let Some(i) = move_down {
-        app.voice_drafts[index].samples.swap(i, i + 1);
+    // 顶部「自定义音色」下拉若正选中这个音色，键名被改名后要跟着走，
+    // 否则下一帧在下拉选项里找不到旧键名，会退化成显示原始键名。
+    if app.voice_custom_key == key && app.voice_custom_key != current_key {
+        app.voice_custom_key = current_key.clone();
     }
     if let Some(i) = remove_sample {
         app.voice_drafts[index].samples.remove(i);
     }
 
-    if set_active {
-        app.set_active_voice_custom(&current_key);
-    }
     if delete_voice {
         app.voice_drafts.remove(index);
         app.voice_edit_error = None;
         app.selected_voice = None;
+        // 顶部下拉选中的就是这个被删掉的音色时，换到剩余第一个（没有则清空）
+        if app.voice_custom_key == key {
+            app.voice_custom_key = app
+                .voice_drafts
+                .first()
+                .map(|draft| draft.key.clone())
+                .unwrap_or_default();
+        }
     }
+}
+
+/// 顶部「当前音色」：Radio 二选一（未选中的控件禁用）+ 显式「应用」。
+fn draw_current_voice(app: &mut KaolsApp, ui: &mut egui::Ui) {
+    let mut mode = app.voice_mode;
+    let mut existing = app.voice_input.clone();
+    let mut custom_key = app.voice_custom_key.clone();
+    let options: Vec<(String, String)> = app
+        .voice_drafts
+        .iter()
+        .map(|draft| {
+            let name = if draft.display_name.trim().is_empty() {
+                draft.key.clone()
+            } else {
+                format!("{}（{}）", draft.display_name, draft.key)
+            };
+            (draft.key.clone(), name)
+        })
+        .collect();
+
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut mode, VoiceMode::Existing, "现有音色");
+        ui.add_enabled(
+            mode == VoiceMode::Existing,
+            egui::TextEdit::singleline(&mut existing)
+                .desired_width(340.0)
+                .hint_text("内置音色或任意 voice_id，如 qiaoxiaojiao_v3.1"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut mode, VoiceMode::Custom, "自定义音色");
+        ui.add_enabled_ui(mode == VoiceMode::Custom, |ui| {
+            let selected_label = options
+                .iter()
+                .find(|(key, _)| key == &custom_key)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| {
+                    if custom_key.is_empty() {
+                        "（没有自定义音色）".to_string()
+                    } else {
+                        custom_key.clone()
+                    }
+                });
+            egui::ComboBox::from_id_salt("current_voice_custom")
+                .selected_text(selected_label)
+                .width(320.0)
+                .show_ui(ui, |ui| {
+                    if options.is_empty() {
+                        ui.label(egui::RichText::new("还没有自定义音色").weak());
+                    }
+                    for (key, label) in &options {
+                        ui.selectable_value(&mut custom_key, key.clone(), label);
+                    }
+                });
+        });
+    });
+
+    app.voice_mode = mode;
+    app.voice_input = existing;
+    app.voice_custom_key = custom_key;
 }
 
 /// 编辑样本列表；返回需要在调用方应用的操作（避免同时借用 `app`）。
@@ -282,66 +317,137 @@ fn edit_samples(
     ui: &mut egui::Ui,
     draft: &mut VoiceDraft,
     exe_dir: &Path,
-    move_up: &mut Option<usize>,
-    move_down: &mut Option<usize>,
     remove_sample: &mut Option<usize>,
 ) {
     let count = draft.samples.len();
+    // 拖拽排序：手柄按下时把下标存进 egui 临时数据，松手时按指针位置插入
+    let drag_id = ui.make_persistent_id(("voice_sample_drag", draft.key.as_str()));
+    let mut drag_from = ui.data(|data| data.get_temp::<usize>(drag_id));
+    let mut released = false;
+    let mut block_rects: Vec<egui::Rect> = Vec::with_capacity(count);
+
     for (sample_index, sample) in draft.samples.iter_mut().enumerate() {
         ui.separator();
+        // 左侧：拖拽手柄（与右侧内容块垂直居中）；右侧：标题行 + 设置行
+        let mut block_rect: Option<egui::Rect> = None;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("样本 {}", sample_index + 1)).strong());
-            if sample_index == 0 {
-                ui.label(egui::RichText::new("默认声线").weak());
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("语言");
-            let mut current = sample.language.clone();
-            egui::ComboBox::from_id_salt(("voice_lang", draft.key.as_str(), sample_index))
-                .selected_text(current.as_str())
-                .width(80.0)
-                .show_ui(ui, |ui| {
-                    for code in CLONING_LANGUAGES {
-                        ui.selectable_value(&mut current, (*code).to_string(), *code);
+            let row_left = ui.cursor().left();
+            // 先给手柄列留出宽度，右侧内容正常排版后再把手柄放到内容块垂直中心
+            ui.add_space(18.0);
+            let right = ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("样本 {}", sample_index + 1)).strong());
+                    if sample_index == 0 {
+                        ui.label(egui::RichText::new("默认声线").weak());
                     }
                 });
-            sample.language = current;
-            ui.label(egui::RichText::new("音频").weak());
-            ui.add(
-                egui::TextEdit::singleline(&mut sample.audio)
-                    .desired_width(320.0)
-                    .hint_text("样例音频路径（相对 exe 目录或绝对路径）"),
-            );
-            if ui.button("选择…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("音频", &["wav", "mp3", "m4a", "flac", "ogg"])
-                    .pick_file()
-                {
-                    sample.audio = config_audio_path(exe_dir, &path);
+
+                ui.horizontal(|ui| {
+                    ui.label("语言");
+                    let mut current = sample.language.clone();
+                    egui::ComboBox::from_id_salt(("voice_lang", draft.key.as_str(), sample_index))
+                        .selected_text(current.as_str())
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for code in CLONING_LANGUAGES {
+                                ui.selectable_value(&mut current, (*code).to_string(), *code);
+                            }
+                        });
+                    sample.language = current;
+                    ui.label(egui::RichText::new("音频").weak());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut sample.audio)
+                            .desired_width(280.0)
+                            .hint_text("样例音频路径（相对 exe 目录或绝对路径）"),
+                    );
+                    if ui.button("选择…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("音频", &["wav", "mp3", "m4a", "flac", "ogg"])
+                            .pick_file()
+                        {
+                            sample.audio = config_audio_path(exe_dir, &path);
+                        }
+                    }
+                    // 删除按钮放在设置行末尾
+                    if count > 1 && ui.button("删除").clicked() {
+                        *remove_sample = Some(sample_index);
+                    }
+                });
+
+                if !sample.audio.trim().is_empty() {
+                    let resolved = resolve_audio(exe_dir, &sample.audio);
+                    if !resolved.is_file() {
+                        ui.colored_label(
+                            AMBER,
+                            format!("⚠ 音频文件不存在：{}", resolved.display()),
+                        );
+                    }
                 }
+            });
+            block_rect = Some(right.response.rect);
+
+            let handle_rect = egui::Rect::from_center_size(
+                egui::pos2(row_left + 8.0, right.response.rect.center().y),
+                egui::vec2(16.0, 20.0),
+            );
+            let handle = ui
+                .put(
+                    handle_rect,
+                    egui::Label::new(egui::RichText::new("≡").weak()).sense(egui::Sense::drag()),
+                )
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .on_hover_text("拖动调整样本顺序");
+            if handle.drag_started() {
+                drag_from = Some(sample_index);
+                ui.data_mut(|data| data.insert_temp(drag_id, sample_index));
+            }
+            if handle.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            if handle.drag_stopped() {
+                released = true;
+                ui.data_mut(|data| data.remove_temp::<usize>(drag_id));
             }
         });
+        if let Some(rect) = block_rect {
+            block_rects.push(rect);
+        }
+    }
 
-        if !sample.audio.trim().is_empty() {
-            let resolved = resolve_audio(exe_dir, &sample.audio);
-            if !resolved.is_file() {
-                ui.colored_label(AMBER, format!("⚠ 音频文件不存在：{}", resolved.display()));
+    // 松手时按指针所在位置插入；拖动过程中在目标插入位置画一条指示线。
+    // 指示线画在“整块样本”（标题行+设置行）的边界上，避免出现在块内部造成歧义。
+    if let Some(from) = drag_from {
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            let insert_at = block_rects
+                .iter()
+                .position(|rect| pointer.y < rect.center().y)
+                .unwrap_or(block_rects.len());
+            let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+            let y = block_rects
+                .get(insert_at)
+                .map(|rect| rect.top())
+                .or_else(|| block_rects.last().map(|rect| rect.bottom()));
+            if let Some(y) = y {
+                let x = block_rects
+                    .first()
+                    .map(|rect| egui::Rangef::new(rect.left(), ui.max_rect().right()))
+                    .unwrap_or(egui::Rangef::new(0.0, ui.max_rect().right()));
+                ui.painter().hline(x, y, stroke);
+            }
+            if released {
+                let len = draft.samples.len();
+                let mut to = insert_at;
+                if from < to {
+                    to -= 1;
+                }
+                let to = to.min(len.saturating_sub(1));
+                if from < len && from != to {
+                    let sample = draft.samples.remove(from);
+                    draft.samples.insert(to, sample);
+                }
+                ui.data_mut(|data| data.remove_temp::<usize>(drag_id));
             }
         }
-
-        ui.horizontal(|ui| {
-            if sample_index > 0 && ui.small_button("↑ 上移").clicked() {
-                *move_up = Some(sample_index);
-            }
-            if sample_index + 1 < count && ui.small_button("↓ 下移").clicked() {
-                *move_down = Some(sample_index);
-            }
-            if count > 1 && ui.small_button("删除").clicked() {
-                *remove_sample = Some(sample_index);
-            }
-        });
     }
 }
 
@@ -370,7 +476,6 @@ fn voice_item(
     draft: &VoiceDraft,
     languages: &str,
     selected: bool,
-    is_active: bool,
     scroll_here: bool,
 ) -> bool {
     let fill = if selected {
@@ -398,20 +503,15 @@ fn voice_item(
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(languages).weak());
-                if is_active {
-                    ui.colored_label(GREEN, "当前生效");
-                }
             });
         });
     });
-    let response = ui
-        .interact(
-            inner.response.rect,
-            // 用行号做 id：编辑配置键名时 id 不会跟着变
-            ui.scope_id().with(("tts_voice_item", index)),
-            egui::Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = ui.interact(
+        inner.response.rect,
+        // 用行号做 id：编辑配置键名时 id 不会跟着变
+        ui.scope_id().with(("tts_voice_item", index)),
+        egui::Sense::click(),
+    );
     if scroll_here {
         // 让外层 ScrollArea 把这一项滚到可见区域底部
         ui.scroll_to_rect(inner.response.rect, Some(egui::Align::BOTTOM));

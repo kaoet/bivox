@@ -50,6 +50,9 @@ struct AsrSentence {
     sentence_end: bool,
     #[serde(default)]
     heartbeat: bool,
+    /// 句子 id（同一句重复下发最终结果时相同）
+    #[serde(default)]
+    sentence_id: Option<u64>,
 }
 
 /// ASR 会话的共享状态（跨重连保留）
@@ -243,6 +246,7 @@ impl QwenAsrClient {
                                         .send(AsrEvent {
                                             text: sentence.text,
                                             is_sentence_end: sentence.sentence_end,
+                                            sentence_id: sentence.sentence_id,
                                         })
                                         .await;
                                 }
@@ -348,6 +352,8 @@ mod tests {
         assert_eq!(sentence.text, "你好");
         assert!(sentence.sentence_end);
         assert!(!sentence.heartbeat);
+        // 句子 id 必须解析出来：字幕用它区分「同一句重复下发」和「两次相同的发音」
+        assert_eq!(sentence.sentence_id, Some(1));
     }
 
     #[test]

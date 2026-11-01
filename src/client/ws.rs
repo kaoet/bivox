@@ -242,6 +242,7 @@ impl AudioStreamState {
         let _ = self.tx_events.try_send(AsrEvent {
             text: String::new(),
             is_sentence_end: true,
+            sentence_id: None,
         });
     }
 }

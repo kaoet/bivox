@@ -169,6 +169,13 @@ impl QwenTtsClient {
                 .clone()
                 .expect("pending_chunk 已确保存在");
 
+            // 空文本 + 句终只用于结束已经打开的 task（会话在 ASR 句终没有新文本时补发）；
+            // 如果 TTS 此时空闲，直接丢弃，不新建空 task。
+            if first_chunk.text.is_empty() {
+                state.pending_chunk = None;
+                continue;
+            }
+
             // ===== 每个句子一个 task：run-task -> continue-task* -> finish-task =====
             let task_id = Uuid::new_v4().simple().to_string();
 
@@ -250,10 +257,15 @@ impl QwenTtsClient {
             // 全双工：一边按序发送文本切片，一边接收音频流，直到本句 task-finished
             loop {
                 if let Some(chunk) = pending_chunk.take() {
-                    if let Err(e) = Self::send_continue_chunk(&mut write, &task_id, &chunk).await {
-                        return Ok(SessionEnd::Disconnected(format!(
-                            "发送 continue-task 失败: {e:#}"
-                        )));
+                    // 空文本的人造句终请求：不追加文本，只发 finish-task 结束当前 task
+                    if !chunk.text.is_empty() {
+                        if let Err(e) =
+                            Self::send_continue_chunk(&mut write, &task_id, &chunk).await
+                        {
+                            return Ok(SessionEnd::Disconnected(format!(
+                                "发送 continue-task 失败: {e:#}"
+                            )));
+                        }
                     }
                     if chunk.is_sentence_end {
                         if let Err(e) = Self::send_finish_task(&mut write, &task_id).await {
@@ -529,6 +541,101 @@ mod tests {
             playback.queued_samples_len()
         );
         assert!(!client.is_finished(), "连接应保持复用，协程不应退出");
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
+    }
+
+    /// 句终没有新文本时（空文本 + `is_sentence_end`）只发 finish-task 结束当前 task，
+    /// 不能追加一个空的 continue-task（服务端会当作文本错误）。
+    #[tokio::test]
+    async fn empty_final_chunk_only_sends_finish_task() {
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let received_texts_server = received_texts.clone();
+        let finish_count_server = finish_count.clone();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
+                match v["header"]["action"].as_str() {
+                    Some("run-task") => {
+                        let started =
+                            json!({ "header": { "event": "task-started" }, "payload": {} });
+                        ws.send(Message::Text(started.to_string())).await.unwrap();
+                    }
+                    Some("continue-task") => {
+                        if let Some(text) = v["payload"]["input"]["text"].as_str() {
+                            received_texts_server.lock().unwrap().push(text.to_string());
+                        }
+                    }
+                    Some("finish-task") => {
+                        finish_count_server.fetch_add(1, Ordering::SeqCst);
+                        ws.send(Message::Binary(vec![1, 0, 2, 0])).await.unwrap();
+                        let finished =
+                            json!({ "header": { "event": "task-finished" }, "payload": {} });
+                        ws.send(Message::Text(finished.to_string())).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (tx_chunks, rx_chunks) = tokio::sync::mpsc::channel(8);
+        let playback = AudioPlaybackHandle::for_test();
+        let is_running = Arc::new(AtomicBool::new(true));
+        let config = QwenTtsConfig {
+            api_key: "sk-test".to_string(),
+            tts_model: "qwen-tts-test".to_string(),
+            ws_url: format!("ws://{addr}/api-ws/v1/inference"),
+        };
+        let client = tokio::spawn(QwenTtsClient::run_duplex(
+            config,
+            rx_chunks,
+            playback,
+            is_running.clone(),
+        ));
+
+        tx_chunks
+            .send(TtsChunkRequest {
+                text: "第一句".to_string(),
+                is_sentence_end: false,
+                voice: "test-voice".to_string(),
+                language: "zh".to_string(),
+            })
+            .await
+            .unwrap();
+        tx_chunks
+            .send(TtsChunkRequest {
+                text: String::new(),
+                is_sentence_end: true,
+                voice: "test-voice".to_string(),
+                language: "zh".to_string(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        assert_eq!(
+            *received_texts.lock().unwrap(),
+            vec!["第一句".to_string()],
+            "空文本句终请求不应产生空的 continue-task"
+        );
+        assert_eq!(
+            finish_count.load(Ordering::SeqCst),
+            1,
+            "应恰好发一次 finish-task"
+        );
 
         is_running.store(false, Ordering::SeqCst);
         client.abort();
