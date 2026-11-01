@@ -161,7 +161,6 @@ impl TextChunker {
         }
     }
 
-    #[allow(dead_code)]
     pub fn with_guard_tail(chunk_word_threshold: usize, guard_tail_chars: usize) -> Self {
         Self {
             emitted_text: String::new(),
@@ -284,7 +283,6 @@ impl TextChunker {
         chunks
     }
 
-    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.emitted_text.clear();
     }

@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.11，**M0、M4、D0（egui_mcp 工具链）已完成**，下一步 M1
+> **状态**：草案 v0.14，**M0、M4、D0 已完成**，语音合成页两栏骨架、日志面板可调高度已就位；下一步 M1
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -132,9 +132,8 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 1. **不读 `%APPDATA%`**、不读注册表、不读当前工作目录。
 2. **不读任何环境变量**来覆盖配置路径（主程序；调试工具按 D19 读工作目录的 `config.toml`，属独立工具，不受此条约束）。
 3. `voice_cache.json`、样例音频等相对路径仍以 **`config.toml` 所在目录**为基准（沿用 `AppConfig::resolve_path`，配置与 exe 同目录，效果一致）。
-4. **exe 目录必须可写**：启动做一次写探测（建临时文件再删除）。失败显示整页错误——"程序目录不可写，请把整个文件夹放到可写位置（如 `D:\Apps\kaols`），不要放在 `Program Files`"。
-5. **开发期**：`cargo run` 的 exe 在 `target\debug\`，用 `scripts/dev-run.ps1` 把仓库根 `config.toml` 复制到 `target\<profile>\` 后再运行。
-6. 便携模式的代价（接受）：备份目录 = 备份 API Key + 音色缓存；README 写清。
+4. **开发期**：`cargo run` 的 exe 在 `target\debug\`，用 `scripts/dev-run.ps1` 把仓库根 `config.toml` 复制到 `target\<profile>\` 后再运行。
+5. 便携模式的代价（接受）：备份目录 = 备份 API Key + 音色缓存；README 写清。
 
 ### D5 ✅ 线程模型：eframe 占主线程，tokio 跑在后台
 
@@ -154,6 +153,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 自写 `LogSink`（不引 tracing）：同时写 ①界面日志面板环形缓冲（**上限 5000 行**，见 D16）②`<exe 目录>\logs\kaols-YYYY-MM-DD.log`（保留 7 天）。
 - `colored` 不再用于 GUI；分级颜色改用 `egui::RichText::color`（ERROR 红、WARN 黄、INFO 默认）。`colored` 保留给调试 CLI 工具（终端输出）。
 - 主程序内 `println!` / `eprintln!` 全部改为 `log::*!` 或 `PipelineEvent`。
+- 日志面板高度**可拖拽调整**：`Panel::bottom(..).resizable(true)`，初始 180px、最小 60px；内容用 `ScrollArea` 填满可用高度并 `stick_to_bottom`，所以拖动分割线能实时改变可见行数（v0.14）。
 
 ### D8 ✅ 错误与崩溃必须可见（含 `let _ =` 使用准则）
 
@@ -179,7 +179,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 **其余要求**：
 
 - `std::panic::set_hook`：写 `<exe 目录>\crash.log`（含 backtrace）+ 置全局"崩溃信息"，下一帧以顶部红色错误条展示。
-- 启动阶段致命错误（配置无效、目录不可写、显卡初始化失败）显示整页错误界面，不直接退出。
+- 启动阶段致命错误（配置无效、显卡初始化失败）显示整页错误界面，不直接退出。
 - 新代码引入 `let _ =` 必须在 code review / AI 约定中被质疑一次（见 D15）。
 
 ### D9 ✅ 渲染后端：默认 wgpu（DX12），glow 作为截图/兜底变体
@@ -206,7 +206,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 
 ### D11 ✅ 音色管理：GUI 只编辑 `config.toml`，完全不碰远程与缓存
 
-- **GUI 的音色页 = 配置编辑器**，数据来源只有 `AppConfig.tts.custom_voices`：
+- **GUI 的「语音合成」页里的自定义音色区 = 配置编辑器**，数据来源只有 `AppConfig.tts.custom_voices`：
   - 列出 `[tts.custom_voices.<名>]` 及每个样本（语言 + 音频路径）；
   - 新增/删除音色、修改显示名（`name`）、新增/删除样本、选语言（下拉来自 `language::CLONING_LANGUAGES`）、选音频文件（`rfd` 文件选择框）、上移/下移样本（**第一个样本是默认声线**，顺序有语义）；
   - 音频路径存法：选中文件在 exe 目录内 → 存**相对路径**（保证整个目录可搬迁）；在目录外 → 存绝对路径并提示"可能破坏便携性"；
@@ -284,7 +284,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 - 启动时若 `<exe 目录>\config.toml` 不存在：写入一份内置默认模板（**`[api] key` 保持注释状态**，使校验明确提示"未配置 API Key"），然后进「设置」页并高亮 Key 输入框。
 - 模板来源：仓库根 `config.example.toml` 通过 `include_str!("../config.example.toml")` 在**编译期内嵌**，它是模板的唯一事实源（该文件里 `key` 那一行改成注释）。
 - 因为模板已进二进制，**发布 zip 不再包含 `config.example.toml`**（见 D2）；用户首启生成的 `config.toml` 本身就带全部注释字段说明，README 只需列关键字段与示例。
-- 模板生成后可被用户手改或 GUI 写回；目录不可写时按 D4-4 显示整页错误。
+- 模板生成后可被用户手改或 GUI 写回；写入失败时按启动错误显示（`startup_error`），不做启动探测。
 
 ### D19 ✅ 独立调试 CLI 工具：百炼音色管理
 
@@ -298,7 +298,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
   - `delete-all [-y]`：批量删除，默认要求交互确认。
 - 逻辑放在 `src/voice/admin.rs`（lib 内，可用 `voice/mock_http.rs` 做单测），bin 只做参数解析与终端输出；保留 `colored` 做终端彩色（调试工具专用）。
 - **不随发布包分发**（已定），需要时本地构建。
-- 注意（与 GUI 的交互）：如果删掉的 voice_id 仍被 `voice_cache.json` 引用，GUI 下次合成会收到"音色不存在"。v1 的处理是文档说明——删除 `voice_cache.json` 或用 GUI 重新触发复刻即可；不做自动恢复（见 R16）。
+- 注意（与 GUI 的交互）：如果删掉的 voice_id 仍被 `voice_cache.json` 引用，GUI 下次合成会收到"音色不存在"。v1 的处理是文档说明——删除 `voice_cache.json` 或用 GUI 重新触发复刻即可；不做自动恢复（见 R15）。
 - **实现状态（M4 已完成）**：`src/voice/admin.rs` + `src/bin/admin.rs`，命令为
   `admin [-c config.toml] list | delete --voice-id <id> [-y] | delete-all [-y]`；
   已手工验证帮助/配置缺失/非交互确认三条路径，7 个 mock 测试覆盖列表与删除结果分类。
@@ -368,14 +368,14 @@ src/
 │   └── admin.rs             # 调试 CLI（list/delete），参数解析 + 终端输出
 ├── app.rs               # KaolsApp：状态、事件泵、Tab 分发、退出流程
 ├── events.rs            # PipelineEvent / SessionState
-├── paths.rs             # 便携路径 + 写探测 + 首启模板（D4/D18）
+├── paths.rs             # 便携路径 + 首启模板（D4/D18）
 ├── log_sink.rs          # log 门面 → 内存环形 + 文件
 ├── config_edit.rs       # toml_edit 定点写回 + 校验 + .bak（D3）
 ├── gui/
 │   ├── mod.rs
 │   ├── toolbar.rs       # 开始/停止、设备下拉、状态灯
 │   ├── realtime_tab.rs  # 当前句 + 历史字幕（单句复制）
-│   ├── voices_tab.rs    # 音色配置编辑器（D11）
+│   ├── tts_tab.rs       # 语音合成页（TTS 配置：自定义音色列表 + 详情，D11）
 │   ├── settings_tab.rs  # 配置展示/校验/Key 输入/重载
 │   ├── log_panel.rs     # 日志面板（虚拟化滚动）
 │   └── widgets.rs       # 设备 ComboBox、确认 Modal、错误条
@@ -503,7 +503,6 @@ pub struct AppPaths {
 }
 impl AppPaths {
     pub fn resolve() -> std::io::Result<Self>;
-    pub fn ensure_writable(&self) -> std::io::Result<()>;
     /// 配置不存在时写内置模板（key 保持注释），返回是否新建
     pub fn ensure_default_config(&self) -> std::io::Result<bool>;
 }
@@ -522,7 +521,7 @@ impl AppPaths {
 - [x] `Cargo.toml`：加 `eframe = "=0.37.0"`（glow + inspection）、`log`、`chrono`；主程序不再用 `clap`/`colored`
 - [x] `main.rs`：`windows_subsystem`、tokio runtime、panic hook、日志初始化、`run_native`
 - [x] `app.rs`：`impl eframe::App`，工具栏 + 3 个 Tab 空壳（实时/音色/设置）
-- [x] `paths.rs`：便携路径 + 写探测 + 首启模板（D18）
+- [x] `paths.rs`：便携路径 + 首启模板（D18）
 - [x] `log_sink.rs`：内存环形缓冲 + 按天文件日志 + 日志面板
 - [x] `scripts/dev-run.ps1`
 - [x] 中文渲染验证（`EFRAME_SCREENSHOT_TO` 截图确认）；渲染后端定为 glow（D9）
@@ -542,7 +541,7 @@ impl AppPaths {
 - [ ] 设置页：字段展示 + 校验错误列表 + 「打开配置文件所在目录」+「重新加载」
 - [ ] API Key 输入与保存（D3）、安全提示文案
 - [ ] 设备下拉（D12 新 API）+「刷新设备」+「系统默认」+ 不一致时红字
-- [ ] 配置无效 / 目录不可写时整页错误
+- [ ] 配置无效时整页错误
 
 **验收**：删配置后启动自动生成模板并提示填 Key；改坏 key 后界面报错；保存 Key 后 `config.toml` 注释未丢；设备名写成不存在值时明确报错且不回退
 **预估**：乐观 1 天 / 保守 1.5 天
@@ -565,7 +564,7 @@ impl AppPaths {
 
 - [ ] `voice/editor.rs`：`drafts_from_config` / `drafts_to_config`（纯函数 + 单测）
 - [ ] `config_edit.rs::set_custom_voices`（整体替换该表 + 校验 + `.bak`）
-- [ ] 音色页：列表、新增/删除音色、改显示名、样本增删改、上移/下移（首样本=默认声线标注）
+- [ ] 语音合成页（自定义音色区）：左侧列表 + 右侧详情（M0.5 已先做出两栏骨架），再补新增/删除音色、改显示名、样本增删改、上移/下移（首样本=默认声线标注）
 - [ ] 语言下拉（`language::CLONING_LANGUAGES`）+ 音频文件选择（`rfd`）+ 文件存在性警告
 - [ ] 音频路径相对/绝对策略（exe 目录内→相对路径）
 - [ ] 生效音色 `[tts] voice` 下拉（内置/自定义）
@@ -627,20 +626,19 @@ impl AppPaths {
 | R1 | egui 0.37 预热不足：AI 生成旧 API 代码 | 高 | 中 | 钉版本 + AGENTS.md + 报错贴 `docs.rs/0.37.0` |
 | R2 | 部分机器/远程桌面下 GPU 初始化失败 | 低 | 中 | 默认 wgpu（DX12，M0 已在本机验证到适配器）；失败时用 glow 变体构建兜底，错误写入日志/crash.log |
 | R3 | 去掉控制台后错误静默 | 中 | 高 | panic hook + 文件日志 + 界面错误条（D8）；禁止 `let _ =` |
-| R4 | 便携目录不可写（Program Files、只读盘） | 中 | 高 | 写探测 + 整页提示（D4-4） |
-| R5 | `toml_edit` 改写把配置写坏 / 丢表外注释 | 中 | 高 | 写前 `from_toml_str` 校验、写前 `.bak`、单测覆盖"其它字段不变"、失败不落盘 |
-| R6 | `[tts.custom_voices]` 整体替换丢失表内注释 | 高 | 低 | 文档与 README 说明；后续可做逐项编辑 |
-| R7 | 多 bin 共用 lib，改动影响另一侧 | 中 | 中 | 门禁用 `cargo build --bins`；共享模块（`voice/api.rs`）改动必须两边都测 |
-| R8 | 配置写回后与运行中会话不一致 | 中 | 中 | 会话运行中保存时提示"下次开始生效"，不做热重载 |
-| R9 | 麦克风被占用 / 设备热插拔 | 中 | 中 | 明确报错 + 刷新按钮；精确匹配失败时报出配置值（D12） |
-| R10 | 长跑内存增长 | 中 | 中 | 日志 5000 行、字幕 500 句环形裁剪（D16） |
-| R11 | 关窗时后台线程未收尾 | 中 | 中 | D13 + M2 "连续 3 次开始/停止"验收 |
-| R12 | 自定义音色启动上传慢/失败 | 中 | 中 | 后台任务 + Starting 状态 + 超时提示 |
-| R13 | 双开抢麦克风、并发写缓存 | 低 | 中 | 单实例（D17） |
-| R14 | 立即模式每帧重算导致高 CPU | 低 | 低 | 仅事件到达时 `request_repaint`；`ScrollArea::show_rows` 虚拟化 |
-| R15 | 便携目录被备份/分享，泄露 Key 与音色缓存 | 中 | 中 | README + 设置页提示；zip 不含 config.toml |
-| R16 | 调试工具删掉仍被 `voice_cache.json` 引用的远端音色 → GUI 合成报"音色不存在" | 中 | 中 | 文档说明：删除 `voice_cache.json` 或改配置触发重新复刻；v2 可做"TTS 报 not-found 时失效缓存并重试一次" |
-| R17 | cpal 0.15→0.18 升级后只验证了设备枚举（能列出输入/输出设备），**录音/播放链路未做真机回归** | 中 | 高 | M2 首次接管线时必须实测：麦克风采集、扬声器播放、断连重连；失败优先看采样格式/重采样分支 |
+| R4 | `toml_edit` 改写把配置写坏 / 丢表外注释 | 中 | 高 | 写前 `from_toml_str` 校验、写前 `.bak`、单测覆盖"其它字段不变"、失败不落盘 |
+| R5 | `[tts.custom_voices]` 整体替换丢失表内注释 | 高 | 低 | 文档与 README 说明；后续可做逐项编辑 |
+| R6 | 多 bin 共用 lib，改动影响另一侧 | 中 | 中 | 门禁用 `cargo build --bins`；共享模块（`voice/api.rs`）改动必须两边都测 |
+| R7 | 配置写回后与运行中会话不一致 | 中 | 中 | 会话运行中保存时提示"下次开始生效"，不做热重载 |
+| R8 | 麦克风被占用 / 设备热插拔 | 中 | 中 | 明确报错 + 刷新按钮；精确匹配失败时报出配置值（D12） |
+| R9 | 长跑内存增长 | 中 | 中 | 日志 5000 行、字幕 500 句环形裁剪（D16） |
+| R10 | 关窗时后台线程未收尾 | 中 | 中 | D13 + M2 "连续 3 次开始/停止"验收 |
+| R11 | 自定义音色启动上传慢/失败 | 中 | 中 | 后台任务 + Starting 状态 + 超时提示 |
+| R12 | 双开抢麦克风、并发写缓存 | 低 | 中 | 单实例（D17） |
+| R13 | 立即模式每帧重算导致高 CPU | 低 | 低 | 仅事件到达时 `request_repaint`；`ScrollArea::show_rows` 虚拟化 |
+| R14 | 便携目录被备份/分享，泄露 Key 与音色缓存 | 中 | 中 | README + 设置页提示；zip 不含 config.toml |
+| R15 | 调试工具删掉仍被 `voice_cache.json` 引用的远端音色 → GUI 合成报"音色不存在" | 中 | 中 | 文档说明：删除 `voice_cache.json` 或改配置触发重新复刻；v2 可做"TTS 报 not-found 时失效缓存并重试一次" |
+| R16 | cpal 0.15→0.18 升级后只验证了设备枚举（能列出输入/输出设备），**录音/播放链路未做真机回归** | 中 | 高 | M2 首次接管线时必须实测：麦克风采集、扬声器播放、断连重连；失败优先看采样格式/重采样分支 |
 
 ---
 
@@ -739,3 +737,6 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.9 | 2026-11-01 | **cpal 0.15 → 0.18 升级，wgpu 后端恢复为默认**（D9 重写）：cpal 0.18 改用 `windows ^0.62`，依赖图里 0.54 消失，`gpu-allocator` 与 `wgpu-hal` 对齐，wgpu 编译/运行通过（本机枚举到 4 个适配器，DX12 RTX 5070 Ti 可用）。代码适配：`DeviceTrait::name()`→`description()?.name()`（新增 `audio::device::device_name`）、`sample_rate()` 返回 u32、`build_*_stream` 收 `StreamConfig` 值（`supported_config.config()`）。Cargo 增加 `renderer-wgpu`（默认）/`renderer-glow` 两个 feature，`app.rs` 按 feature 选渲染器；glow 变体保留用于截图核对（wgpu 不支持 `EFRAME_SCREENSHOT_TO`）与 OpenGL 兜底；`dev-run.ps1 -Glow`。验证：两种变体均构建通过，GUI 以 wgpu 启动 6s 稳定运行，cpal 0.18 设备枚举正常（中英文设备名正确），`cargo test` 全绿。新增 R17（音频链路未做真机回归） |
 | v0.10 | 2026-11-01 | 新增 **§11 开发工具链：egui_mcp（D0）**：明确时机为 M1 之前（不影响产品代码）；应用侧已就绪（`inspection` feature + `EGUI_INSPECTION=1` 开 5719，截图需窗口可见）；DSH 侧只需三步——`cargo install egui_mcp`（crates.io 0.3.0，依赖 egui/egui_inspection ^0.37，与本项目匹配）、在 `~/.dsh/profiles/desktop/cordis.patch.yml` 追加 `@deepseek-ai/dsh-mcp-client` 插件条目（DSH 内置该插件，无需另装）、重启 DSH 后新会话生效；给出与 kittest/静态截图的分工与排障清单 |
 | v0.11 | 2026-11-01 | **D0 工具链验证通过（egui_mcp 可用）**。排障结论：`cordis.patch.yml` 里新增未随 bundle 挂载的插件必须用 `- insert:` 包装，否则 Loader 按 id 覆盖找不到行、只打一条不落盘的 stderr 警告（表现为"无进程/无工具/无报错"）。修正后 DSH 重启：工具列表出现 15 个 `mcp__egui__*`；GUI 以 `EGUI_INSPECTION=1` 启动后 `attach` → `widget_tree`（读到工具栏/页签/设置页文案）→ `screenshot`（1100×720，`target/mcp-egui-shot.png`）全链路成功。§11 已补 insert 写法与踩坑说明 |
+| v0.12 | 2026-11-01 | 按你的要求**删除启动写探测**：移除 `AppPaths::ensure_writable`（不再启动时建临时文件探测 exe 目录可写性），同步删掉 D4 第 4 条规则、D8/D18/M0/M1 里的"目录不可写整页错误"描述、风险 R4，并把风险表 R5–R17 顺延为 R4–R16（D19 的引用同步改为 R15）；AGENTS.md 项目结构描述同步。写失败（默认配置/日志）仍走普通 `startup_error` 路径，不做专门探测。验证：fmt / clippy 0 警告 / `cargo build --bins` / 110 测试全绿 |
+| v0.13 | 2026-11-01 | 「音色」页签改为**「语音合成」**（TTS 配置汇总页）：左侧自定义音色列表（首行=名称 + weak 键名，次行=weak 语言代码，整行可点选、选中蓝色高亮），右侧选中音色详情（占位：键名/支持语言/合成模型/样本数/样本列表 + 「当前生效音色」标记，M3 再细化）；未选中时右侧留空。代码：`Tab::Voices → Tab::Tts`，`gui/voices_tab.rs → gui/tts_tab.rs`，新增 `KaolsApp.selected_voice` 状态（重新加载配置时清空）。验证：fmt / clippy 0 警告 / build / 110 测试；egui_mcp 实测点选三个音色，选中高亮与「当前生效音色」标记均正确 |
+| v0.14 | 2026-11-01 | 日志面板（底部）改为**可拖拽调整高度**：`Panel::bottom(..).resizable(true).default_size(180).min_size(60)`，日志 `ScrollArea` 去掉固定 `max_height(180)`、改为填满面板剩余高度（`auto_shrink([false,false])` + `stick_to_bottom`）。验证：egui_mcp 从分隔线 (550,540) 拖到 (550,400)，日志面板实时变高、可见行数增加；fmt / clippy 0 警告 / build / 110 测试全绿 |

@@ -140,8 +140,8 @@ impl EnergyVad {
     pub fn frame_dbfs(frame: &[u8]) -> f32 {
         let mut sum = 0.0f64;
         let mut count = 0u32;
-        for pair in frame.chunks_exact(2) {
-            let sample = i16::from_le_bytes([pair[0], pair[1]]) as f64 / 32768.0;
+        for pair in frame.as_chunks::<2>().0 {
+            let sample = i16::from_le_bytes(*pair) as f64 / 32768.0;
             sum += sample * sample;
             count += 1;
         }

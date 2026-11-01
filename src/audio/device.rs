@@ -17,6 +17,12 @@ pub fn device_name(device: &Device) -> String {
         .unwrap_or_else(|_| "未知设备".to_string())
 }
 
+impl Default for AudioDeviceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioDeviceManager {
     pub fn new() -> Self {
         Self {

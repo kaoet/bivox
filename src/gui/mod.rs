@@ -7,5 +7,5 @@ pub mod log_panel;
 pub mod realtime_tab;
 pub mod settings_tab;
 pub mod toolbar;
-pub mod voices_tab;
+pub mod tts_tab;
 pub mod widgets;

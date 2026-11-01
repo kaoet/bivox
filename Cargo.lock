@@ -946,15 +946,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2218,20 +2209,17 @@ name = "kaols"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "audioadapter",
  "audioadapter-buffers",
  "chrono",
  "clap",
  "colored",
  "cpal",
- "crossbeam-channel",
  "eframe",
  "futures-util",
  "hex",
  "hound",
  "log",
  "reqwest",
- "ringbuf",
  "rubato",
  "serde",
  "serde_json",
@@ -3531,17 +3519,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "ringbuf"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
-dependencies = [
- "crossbeam-utils",
- "portable-atomic",
- "portable-atomic-util",
 ]
 
 [[package]]

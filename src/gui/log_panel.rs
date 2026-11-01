@@ -27,7 +27,6 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .stick_to_bottom(true)
         .auto_shrink([false, false])
-        .max_height(180.0)
         .show(ui, |ui| {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
             let skip = app.log.len().saturating_sub(VISIBLE_LINES);

@@ -47,27 +47,6 @@ impl AppPaths {
         }
     }
 
-    /// 探测程序目录是否可写。
-    ///
-    /// 便携模式的前提是 exe 目录可写；放在 `Program Files`、只读盘或写保护 U 盘时
-    /// 直接给出可执行的提示（D4-4），而不是等到写日志时才莫名失败。
-    pub fn ensure_writable(&self) -> std::io::Result<()> {
-        let probe = self.exe_dir.join(".kaols-write-probe");
-        fs::write(&probe, b"kaols").map_err(|err| {
-            std::io::Error::new(
-                err.kind(),
-                format!(
-                    "程序目录不可写（{}）：{err}\n\
-                     请把整个程序文件夹放到可写位置（例如 D:\\Apps\\kaols），不要放在 Program Files。",
-                    self.exe_dir.display()
-                ),
-            )
-        })?;
-        // best-effort: 探测文件删除失败不影响"可写"结论（写入已成功）
-        let _ = fs::remove_file(&probe);
-        Ok(())
-    }
-
     /// 配置不存在时写入内置模板；返回是否新建。
     pub fn ensure_default_config(&self) -> std::io::Result<bool> {
         if self.config_file.exists() {

@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-#[allow(dead_code)]
 pub struct AudioCapture {
     _stream: Stream,
     is_capturing: Arc<AtomicBool>,

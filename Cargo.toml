@@ -7,7 +7,7 @@ default-run = "kaols"
 [features]
 # 渲染后端二选一：默认 wgpu（DX12，远程桌面也能用）。
 # 需要 `EFRAME_SCREENSHOT_TO` 截图核对时改用：
-#   cargo run --no-default-features --features renderer-glow -- --help
+#   cargo run --no-default-features --features renderer-glow
 default = ["renderer-wgpu"]
 renderer-wgpu = ["eframe/wgpu"]
 renderer-glow = ["eframe/glow"]
@@ -25,15 +25,15 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 ] }
 log = "0.4"
 chrono = "0.4"
+
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 cpal = "0.18"
-ringbuf = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
-# clap / colored 仅供 M4 的调试 CLI（主程序不再使用 clap）
+# clap / colored 仅供调试 CLI（src/bin/admin.rs），GUI 主程序不用
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 colored = "2.1"
@@ -41,8 +41,6 @@ uuid = { version = "1.10", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 sha2 = "0.10"
 hex = "0.4"
-crossbeam-channel = "0.5"
 hound = "3.5"
 rubato = "5.0.1"
-audioadapter = "5.0.0"
 audioadapter-buffers = "5.2.0"

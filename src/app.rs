@@ -53,25 +53,27 @@ impl SessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Realtime,
-    Voices,
+    Tts,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Realtime, Tab::Voices, Tab::Settings];
+    pub const ALL: [Tab; 3] = [Tab::Realtime, Tab::Tts, Tab::Settings];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Realtime => "实时",
-            Self::Voices => "音色",
+            Self::Tts => "语音合成",
             Self::Settings => "设置",
         }
     }
 }
 
 /// 配置加载结果。
+///
+/// `Loaded` 装箱：`AppConfig` 结构较大，避免枚举尺寸被它主导（clippy::large_enum_variant）。
 pub enum ConfigState {
-    Loaded(AppConfig),
+    Loaded(Box<AppConfig>),
     Invalid { error: String },
 }
 
@@ -86,9 +88,11 @@ pub struct KaolsApp {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub config: ConfigState,
+    /// 语音合成页左栏当前选中的自定义音色（配置键名）；`None` = 未选中。
+    pub selected_voice: Option<String>,
     /// 本次启动是否刚刚生成了默认配置。
     pub config_created: bool,
-    /// 启动检查发现的问题（目录不可写、写默认配置失败等）。
+    /// 启动检查发现的问题（写默认配置失败、初始化日志失败等）。
     pub startup_error: Option<String>,
     /// 运行期崩溃信息（panic 钩子写入）。
     pub crash: Option<String>,
@@ -120,6 +124,7 @@ impl KaolsApp {
             input_device: None,
             output_device: None,
             config,
+            selected_voice: None,
             config_created,
             startup_error,
             crash: None,
@@ -131,6 +136,8 @@ impl KaolsApp {
     /// 重新从磁盘读取配置（设置页「重新加载」）。
     pub fn reload_config(&mut self) {
         self.config = load_config(&self.paths.config_file);
+        // 配置可能删掉了当前选中的音色；清空选择，语音合成页会重新判定。
+        self.selected_voice = None;
         info!("已重新加载配置：{}", self.paths.config_file.display());
     }
 
@@ -204,7 +211,7 @@ impl KaolsApp {
 
         match self.tab {
             Tab::Realtime => gui::realtime_tab::show(self, ui),
-            Tab::Voices => gui::voices_tab::show(self, ui),
+            Tab::Tts => gui::tts_tab::show(self, ui),
             Tab::Settings => gui::settings_tab::show(self, ui),
         }
     }
@@ -221,7 +228,12 @@ impl eframe::App for KaolsApp {
 
         // 面板顺序：先上/下，最后 CentralPanel。
         egui::Panel::top("kaols_toolbar").show(ui, |ui| gui::toolbar::show(self, ui));
-        egui::Panel::bottom("kaols_log").show(ui, |ui| gui::log_panel::show(self, ui));
+        // 日志面板高度可拖拽调整（分割线在日志面板上边缘）
+        egui::Panel::bottom("kaols_log")
+            .resizable(true)
+            .default_size(180.0)
+            .min_size(60.0)
+            .show(ui, |ui| gui::log_panel::show(self, ui));
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
     }
 }
@@ -231,7 +243,7 @@ pub fn load_config(path: &Path) -> ConfigState {
     match AppConfig::load(path) {
         Ok(config) => {
             info!("已加载配置：{}", path.display());
-            ConfigState::Loaded(config)
+            ConfigState::Loaded(Box::new(config))
         }
         Err(err) => {
             let message = format!("{err:#}");
@@ -267,10 +279,6 @@ pub fn run(paths: AppPaths) -> ExitCode {
             startup_error = Some(message);
         }
     };
-
-    if let Err(err) = paths.ensure_writable() {
-        record_error(err.to_string());
-    }
 
     let config_created = match paths.ensure_default_config() {
         Ok(created) => {

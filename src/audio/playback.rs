@@ -17,8 +17,8 @@ impl AudioPlaybackHandle {
     pub fn push_pcm16(&self, bytes: &[u8]) {
         if let Some(ref resampler_mutex) = self.resampler {
             let mut resampler = resampler_mutex.lock().unwrap();
-            for chunk in bytes.chunks_exact(2) {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            for chunk in bytes.as_chunks::<2>().0 {
+                let sample = i16::from_le_bytes(*chunk);
                 resampler.input_fifo.push(sample as f32 / 32768.0);
             }
 
@@ -32,14 +32,14 @@ impl AudioPlaybackHandle {
             }
         } else {
             let mut queue = self.sample_queue.lock().unwrap();
-            for chunk in bytes.chunks_exact(2) {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            for chunk in bytes.as_chunks::<2>().0 {
+                let sample = i16::from_le_bytes(*chunk);
                 queue.push_back(sample);
             }
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // M2：「停止播放」按钮接入
     pub fn interrupt(&self) {
         self.interrupt_flag.store(true, Ordering::Relaxed);
         if let Ok(mut queue) = self.sample_queue.lock() {
