@@ -8,6 +8,7 @@
 pub mod admin;
 pub mod api;
 pub mod cache;
+pub mod editor;
 
 #[cfg(test)]
 mod mock_http;

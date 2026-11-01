@@ -1,6 +1,6 @@
 //! GUI 应用主体：启动准备、全局状态、面板布局、事件泵、退出流程。
 //!
-//! 阶段说明：M0 骨架；M1 配置写回；M2 实时管线（`PipelineSession` + 事件泵 + 字幕）。
+//! 阶段说明：M0 骨架；M1 配置写回；M2 实时管线；M3 音色配置编辑器。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -18,6 +18,7 @@ use crate::gui;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::paths::AppPaths;
 use crate::pipeline::session::PipelineSessionHandle;
+use crate::voice::editor::{self, VoiceDraft};
 
 /// 窗口标题。
 pub const WINDOW_TITLE: &str = "kaols — 实时语音识别与合成";
@@ -161,6 +162,12 @@ pub struct KaolsApp {
     pub config_write_error: Option<String>,
     /// 实时字幕状态（当前句 + 历史句）。
     pub subtitles: SubtitleState,
+    /// 语音合成页的音色编辑草稿（保存前只改这里，`config` 不变）。
+    pub voice_drafts: Vec<VoiceDraft>,
+    /// 音色列表在下一次绘制时滚到底部（新增音色后使用，滚完即清）。
+    pub voice_list_scroll_to_end: bool,
+    /// 音色编辑的校验/保存错误（红色显示）。
+    pub voice_edit_error: Option<String>,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
     /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
@@ -210,6 +217,9 @@ impl KaolsApp {
             output_devices: Vec::new(),
             config_write_error: None,
             subtitles: SubtitleState::default(),
+            voice_drafts: Vec::new(),
+            voice_list_scroll_to_end: false,
+            voice_edit_error: None,
             pipeline_error: None,
             vad_active: false,
             config_created,
@@ -227,25 +237,33 @@ impl KaolsApp {
     pub fn reload_config(&mut self) {
         self.config = load_config(&self.paths.config_file);
         self.sync_from_config();
-        // 配置可能删掉了当前选中的音色；清空选择，语音合成页会重新判定。
-        self.selected_voice = None;
+        // 选中的音色若仍存在就保留（保存后不丢选择），否则清空
+        let selected_exists = self
+            .selected_voice
+            .as_ref()
+            .is_some_and(|key| self.voice_drafts.iter().any(|draft| &draft.key == key));
+        if !selected_exists {
+            self.selected_voice = None;
+        }
         info!("已重新加载配置：{}", self.paths.config_file.display());
-        // 运行中改配置（Key/设备等）→ 用新配置自动重启管线
+        // 运行中改配置（Key/设备/音色等）→ 用新配置自动重启管线
         self.maybe_restart_session();
     }
 
-    /// 把配置里的 Key / 设备同步到界面状态（加载、重载、写回成功后调用）。
+    /// 把配置里的 Key / 设备 / 音色草稿同步到界面状态（加载、重载、写回成功后调用）。
     fn sync_from_config(&mut self) {
         match &self.config {
             ConfigState::Loaded(config) => {
                 self.api_key_input = config.api.key.clone().unwrap_or_default();
                 self.input_device = config.audio.input_device.clone();
                 self.output_device = config.audio.output_device.clone();
+                self.voice_drafts = editor::drafts_from_config(config);
             }
             ConfigState::Invalid { .. } => {
                 self.api_key_input.clear();
                 self.input_device = None;
                 self.output_device = None;
+                self.voice_drafts.clear();
             }
         }
     }
@@ -306,6 +324,79 @@ impl KaolsApp {
                 self.config_write_error = Some(message.clone());
                 warn!("写回配置失败：{message}");
             }
+        }
+    }
+
+    // ---- M3：自定义音色编辑 ----
+
+    /// 音色草稿是否有未保存修改。
+    pub fn voice_drafts_dirty(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => self.voice_drafts != editor::drafts_from_config(config),
+            ConfigState::Invalid { .. } => !self.voice_drafts.is_empty(),
+        }
+    }
+
+    /// 保存音色草稿到 `config.toml`（`[tts.custom_voices]`；必要时同步修正 `[tts] voice`）。
+    pub fn save_voice_drafts(&mut self) {
+        match self.try_save_voice_drafts() {
+            Ok(()) => {
+                self.voice_edit_error = None;
+                self.reload_config();
+                info!("已保存自定义音色（{}）", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.voice_edit_error = Some(message.clone());
+                warn!("保存自定义音色失败：{message}");
+            }
+        }
+    }
+
+    fn try_save_voice_drafts(&self) -> anyhow::Result<()> {
+        let entries = editor::drafts_to_entries(&self.voice_drafts)?;
+        let ConfigState::Loaded(config) = &self.config else {
+            anyhow::bail!("配置无效，无法保存音色");
+        };
+
+        // 样例音频必须存在（相对路径按配置文件目录解析）
+        for (key, voice) in &entries {
+            for sample in &voice.samples {
+                let path = config.resolve_path(&sample.audio);
+                if !path.is_file() {
+                    anyhow::bail!("音色 `{key}` 的样例音频不存在：{}", path.display());
+                }
+            }
+        }
+
+        let original = config_edit::read(&self.paths.config_file)?;
+        let mut updated = config_edit::set_custom_voices(&original, &entries)?;
+
+        // 生效音色引用的自定义音色被删除/改名时，自动切到第一个自定义音色
+        if let Some(current) = config.custom_voice_name() {
+            if !entries.iter().any(|(key, _)| key == current) {
+                if let Some((first, _)) = entries.first() {
+                    updated = config_edit::set_active_voice(&updated, &format!("custom:{first}"))?;
+                }
+            }
+        }
+
+        config_edit::save(&self.paths.config_file, &original, &updated)
+    }
+
+    /// 放弃音色编辑，回到配置文件里的内容。
+    pub fn reset_voice_drafts(&mut self) {
+        self.sync_from_config();
+        self.voice_edit_error = None;
+    }
+
+    /// 把某个自定义音色设为生效音色（写 `[tts] voice = "custom:<key>"`）。
+    pub fn set_active_voice_custom(&mut self, key: &str) {
+        let voice = format!("custom:{key}");
+        let result = self.write_config(|text| config_edit::set_active_voice(text, &voice));
+        self.finish_config_write(result, "已切换生效音色");
+        if let Some(err) = &self.config_write_error {
+            self.voice_edit_error = Some(err.clone());
         }
     }
 

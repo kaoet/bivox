@@ -1,226 +1,420 @@
-//! 语音合成页：语音合成（TTS）相关的全部配置。
+//! 语音合成页：TTS 配置与自定义音色编辑器（M3 / D11）。
 //!
-//! 当前实现自定义音色的两栏布局：左侧音色列表、右侧选中音色的详情（详情为占位，
-//! M3 再接入样本增删改与保存）。本页只读 `config.toml`，不访问百炼接口、
-//! 不读写 `voice_cache.json`（D11）。
+//! 左栏是音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线与样例音频。
+//! 草稿只在点「保存到 config.toml」后写回（`[tts.custom_voices]`，同时校验并备份）；
+//! 保存后自动重载配置（运行中会按 D20 自动重启实时管线）。
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 use crate::app::{ConfigState, KaolsApp};
+use crate::language::CLONING_LANGUAGES;
+use crate::voice::editor::{config_audio_path, SampleDraft, VoiceDraft};
 
-/// 左侧列表项（从配置做一份快照，避免界面渲染期间同时借用 `app` 的只读与可变部分）。
-struct VoiceEntry {
-    key: String,
-    display: String,
-    languages: String,
-}
-
-/// 右侧详情（同样是快照）。
-struct VoiceDetail {
-    key: String,
-    display: String,
-    languages: String,
-    /// `(语言, 音频路径)`，顺序即配置里的顺序（第一个是默认声线）。
-    samples: Vec<(String, String)>,
-    /// 是否是 `[tts] voice` 当前引用的音色。
-    is_active: bool,
-    tts_model: String,
-}
-
-/// 本页需要的数据快照。
-struct Snapshot {
-    entries: Vec<VoiceEntry>,
-    details: Vec<VoiceDetail>,
-}
-
-impl Snapshot {
-    fn from_config(config: &crate::config::AppConfig) -> Self {
-        let active = config.custom_voice_name().map(str::to_string);
-
-        let mut details: Vec<VoiceDetail> = config
-            .tts
-            .custom_voices
-            .iter()
-            .map(|(key, voice)| {
-                let languages = voice
-                    .samples
-                    .iter()
-                    .map(|sample| sample.language.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let samples = voice
-                    .samples
-                    .iter()
-                    .map(|sample| {
-                        (
-                            sample.language.clone(),
-                            config.resolve_path(&sample.audio).display().to_string(),
-                        )
-                    })
-                    .collect();
-
-                VoiceDetail {
-                    key: key.clone(),
-                    display: voice.display_name(key),
-                    languages,
-                    samples,
-                    is_active: active.as_deref() == Some(key.as_str()),
-                    tts_model: config.tts.model.clone(),
-                }
-            })
-            .collect();
-        details.sort_by(|a, b| a.display.cmp(&b.display));
-
-        let entries = details
-            .iter()
-            .map(|detail| VoiceEntry {
-                key: detail.key.clone(),
-                display: detail.display.clone(),
-                languages: detail.languages.clone(),
-            })
-            .collect();
-
-        Self { entries, details }
-    }
-
-    fn detail(&self, key: &str) -> Option<&VoiceDetail> {
-        self.details.iter().find(|detail| detail.key == key)
-    }
-}
+const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xc9, 0x6f);
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.heading("语音合成");
     ui.label(
         egui::RichText::new(
-            "这里配置语音合成：音色、模型、语言等。当前先实现自定义音色的浏览与选择，\
-             编辑能力在 M3 接入。",
+            "自定义音色在这里编辑：显示名、各语言声线与样例音频。\
+             点「保存到 config.toml」才写回；运行中保存会自动重启实时管线以应用新配置。",
         )
         .weak(),
     );
     ui.add_space(6.0);
 
-    let snapshot = match &app.config {
-        ConfigState::Loaded(config) => Snapshot::from_config(config),
-        ConfigState::Invalid { error } => {
-            ui.colored_label(
-                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-                format!("配置无效，无法读取音色：{error}"),
-            );
-            return;
-        }
+    let active_voice = match &app.config {
+        ConfigState::Loaded(config) => config.tts.voice.clone(),
+        ConfigState::Invalid { .. } => String::new(),
     };
+    let exe_dir = app.paths.exe_dir.clone();
 
-    // 选中的音色如果已不存在（配置被改/重新加载），清空选择，右侧自然空着。
-    if let Some(selected) = &app.selected_voice {
-        if snapshot.detail(selected).is_none() {
-            app.selected_voice = None;
-        }
-    }
-
-    let selected = app.selected_voice.clone();
-    let mut clicked: Option<String> = None;
-
-    // 左侧列表：`Panel::left` 会从当前 Ui 里切出左栏，画完后剩余的 Ui 就是右栏。
+    let mut clicked_key: Option<String> = None;
+    let mut add_new = false;
+    let mut save = false;
+    let mut reset = false;
+    // 新增音色后，下一次绘制把列表滚到底（新音色追加在末尾）
+    let scroll_to_end = app.voice_list_scroll_to_end;
     egui::Panel::left("tts_voice_list_panel")
         .resizable(true)
-        .default_size(300.0)
+        .default_size(280.0)
         .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("自定义音色").strong());
+                if app.voice_drafts_dirty() {
+                    ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+                }
+            });
+            let dirty = app.voice_drafts_dirty();
+            ui.horizontal(|ui| {
+                if ui.button("＋ 新增音色").clicked() {
+                    add_new = true;
+                }
+                if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
+                    save = true;
+                }
+                if ui
+                    .add_enabled(dirty, egui::Button::new("放弃修改"))
+                    .clicked()
+                {
+                    reset = true;
+                }
+            });
+            if dirty {
+                ui.label(egui::RichText::new("有未保存修改：点「保存」写回 config.toml").weak());
+            }
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("自定义音色").strong());
-            ui.add_space(2.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .id_salt("tts_voice_list_scroll")
                 .show(ui, |ui| {
-                    if snapshot.entries.is_empty() {
-                        ui.label(egui::RichText::new("配置里还没有自定义音色。").weak());
+                    if app.voice_drafts.is_empty() {
+                        ui.label(egui::RichText::new("还没有自定义音色。").weak());
                     }
-                    for entry in &snapshot.entries {
-                        let is_selected = selected.as_deref() == Some(entry.key.as_str());
-                        if voice_item(ui, entry, is_selected) {
-                            clicked = Some(entry.key.clone());
+                    let selected = app.selected_voice.clone();
+                    for (index, draft) in app.voice_drafts.iter().enumerate() {
+                        let languages = draft
+                            .samples
+                            .iter()
+                            .map(|sample| sample.language.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let is_selected = selected.as_deref() == Some(draft.key.as_str());
+                        let is_active = active_voice == format!("custom:{}", draft.key.as_str());
+                        // 新增音色后把列表滚到末尾（最后一项底部对齐）
+                        let scroll_here = scroll_to_end && index + 1 == app.voice_drafts.len();
+                        if voice_item(
+                            ui,
+                            index,
+                            draft,
+                            &languages,
+                            is_selected,
+                            is_active,
+                            scroll_here,
+                        ) {
+                            clicked_key = Some(draft.key.clone());
                         }
                     }
                 });
         });
 
-    if let Some(key) = clicked {
+    if add_new {
+        let key = unique_voice_key(&app.voice_drafts);
+        // 新音色的第一个样本固定用中文，后续可在样本行里改语言
+        let language = "zh".to_string();
+        app.voice_drafts.push(VoiceDraft {
+            key: key.clone(),
+            display_name: String::new(),
+            samples: vec![SampleDraft {
+                language,
+                audio: String::new(),
+            }],
+        });
+        app.selected_voice = Some(key);
+        app.voice_edit_error = None;
+        // 新音色追加在列表末尾：等它真正画出来后的下一帧再把列表滚到底
+        app.voice_list_scroll_to_end = true;
+    }
+    if let Some(key) = clicked_key {
         app.selected_voice = Some(key);
     }
-
-    // 右侧详情：没选中就什么都不画。
-    let current = app.selected_voice.clone();
-    if let Some(detail) = current.as_deref().and_then(|key| snapshot.detail(key)) {
-        show_detail(ui, detail);
+    // 已经用 stick_to_bottom 画过一帧（新音色出现在末尾）后清除滚动标记
+    if !add_new {
+        app.voice_list_scroll_to_end = false;
     }
-}
 
-/// 一行音色列表项：第一行「名称 + weak 键名」，第二行 weak 语言列表；整行可点击。
-fn voice_item(ui: &mut egui::Ui, entry: &VoiceEntry, selected: bool) -> bool {
-    let fill = if selected {
-        ui.visuals().selection.bg_fill
-    } else {
-        egui::Color32::TRANSPARENT
+    // 保存 / 放弃修改作用于整份草稿，不依赖「当前选中项」：
+    // 删掉选中的音色后列表会变空，这两个按钮也必须继续可用。
+    if save {
+        app.save_voice_drafts();
+    }
+    if reset {
+        // 放弃修改后保持选中：记录当前选中项的行号（草稿顺序与配置排序一致），
+        // 重置后按行号找回；编辑过键名/显示名都不影响行号。
+        let wanted_index = app
+            .selected_voice
+            .as_ref()
+            .and_then(|key| app.voice_drafts.iter().position(|draft| &draft.key == key));
+        app.reset_voice_drafts();
+        // 放弃修改时一并清掉上一次保存失败的错误提示
+        app.voice_edit_error = None;
+        if let Some(index) = wanted_index {
+            if let Some(draft) = app.voice_drafts.get(index) {
+                app.selected_voice = Some(draft.key.clone());
+            }
+        }
+    }
+
+    let Some(key) = app.selected_voice.clone() else {
+        return;
+    };
+    let Some(index) = app.voice_drafts.iter().position(|draft| draft.key == key) else {
+        app.selected_voice = None;
+        return;
     };
 
-    let frame = egui::Frame::NONE
-        .fill(fill)
-        .inner_margin(egui::Margin::symmetric(6, 4))
-        .corner_radius(egui::CornerRadius::same(4));
+    let mut draft = app.voice_drafts[index].clone();
+    let mut set_active = false;
+    let mut delete_voice = false;
+    // 样本操作在滚出闭包后统一应用（避免同时借用 app）
+    let mut move_up: Option<usize> = None;
+    let mut move_down: Option<usize> = None;
+    let mut remove_sample: Option<usize> = None;
 
-    let inner = frame.show(ui, |ui| {
-        // 让整行撑满左栏宽度，选中高亮才不会只有文字那么宽。
-        ui.set_width(ui.available_width());
-        ui.vertical(|ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(&entry.display));
-                ui.label(egui::RichText::new(&entry.key).weak());
-            });
-            ui.label(egui::RichText::new(&entry.languages).weak());
-        });
-    });
-
-    ui.interact(
-        inner.response.rect,
-        ui.scope_id().with(("tts_voice_item", &entry.key)),
-        egui::Sense::click(),
-    )
-    .clicked()
-}
-
-/// 右侧详情（占位内容，后续 M3 细化）。
-fn show_detail(ui: &mut egui::Ui, detail: &VoiceDetail) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_salt("tts_voice_detail_scroll")
         .show(ui, |ui| {
             ui.add_space(4.0);
+            let is_active = active_voice == format!("custom:{key}");
             ui.horizontal_wrapped(|ui| {
-                ui.heading(&detail.display);
-                if detail.is_active {
-                    ui.colored_label(egui::Color32::from_rgb(0x3c, 0xc9, 0x6f), "当前生效音色");
+                ui.heading(if draft.display_name.trim().is_empty() {
+                    draft.key.as_str()
+                } else {
+                    draft.display_name.as_str()
+                });
+                if is_active {
+                    ui.colored_label(GREEN, "当前生效音色");
                 }
             });
-            ui.label(egui::RichText::new(format!("配置键名：{}", detail.key)).weak());
-            ui.add_space(6.0);
+            ui.add_space(4.0);
 
-            crate::gui::widgets::kv_row(ui, "支持语言", &detail.languages);
-            crate::gui::widgets::kv_row(ui, "合成模型", &detail.tts_model);
-            crate::gui::widgets::kv_row(ui, "样本数量", &format!("{} 个", detail.samples.len()));
+            ui.horizontal(|ui| {
+                ui.label("显示名");
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.display_name)
+                        .desired_width(300.0)
+                        .hint_text("留空则显示配置键名"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("配置键名");
+                ui.add(egui::TextEdit::singleline(&mut draft.key).desired_width(180.0));
+                ui.label(egui::RichText::new("用于 [tts] voice = custom:<键名>").weak());
+            });
 
             ui.add_space(8.0);
             ui.label(egui::RichText::new("声线样本（有序，第一个是默认声线）").strong());
-            ui.add_space(2.0);
-            for (index, (language, audio)) in detail.samples.iter().enumerate() {
-                ui.monospace(format!("{}. {} → {}", index + 1, language, audio));
+            edit_samples(
+                ui,
+                &mut draft,
+                &exe_dir,
+                &mut move_up,
+                &mut move_down,
+                &mut remove_sample,
+            );
+
+            if ui.button("＋ 添加样本").clicked() {
+                let used: HashSet<&str> = draft
+                    .samples
+                    .iter()
+                    .map(|sample| sample.language.as_str())
+                    .collect();
+                let language = CLONING_LANGUAGES
+                    .iter()
+                    .find(|code| !used.contains(**code))
+                    .copied()
+                    .unwrap_or("zh");
+                draft.samples.push(SampleDraft {
+                    language: language.to_string(),
+                    audio: String::new(),
+                });
             }
 
             ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(
-                    "（占位详情：M3 会在这里接入样本增删改、语言选择与音频文件选择。）",
-                )
-                .weak(),
-            );
+            ui.separator();
+            if let Some(error) = &app.voice_edit_error {
+                ui.colored_label(RED, format!("保存失败：{error}"));
+            }
+            let dirty = app.voice_drafts_dirty();
+            let config_loaded = matches!(app.config, ConfigState::Loaded(_));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !dirty && config_loaded && !is_active,
+                        egui::Button::new("设为当前音色"),
+                    )
+                    .clicked()
+                {
+                    set_active = true;
+                }
+                if ui.button("删除这个音色").clicked() {
+                    delete_voice = true;
+                }
+            });
         });
+
+    // 把编辑后的草稿写回，并处理样本移动/删除（在草稿上进行）
+    app.voice_drafts[index] = draft;
+    // 配置键名可能刚被编辑：选中状态是按「键名」记录的，必须同步更新，
+    // 否则下一帧列表找不到选中项，会取消选中并让右栏详情消失。
+    let current_key = app.voice_drafts[index].key.clone();
+    if app.selected_voice.as_deref() != Some(current_key.as_str()) {
+        app.selected_voice = Some(current_key.clone());
+    }
+    if let Some(i) = move_up {
+        app.voice_drafts[index].samples.swap(i, i - 1);
+    }
+    if let Some(i) = move_down {
+        app.voice_drafts[index].samples.swap(i, i + 1);
+    }
+    if let Some(i) = remove_sample {
+        app.voice_drafts[index].samples.remove(i);
+    }
+
+    if set_active {
+        app.set_active_voice_custom(&current_key);
+    }
+    if delete_voice {
+        app.voice_drafts.remove(index);
+        app.voice_edit_error = None;
+        app.selected_voice = None;
+    }
+}
+
+/// 编辑样本列表；返回需要在调用方应用的操作（避免同时借用 `app`）。
+fn edit_samples(
+    ui: &mut egui::Ui,
+    draft: &mut VoiceDraft,
+    exe_dir: &Path,
+    move_up: &mut Option<usize>,
+    move_down: &mut Option<usize>,
+    remove_sample: &mut Option<usize>,
+) {
+    let count = draft.samples.len();
+    for (sample_index, sample) in draft.samples.iter_mut().enumerate() {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("样本 {}", sample_index + 1)).strong());
+            if sample_index == 0 {
+                ui.label(egui::RichText::new("默认声线").weak());
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("语言");
+            let mut current = sample.language.clone();
+            egui::ComboBox::from_id_salt(("voice_lang", draft.key.as_str(), sample_index))
+                .selected_text(current.as_str())
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for code in CLONING_LANGUAGES {
+                        ui.selectable_value(&mut current, (*code).to_string(), *code);
+                    }
+                });
+            sample.language = current;
+            ui.label(egui::RichText::new("音频").weak());
+            ui.add(
+                egui::TextEdit::singleline(&mut sample.audio)
+                    .desired_width(320.0)
+                    .hint_text("样例音频路径（相对 exe 目录或绝对路径）"),
+            );
+            if ui.button("选择…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("音频", &["wav", "mp3", "m4a", "flac", "ogg"])
+                    .pick_file()
+                {
+                    sample.audio = config_audio_path(exe_dir, &path);
+                }
+            }
+        });
+
+        if !sample.audio.trim().is_empty() {
+            let resolved = resolve_audio(exe_dir, &sample.audio);
+            if !resolved.is_file() {
+                ui.colored_label(AMBER, format!("⚠ 音频文件不存在：{}", resolved.display()));
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if sample_index > 0 && ui.small_button("↑ 上移").clicked() {
+                *move_up = Some(sample_index);
+            }
+            if sample_index + 1 < count && ui.small_button("↓ 下移").clicked() {
+                *move_down = Some(sample_index);
+            }
+            if count > 1 && ui.small_button("删除").clicked() {
+                *remove_sample = Some(sample_index);
+            }
+        });
+    }
+}
+
+fn resolve_audio(exe_dir: &Path, audio: &str) -> PathBuf {
+    let path = Path::new(audio.trim());
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        exe_dir.join(path)
+    }
+}
+
+fn unique_voice_key(drafts: &[VoiceDraft]) -> String {
+    for index in 1.. {
+        let key = format!("voice{index}");
+        if !drafts.iter().any(|draft| draft.key == key) {
+            return key;
+        }
+    }
+    unreachable!()
+}
+
+fn voice_item(
+    ui: &mut egui::Ui,
+    index: usize,
+    draft: &VoiceDraft,
+    languages: &str,
+    selected: bool,
+    is_active: bool,
+    scroll_here: bool,
+) -> bool {
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let frame = egui::Frame::NONE
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .corner_radius(egui::CornerRadius::same(4));
+    let inner = frame.show(ui, |ui| {
+        // 列表项整行都可以点：不要让文字变成可选（否则悬停会出现 I 形光标）
+        ui.style_mut().interaction.selectable_labels = false;
+        ui.set_width(ui.available_width());
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                let name = if draft.display_name.trim().is_empty() {
+                    draft.key.as_str()
+                } else {
+                    draft.display_name.as_str()
+                };
+                ui.label(name);
+                ui.label(egui::RichText::new(&draft.key).weak());
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(languages).weak());
+                if is_active {
+                    ui.colored_label(GREEN, "当前生效");
+                }
+            });
+        });
+    });
+    let response = ui
+        .interact(
+            inner.response.rect,
+            // 用行号做 id：编辑配置键名时 id 不会跟着变
+            ui.scope_id().with(("tts_voice_item", index)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if scroll_here {
+        // 让外层 ScrollArea 把这一项滚到可见区域底部
+        ui.scroll_to_rect(inner.response.rect, Some(egui::Align::BOTTOM));
+    }
+    response.clicked()
 }

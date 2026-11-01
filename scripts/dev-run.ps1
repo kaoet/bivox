@@ -1,15 +1,23 @@
 # 开发期启动脚本
 #
 # 便携模式要求 config.toml 与 exe 同目录（GUI_MIGRATION.md D4），
-# 而 `cargo run` 的 exe 在 target\<profile>\，所以这里先把仓库根目录的
-# config.toml / voice_cache.json 复制过去，再启动 GUI。
+# 而 `cargo run` 的 exe 在 target\<profile>\，所以这里只把仓库根目录的
+# config.toml 复制过去，并把这份副本的 `[tts] cache_file` 指向仓库根的
+# voice_cache.json（相对 target\<profile>\ 向上两级）。
+#
+# 为什么不用符号链接（symlink）：
+#   1. Windows 创建文件 symlink 需要管理员权限或开启「开发者模式」；
+#   2. 更关键的是缓存写入是「临时文件 + rename」的原子写，rename 会把链接本身
+#      替换成普通文件（链接断裂），所以 symlink/hardlink 都不可靠。
+# 直接让配置指向根目录缓存文件，则原子写落在真实文件上，多个 profile 共用同一份缓存。
 #
 # 用法：
 #   .\scripts\dev-run.ps1            # debug，默认 wgpu 后端
 #   .\scripts\dev-run.ps1 -Release   # release
 #   .\scripts\dev-run.ps1 -Glow      # glow/OpenGL 后端（截图核对时用）
+#   .\scripts\dev-run.ps1 -NoRun     # 只准备 target 目录，不启动 GUI（脚本自检用）
 
-param([switch]$Release, [switch]$Glow)
+param([switch]$Release, [switch]$Glow, [switch]$NoRun)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -24,12 +32,27 @@ if ($Release) { $cargoArgs += "--release" }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $targetDir = Join-Path $root "target\$profileName"
-foreach ($name in @("config.toml", "voice_cache.json")) {
-    $source = Join-Path $root $name
-    if (Test-Path $source) {
-        Copy-Item $source (Join-Path $targetDir $name) -Force
+
+# 复制 config.toml，并把副本的 cache_file 指到仓库根缓存
+$configSource = Join-Path $root "config.toml"
+$configTarget = Join-Path $targetDir "config.toml"
+if (Test-Path $configSource) {
+    Copy-Item $configSource $configTarget -Force
+
+    # target\<profile>\config.toml 向上两级就是仓库根目录
+    $cacheRel = "../../voice_cache.json"
+    $text = Get-Content $configTarget -Raw
+    if ($text -match '(?m)^\s*cache_file\s*=') {
+        $text = [regex]::Replace($text, '(?m)^\s*cache_file\s*=.*$', "cache_file = `"$cacheRel`"")
+    } elseif ($text -match '(?m)^\[tts\]\s*$') {
+        $text = [regex]::Replace($text, '(?m)^\[tts\]\s*$', "[tts]`ncache_file = `"$cacheRel`"")
+    } else {
+        $text = $text.TrimEnd() + "`n`n[tts]`ncache_file = `"$cacheRel`"`n"
     }
+    Set-Content -Path $configTarget -Value $text -NoNewline
 }
+
+if ($NoRun) { exit 0 }
 
 & (Join-Path $targetDir "kaols.exe")
 exit $LASTEXITCODE

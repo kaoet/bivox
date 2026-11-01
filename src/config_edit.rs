@@ -8,7 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+
+use crate::config::CustomVoiceConfig;
 
 /// 读取配置原文。
 pub fn read(path: &Path) -> Result<String> {
@@ -42,6 +44,47 @@ pub fn set_audio_devices(
     set_or_remove(audio, "input_device", input);
     set_or_remove(audio, "output_device", output);
 
+    render(&doc, original)
+}
+
+/// 整体替换 `[tts.custom_voices]` 表（键名 → 音色），其余字段与注释保留。
+pub fn set_custom_voices(original: &str, voices: &[(String, CustomVoiceConfig)]) -> Result<String> {
+    let mut doc = parse(original)?;
+    let tts = ensure_table(&mut doc, "tts")?;
+
+    let mut table = Table::new();
+    for (key, voice) in voices {
+        let mut voice_table = Table::new();
+        if let Some(name) = voice
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            voice_table["name"] = toml_edit::value(name);
+        }
+
+        let mut samples = ArrayOfTables::new();
+        for sample in &voice.samples {
+            let mut sample_table = Table::new();
+            sample_table["language"] = toml_edit::value(sample.language.trim());
+            sample_table["audio"] = toml_edit::value(sample.audio.to_string_lossy().as_ref());
+            samples.push(sample_table);
+        }
+        voice_table["samples"] = Item::ArrayOfTables(samples);
+
+        table[key.as_str()] = Item::Table(voice_table);
+    }
+
+    tts["custom_voices"] = Item::Table(table);
+    render(&doc, original)
+}
+
+/// 设置生效音色 `[tts] voice`（内置音色名或 `custom:<键名>`）。
+pub fn set_active_voice(original: &str, voice: &str) -> Result<String> {
+    let mut doc = parse(original)?;
+    let tts = ensure_table(&mut doc, "tts")?;
+    tts["voice"] = toml_edit::value(voice.trim());
     render(&doc, original)
 }
 
@@ -220,5 +263,74 @@ languages = ["zh", "ja"]
     fn invalid_original_toml_is_reported() {
         let err = set_api_key("[api\nkey = 1", Some("sk")).unwrap_err();
         assert!(format!("{err:#}").contains("解析 config.toml 失败"));
+    }
+
+    #[test]
+    fn set_custom_voices_replaces_table_and_keeps_other_fields() {
+        let original = format!(
+            "# 顶部注释\n{SAMPLE}\n[tts]\nvoice = \"custom:old\"\n\n[tts.custom_voices.old]\n[[tts.custom_voices.old.samples]]\nlanguage = \"zh\"\naudio = \"old.wav\"\n"
+        );
+
+        let voices = vec![
+            (
+                "alpha".to_string(),
+                CustomVoiceConfig {
+                    name: Some("甲".to_string()),
+                    samples: vec![
+                        crate::config::CustomVoiceSample {
+                            language: "zh".to_string(),
+                            audio: "voices/a-zh.wav".into(),
+                        },
+                        crate::config::CustomVoiceSample {
+                            language: "ja".to_string(),
+                            audio: "voices/a-ja.wav".into(),
+                        },
+                    ],
+                },
+            ),
+            (
+                "beta".to_string(),
+                CustomVoiceConfig {
+                    name: None,
+                    samples: vec![crate::config::CustomVoiceSample {
+                        language: "en".to_string(),
+                        audio: "voices/b-en.wav".into(),
+                    }],
+                },
+            ),
+        ];
+
+        let updated = set_custom_voices(&original, &voices).unwrap();
+        // 旧生效音色指向已删除的 custom:old，真实保存流程会同时改写 [tts] voice
+        let updated = set_active_voice(&updated, "custom:alpha").unwrap();
+
+        // 注释与其它字段保留
+        assert!(updated.contains("# 顶部注释"));
+        assert!(updated.contains("workspace_host"));
+        // 旧音色被整体替换、新音色结构可被正确解析
+        assert!(!updated.contains("custom_voices.old"));
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert_eq!(config.tts.custom_voices.len(), 2);
+        assert_eq!(config.tts.voice, "custom:alpha");
+        let alpha = &config.tts.custom_voices["alpha"];
+        assert_eq!(alpha.name.as_deref(), Some("甲"));
+        assert_eq!(alpha.samples.len(), 2);
+        assert_eq!(alpha.samples[0].language, "zh");
+        assert_eq!(
+            config.tts.custom_voices["beta"].samples[0]
+                .audio
+                .to_string_lossy(),
+            "voices/b-en.wav"
+        );
+    }
+
+    #[test]
+    fn set_active_voice_updates_tts_voice() {
+        let original = format!("{SAMPLE}\n[tts]\nvoice = \"Cherry\"\n");
+        let updated = set_active_voice(&original, "Ethan").unwrap();
+
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert_eq!(config.tts.voice, "Ethan");
+        assert!(updated.contains("# 顶部注释"));
     }
 }

@@ -139,6 +139,30 @@ pub fn install_panic_hook(crash_log: PathBuf) {
     }));
 }
 
+/// 去掉 ANSI 颜色/控制序列（`colored` 会把 `\x1b[36m...\x1b[0m` 写进日志字符串）。
+///
+/// GUI 与日志文件都不支持终端颜色，保留转义码只会显示成 `[36m` 之类的乱码。
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            output.push(ch);
+            continue;
+        }
+        // CSI：ESC '[' 参数... 终止字节（@ ..= ~）
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    output
+}
+
 impl log::Log for Sink {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Info
@@ -150,7 +174,8 @@ impl log::Log for Sink {
         }
 
         let now = Local::now();
-        let message = record.args().to_string();
+        // `colored` 生成的 ANSI 颜色码在 GUI/日志文件里没有意义，会出现 `[36m` 之类的乱码
+        let message = strip_ansi(&record.args().to_string());
 
         if let Ok(mut guard) = self.file.lock() {
             if let Some(file) = guard.as_mut() {
@@ -185,5 +210,24 @@ impl log::Log for Sink {
                 let _ = file.flush();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        assert_eq!(
+            strip_ansi("\u{1b}[36mqwen-audio\u{1b}[0m 创建"),
+            "qwen-audio 创建"
+        );
+        assert_eq!(strip_ansi("普通文本"), "普通文本");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_unicode_and_emoji() {
+        assert_eq!(strip_ansi("⬆️ 已上传样例音频"), "⬆️ 已上传样例音频");
     }
 }

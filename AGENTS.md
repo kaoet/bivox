@@ -29,8 +29,9 @@ cargo build --bins        # 构建 GUI 主程序 + 调试 CLI
 cargo run                 # 启动 GUI（默认 wgpu；首次启动在 exe 同目录生成 config.toml）
 cargo test                # 全部单元测试（含本地 mock WebSocket / HTTP 服务）
 
-.\scripts\dev-run.ps1         # 开发期启动：把根目录 config.toml 复制到 target\debug 再运行
+.\scripts\dev-run.ps1         # 开发期启动：复制 config.toml 到 target\debug（cache_file 指回仓库根 voice_cache.json）再运行
 .\scripts\dev-run.ps1 -Glow   # 同上，但用 glow/OpenGL 后端（截图核对时用）
+.\scripts\dev-run.ps1 -NoRun  # 只准备 target 目录，不启动 GUI（脚本自检用）
 
 # 百炼音色调试 CLI（默认读当前目录 config.toml，可用 -c 指定）
 cargo run --bin admin -- list
@@ -68,6 +69,7 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 - `src/voice/`：自定义（复刻）音色。
   - `api.rs`：调百炼 HTTP 接口（文件上传、音色复刻/查询/列表/删除），不依赖 SDK。
   - `cache.rs`：`voice_cache.json`（模型 -> 音频 SHA256 -> voice_id）读写。
+  - `editor.rs`：音色编辑草稿（config ↔ 草稿 ↔ 写回数据，纯函数 + 单测）。
   - `admin.rs`：调试 CLI 的纯逻辑（远程音色列出/删除，可用 mock HTTP 测试）。
   - `mod.rs`：启动时解析 `[tts] voice`，并行注册全部语言样本，返回「语言 -> voice_id」映射。
 - `src/bin/admin.rs`：`admin` 调试 CLI——只做百炼音色的列出/删除；不读缓存、不 enroll、无 prefix 过滤。

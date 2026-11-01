@@ -46,3 +46,5 @@ hex = "0.4"
 hound = "3.5"
 rubato = "5.0.1"
 audioadapter-buffers = "5.2.0"
+# 音色编辑器选择样例音频文件（Windows 原生文件对话框）
+rfd = "0.17"

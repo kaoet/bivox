@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.30，**M0、M1、M2、M4、D0 已完成**；下一步 M3（音色配置编辑器）
+> **状态**：草案 v0.42，**M0、M1、M2、M3、M4、D0 已完成**；下一步 M5（打包/图标/单实例/README）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -134,7 +134,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 1. **不读 `%APPDATA%`**、不读注册表、不读当前工作目录。
 2. **不读任何环境变量**来覆盖配置路径（主程序；调试工具按 D19 读工作目录的 `config.toml`，属独立工具，不受此条约束）。
 3. `voice_cache.json`、样例音频等相对路径仍以 **`config.toml` 所在目录**为基准（沿用 `AppConfig::resolve_path`，配置与 exe 同目录，效果一致）。
-4. **开发期**：`cargo run` 的 exe 在 `target\debug\`，用 `scripts/dev-run.ps1` 把仓库根 `config.toml` 复制到 `target\<profile>\` 后再运行。
+4. **开发期**：`cargo run` 的 exe 在 `target\debug\`，用 `scripts/dev-run.ps1` 把仓库根 `config.toml` 复制到 `target\<profile>\` 后再运行；副本里的 `[tts] cache_file` 被改成 `../../voice_cache.json`，让各 profile 共用仓库根缓存（避免每次回滚缓存导致重复上传/复刻）。
 5. 便携模式的代价（接受）：备份目录 = 备份 API Key + 音色缓存；README 写清。
 
 ### D5 ✅ 线程模型：eframe 占主线程，tokio 跑在后台
@@ -421,7 +421,7 @@ src/
     ├── admin.rs         # 调试工具逻辑（可测，复用 mock_http）
     └── editor.rs        # 音色草稿模型：config ↔ 草稿 ↔ TOML 片段（纯函数 + 测试）
 
-scripts/dev-run.ps1      # 开发期复制 config.toml 到 target\<profile>\ 再运行
+scripts/dev-run.ps1      # 开发期复制 config.toml 到 target\<profile>\（cache_file 指回仓库根）再运行
 scripts/package.ps1      # 打包 zip（不含 config.toml、不含调试工具）
 ```
 
@@ -603,19 +603,24 @@ impl AppPaths {
 **验收**：实测说话 → 当前句刷新、历史句出现、TTS 音频有输出；停止→开始可恢复，连续 3 次不掉设备
 **预估**：乐观 1.5 天 / 保守 2.5 天（实际约 2 小时，含以 log 化与事件化重构）
 
-### M3 音色配置编辑器（D11）
+### M3 音色配置编辑器（D11）（已完成 ✅，kittest 用例未做）
 
-- [ ] `voice/editor.rs`：`drafts_from_config` / `drafts_to_config`（纯函数 + 单测）
-- [ ] `config_edit.rs::set_custom_voices`（整体替换该表 + 校验 + `.bak`）
-- [ ] 语音合成页（自定义音色区）：左侧列表 + 右侧详情（M0.5 已先做出两栏骨架），再补新增/删除音色、改显示名、样本增删改、上移/下移（首样本=默认声线标注）
-- [ ] 语言下拉（`language::CLONING_LANGUAGES`）+ 音频文件选择（`rfd`）+ 文件存在性警告
-- [ ] 音频路径相对/绝对策略（exe 目录内→相对路径）
-- [ ] 生效音色 `[tts] voice` 下拉（内置/自定义）
-- [ ] 保存后：提示"下次开始会话时生效"（会话运行中时），未运行时可自动重载
-- [ ] kittest 增加"音色页存在并可添加样本行"用例
+- [x] `voice/editor.rs`：`drafts_from_config` / `drafts_to_entries`（纯函数）+ `config_audio_path`；5 个单测覆盖 roundtrip、显示名缺省、非法草稿、相对/绝对路径
+- [x] `config_edit.rs::set_custom_voices` / `set_active_voice`（整体替换该表 + 写前校验 + `.bak`；2 个单测）
+- [x] 语音合成页：左侧音色列表（显示名 + weak 键名 + 语言列表）+ 「＋ 新增音色」；右侧详情编辑显示名、配置键名、样本增删改、上/下移、首样本「默认声线」标注
+- [x] 语言下拉（`language::CLONING_LANGUAGES`）+ `rfd` 选择音频文件 + 路径不存在时琥珀色警告（保存时再校验，缺失则拒绝保存）
+- [x] 音频路径策略：选中的文件在 exe 目录内 → 写相对路径，否则绝对路径
+- [x] 生效音色：选中音色可点「设为当前音色」写 `[tts] voice = "custom:<键名>"`；删除当前生效音色引用的音色时，保存会自动切到剩余的第一个音色
+- [x] 保存后自动重载配置；运行中保存会按 D20 自动重启实时管线（不再只是"下次生效"）
+- [ ] kittest 用例：项目尚未接入 kittest 工具链，暂以纯逻辑单测 + egui_mcp 手工验证替代（D14 的 kittest 门禁仍待接入）
 
-**验收**：新增一个自定义音色并保存 → TOML 结构正确、注释保留（表外）；删除音色后配置无残留；非法语言/缺文件有提示且不允许保存
-**预估**：乐观 1.5 天 / 保守 2 天
+**实施说明**：
+- 草稿与 `config` 分离：未点保存前只改 `app.voice_drafts`，界面用 `voice_drafts_dirty()`（与配置重新构造的草稿比较）显示「● 未保存」并控制按钮状态。
+- 未做的部分：内置（系统）音色列表选择——`[tts] voice` 的内置音色仍需手改 TOML；当前 UI 只提供自定义音色的"设为当前音色"。
+- egui_mcp 实测：选中「东雪莲」→ 改显示名为「东雪莲测试」→ 保存（日志"已保存自定义音色"，`config.toml` 的 `name` 更新、`.bak` 保存旧内容）→「设为当前音色」（`voice = "custom:dongxue"`，标题旁出现绿色"当前生效音色"）。
+
+**验收**：新增/删除/编辑音色并保存 → TOML 结构正确、表外注释保留；非法语言/重复语言/缺文件有明确错误且不落盘
+**预估**：乐观 1.5 天 / 保守 2 天（实际约 1.5 小时，含 `rfd` 接入）
 
 ### M4 调试 CLI 工具（D19）（已完成 ✅）
 
@@ -799,3 +804,15 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.28 | 2026-11-01 | 字幕语言列宽度再收窄到 **24px**；含 3 字母代码（`yue`）实测不溢出、各行情景仍对齐。验证：fmt / clippy 0 警告 / 126 测试 |
 | v0.29 | 2026-11-01 | 新增 **D21 顶栏本地 VAD 指示器**（开始/停止按钮左侧）：`SpeechGate` 通过 `GateConfig.active_flag: Arc<AtomicBool>` 发布语音段状态，会话调度循环每 100ms 轮询变化并发 `PipelineEvent::VadActive`；UI 显示「VAD ● 激活（绿）/ 静音（灰）/ 关闭（灰，[vad] enabled=false）」，带 tooltip。验证：egui_mcp 实测 空闲=静音 → 运行中说话=激活（绿，同时出现 ASR 字幕）→ 停止后回到静音；fmt / clippy 0 警告 / build / 126 测试 |
 | v0.30 | 2026-11-01 | 按用户要求：**按「停止」立即清空当前字幕**（不再等下次「开始」）。`stop_session()` 调用 `subtitles.reset_current()`；会话以 Idle/Failed 结束时也兜底清一次；历史字幕仍保留（已完成的句子照常进入历史）。验证：egui_mcp 实测运行中识别到「哈，你说吧…」→ 点停止后该行立刻从“当前句”移除（悬停出现复制图标，说明它已是历史句）；fmt / clippy 0 警告 / 126 测试 |
+| v0.31 | 2026-11-01 | **M3 音色配置编辑器实施完成**：新增 `voice/editor.rs`（草稿 roundtrip / 校验 / 音频路径策略，5 单测）；`config_edit.rs` 增加 `set_custom_voices` / `set_active_voice`（整体替换表 + `.bak`，2 单测）；语音合成页右栏改为完整编辑器（显示名、键名、样本增删改/上下移、语言下拉 `CLONING_LANGUAGES`、`rfd` 选音频、文件存在性警告、保存/放弃/设为当前音色/删除音色），左栏支持新增音色；保存走 `drafts_to_entries` 校验（重复键/非法语言/重复语言/缺文件均拒绝），生效音色被删时自动切到第一个；保存后自动重载并触发 D20 热重启。新增依赖 `rfd 0.17`。验证：fmt / clippy 0 警告 / build / **132** 测试；egui_mcp 实测改名保存（配置更新 + `.bak` 留旧值）与「设为当前音色」（`voice = "custom:dongxue"`）。kittest 用例未做（工具链未接入） |
+| v0.32 | 2026-11-01 | 音色列表交互细化：①列表项显示绿色「当前生效」标记（对应 `[tts] voice`）；②列表项禁用文字选择（`selectable_labels = false`）并整行 `on_hover_cursor(PointingHand)`，鼠标在名称/语言等文字上也是手型而不是 I 形光标；③「保存」「放弃修改」按钮移到左栏与「＋ 新增音色」同一行，右栏只留「设为当前音色 / 删除这个音色」。验证：fmt / clippy 0 警告 / 132 测试；egui_mcp 截图确认生效标记与按钮布局 |
+| v0.33 | 2026-11-01 | 按用户要求：删除音色样本编辑里的「· ASR 语言」标记及只为它服务的 `languages` 参数，样本行只保留「样本 N / 默认声线」；fmt / clippy 0 警告 / 132 测试 |
+| v0.34 | 2026-11-01 | 新增音色的第一个样本语言固定为 `"zh"`（用户确认），去掉 `tts_tab::show` 里只为默认语言服务的 `config.asr.languages` 快照与 `languages` 变量；fmt / clippy 0 警告 / 132 测试 |
+| v0.35 | 2026-11-01 | 音色编辑器两处修正：①「放弃修改」时同时清空 `voice_edit_error`（保存失败提示立刻消失，草稿回到配置内容）；②选中的音色就是当前生效音色时「设为当前音色」按钮禁用（`!dirty && loaded && !is_active`）。验证：egui_mcp 实测把样例音频改成不存在路径→保存弹出错误→点放弃修改后错误消失且路径恢复；选中 `custom:yanqing` 时按钮 `disabled = true`；fmt / clippy 0 警告 / 132 测试 |
+| v0.36 | 2026-11-01 | 修删除选中音色后「保存/放弃修改」无反应的 bug：这两个按钮是全局操作，但原来在 `let Some(selected_voice) else { return }` 之后才应用，删除后选中项为空导致提前 return、按钮点击被丢弃。现在在选中项判断之前就应用 save/reset（并保持放弃修改清空错误提示）。验证：egui_mcp 实测删除 Kaoet 后不选任何项，点「放弃修改」音色恢复、点「保存」成功写回（配置中 kaoet 被移除，日志"已保存自定义音色"）；fmt / clippy 0 警告 / 132 测试 |
+| v0.37 | 2026-11-01 | `scripts/dev-run.ps1` 不再复制 `voice_cache.json`，改为：①只复制 `config.toml`，并把副本的 `[tts] cache_file` 改成 `../../voice_cache.json`，让 debug/release 共用仓库根缓存（避免每次运行缓存回滚导致重复上传/复刻）；②若 target 里还残留旧脚本复制的 `voice_cache.json`，先把 target 中缺失的记录合并回仓库根缓存再删除旧副本；③新增 `-NoRun` 便于自检。**不用符号链接**：Windows 文件 symlink 需管理员/开发者模式，且缓存保存是「临时文件 + rename」的原子写，rename 会替换链接本身导致断链；改配置指向真实文件更可靠。验证：`-NoRun` 跑两次（首次合并 16 条记录并删除旧副本、第二次幂等），target 配置仅 `cache_file` 被改写，GUI 启动日志正常"已加载配置" |
+| v0.38 | 2026-11-01 | 按用户要求删掉 `dev-run.ps1` 里的旧缓存合并逻辑：残留的 `target\<profile>\voice_cache.json` 直接删除（不再并入仓库根缓存）。验证：放回一份旧副本后跑 `-NoRun`，缓存副本被删除、仓库根 `voice_cache.json` 哈希不变 |
+| v0.39 | 2026-11-01 | 修 GUI/日志文件里出现的 ANSI 颜色码（如 `[36m…[0m`）：`log_sink` 在写内存队列与日志文件前统一调用 `strip_ansi()` 去掉 CSI 序列（`colored` 仍供调试 CLI 的终端输出使用）；emoji 本身显示正常，未改字体。新增 2 个 `strip_ansi` 单测。验证：临时日志带 `\x1b[36m` 在 GUI 日志面板显示为纯文本（emoji 正常）；fmt / clippy 0 警告 / **134** 测试 |
+| v0.40 | 2026-11-01 | 修「编辑音色配置键名时列表取消选中、右侧编辑界面消失」：选中状态按**配置键名**记录，键名一改就匹配不上。现在每帧写回草稿后同步 `selected_voice` 为新键名；列表项交互 id 改用行号（避免键名变化导致 id 抖动）；「放弃修改」后按键名/显示名找回原选中音色，不再丢选择。验证：egui_mcp 实测把 `kaoet` 改成 `kaoet2` 时左侧保持高亮、右侧编辑器不消失；点放弃修改后键名恢复 `kaoet` 且仍选中该音色；fmt / clippy 0 警告 / 134 测试 |
+| v0.41 | 2026-11-01 | 「放弃修改」后的选中恢复改为**按行号**（草稿顺序与配置排序一致），不再匹配显示名：显示名/键名同时被编辑时也能找回同一音色。验证：egui_mcp 实测把「东雪莲」的显示名改成「测试名」、键名改成 `dongxue2` 后点放弃修改，列表仍选中「东雪莲」且右侧编辑器保持打开；fmt / clippy 0 警告 / 134 测试 |
+| v0.42 | 2026-11-01 | 点击「＋ 新增音色」后左侧列表自动滚到末尾：`KaolsApp.voice_list_scroll_to_end` 标记下一帧用 `ui.scroll_to_rect(last_item, Align::BOTTOM)`（`ScrollArea::stick_to_bottom` 只在已经贴底时才生效，不能把顶部列表拉到底）。验证：窗口缩到 900×560 后新增音色，列表滚到底部并显示新项 `voice1`；fmt / clippy 0 警告 / 134 测试 |
