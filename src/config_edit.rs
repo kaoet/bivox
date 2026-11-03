@@ -1,4 +1,4 @@
-//! 用 `toml_edit` 对 `config.toml` 做**定点修改**（GUI_MIGRATION.md D3）。
+//! 用 `toml_edit` 对 `config.toml` 做**定点修改**（决策 D3，见 docs/decisions.md）。
 //!
 //! 目标：只动 GUI 负责的那几个字段（`[api] key`、`[audio]` 设备……），
 //! 其余字段、注释、顺序原样保留；写盘前先用 `AppConfig::from_toml_str` 校验整份文本，

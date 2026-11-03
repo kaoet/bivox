@@ -1,10 +1,10 @@
-//! 日志与崩溃信息收集（GUI_MIGRATION.md D7/D8）。
+//! 日志与崩溃信息收集（决策 D7/D8，见 docs/decisions.md）。
 //!
 //! 只做两件事：
 //! 1. 把日志同时写进内存队列（界面每帧取走显示）和按天文件（`logs\kaols-YYYY-MM-DD.log`）；
 //! 2. 提供 panic 钩子，把崩溃信息写到 `crash.log` 并交给界面显示。
 //!
-//! 这里不持有 `egui::Context`：M2 接入后台任务后，由发日志的一方决定是否调用
+//! 这里不持有 `egui::Context`：接入后台任务后，由发日志的一方决定是否调用
 //! `ctx.request_repaint()`，避免日志模块反向依赖界面。
 
 use std::collections::VecDeque;
@@ -18,7 +18,7 @@ use chrono::Local;
 /// 界面日志面板保留的最大行数（D16）。
 pub const MAX_LOG_LINES: usize = 5000;
 
-/// 按天日志文件保留天数（含当天，M5）。
+/// 按天日志文件保留天数（含当天）。
 pub const LOG_RETENTION_DAYS: i64 = 7;
 
 /// 删除超过保留期的按天日志文件（`kaols-YYYY-MM-DD.log`），返回删除数量。

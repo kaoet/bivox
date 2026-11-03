@@ -1,6 +1,4 @@
 //! GUI 应用主体：启动准备、全局状态、面板布局、事件泵、退出流程。
-//!
-//! 阶段说明：M0 骨架；M1 配置写回；M2 实时管线；M3 音色配置编辑器。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -153,7 +151,7 @@ pub enum ConfigState {
 /// 应用状态。
 pub struct KaolsApp {
     pub paths: AppPaths,
-    /// 后台运行时：M2 起用它 spawn `PipelineSession`。
+    /// 后台运行时：用它 spawn `PipelineSession`。
     pub runtime: tokio::runtime::Runtime,
     pub tab: Tab,
     pub state: SessionState,
@@ -495,7 +493,7 @@ impl KaolsApp {
         }
     }
 
-    // ---- M3：自定义音色编辑 ----
+    // ---- 自定义音色编辑 ----
 
     /// 音色草稿是否有未保存修改。
     pub fn voice_drafts_dirty(&self) -> bool {
@@ -515,7 +513,7 @@ impl KaolsApp {
         }
     }
 
-    // ---- M2：实时管线（PipelineSession）----
+    // ---- 实时管线（PipelineSession）----
 
     /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。
     pub fn start_session(&mut self, ctx: egui::Context) {

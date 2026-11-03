@@ -114,7 +114,7 @@ pub async fn resolve_active_voice(config: &AppConfig) -> Result<ActiveVoice> {
 
 /// 确保配置中的自定义音色样本全部可用（必要时并行上传复刻），返回语言→voice_id 映射。
 ///
-/// `only_language` 用于 `voices enroll --language`：只处理指定语言样本。
+/// `only_language`：只处理指定语言的样本（当前调用方传 `None`）。
 pub async fn resolve_custom_voice(
     config: &AppConfig,
     api: &BailianVoiceApi,

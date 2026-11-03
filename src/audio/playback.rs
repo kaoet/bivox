@@ -39,7 +39,7 @@ impl AudioPlaybackHandle {
         }
     }
 
-    #[allow(dead_code)] // M2：「停止播放」按钮接入
+    #[allow(dead_code)] // 预留：播放中断；当前由 drop 播放引擎停止，暂无调用方
     pub fn interrupt(&self) {
         self.interrupt_flag.store(true, Ordering::Relaxed);
         if let Ok(mut queue) = self.sample_queue.lock() {

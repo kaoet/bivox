@@ -100,7 +100,7 @@ impl AudioCapture {
         })
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 预留：显式停止采集；当前由 drop `AudioCapture` 停止
     pub fn stop(&self) {
         self.is_capturing.store(false, Ordering::Relaxed);
     }

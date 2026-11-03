@@ -1,7 +1,8 @@
-//! 语音合成页：当前音色选择 + 自定义音色编辑器（M3 / D11）。
+//! 语音合成页：当前音色选择 + 自定义音色编辑器（决策 D11/D22，见 docs/decisions.md）。
 //!
 //! 顶部选择「当前音色」：现有音色（输入框，填内置音色名或任意 voice_id）或
-//! 自定义音色（下拉，写 `custom:<键名>`），点「应用」写回 `[tts] voice`。
+//! 自定义音色（下拉，写 `custom:<键名>`），右上角「保存」同时写回 `[tts] voice`
+//! 与 `[tts.custom_voices]`。
 //! 下方左栏是自定义音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线与样例音频。
 //! 草稿只在点「保存」后写回（`[tts.custom_voices]`，同时校验并备份）；
 //! 保存后自动重载配置（运行中会按 D20 自动重启实时管线）。
@@ -252,7 +253,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     }
 }
 
-/// 顶部「当前音色」：Radio 二选一（未选中的控件禁用）+ 显式「应用」。
+/// 顶部「当前音色」：Radio 二选一（未选中的控件禁用）。
 fn draw_current_voice(app: &mut KaolsApp, ui: &mut egui::Ui) {
     let mut mode = app.voice_mode;
     let mut existing = app.voice_input.clone();

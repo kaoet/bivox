@@ -1,6 +1,6 @@
 //! 设置页：便携路径、API Key 写回、配置概览。
 //!
-//! 写回规则（GUI_MIGRATION.md D3）：本页只写 `[api] key`；音频设备在「音频」页设置。
+//! 写回规则（决策 D3，见 docs/decisions.md）：本页只写 `[api] key`；音频设备在「音频」页设置。
 //! 用 [`crate::config_edit`] 定点修改、写前校验、写前备份；其余字段只读展示。
 
 use eframe::egui;

@@ -1,6 +1,6 @@
 # 开发期启动脚本
 #
-# 便携模式要求 config.toml 与 exe 同目录（GUI_MIGRATION.md D4），
+# 便携模式要求 config.toml 与 exe 同目录（见 docs/decisions.md D4），
 # 而 `cargo run` 的 exe 在 target\<profile>\，所以这里只把仓库根目录的
 # config.toml 复制过去，并把这份副本的 `[tts] cache_file` 指向仓库根的
 # voice_cache.json（相对 target\<profile>\ 向上两级）。

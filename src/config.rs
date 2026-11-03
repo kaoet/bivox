@@ -68,7 +68,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
-    /// 百炼 API Key（原 `DASHSCOPE_API_KEY` 环境变量）。
+    /// 百炼 API Key（只从配置文件读取，不读环境变量）。
     pub key: Option<String>,
 
     /// 业务空间专属域名 Host（不含 `wss://` 与路径）。

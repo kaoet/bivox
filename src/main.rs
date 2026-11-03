@@ -1,7 +1,7 @@
 //! GUI 入口。
 //!
 //! 只做三件事：定位便携目录 → 单实例检查 → 交给 [`kaols::app::run`]。
-//! 具体的日志、崩溃钩子、配置准备都在 `app::run` 里完成（见 GUI_MIGRATION.md D4/D8/D17）。
+//! 具体的日志、崩溃钩子、配置准备都在 `app::run` 里完成（见 docs/decisions.md D4/D8/D17）。
 
 // release 构建不弹控制台；debug 保留控制台，方便直接看 panic 与日志输出。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

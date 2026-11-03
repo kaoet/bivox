@@ -13,7 +13,7 @@ renderer-wgpu = ["eframe/wgpu"]
 renderer-glow = ["eframe/glow"]
 
 [dependencies]
-# GUI：立即模式框架，版本钉死（见 GUI_MIGRATION.md D1/D15）。
+# GUI：立即模式框架，版本钉死（见 docs/decisions.md D1/D15）。
 # 两个后端共用这些基础特性；渲染后端由上面的 feature 决定。
 eframe = { version = "=0.37.0", default-features = false, features = [
     "default_fonts",
@@ -33,7 +33,7 @@ cpal = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
-# GUI 定点写回配置：保留注释与未改动的字段（见 GUI_MIGRATION.md D3）
+# GUI 定点写回配置：保留注释与未改动的字段（见 docs/decisions.md D3）
 toml_edit = "0.25"
 # clap / colored 仅供调试 CLI（src/bin/admin.rs），GUI 主程序不用
 clap = { version = "4.5", features = ["derive"] }

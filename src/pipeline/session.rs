@@ -1,6 +1,6 @@
-//! 实时管线会话（M2）：把「ASR → 语言判定 → 分块 → TTS → 播放」包成可启动/停止的会话。
+//! 实时管线会话：把「ASR → 语言判定 → 分块 → TTS → 播放」包成可启动/停止的会话。
 //!
-//! 与 GUI 的边界（GUI_MIGRATION.md D6/D13）：
+//! 与 GUI 的边界（决策 D6/D13，见 docs/decisions.md）：
 //! - 只通过 [`PipelineEvent`] 向上汇报；
 //! - GUI 持有 [`PipelineSessionHandle`]（`Send + Clone`），不持有 cpal 的 `Stream`；
 //! - 停止时 GUI 调 `handle.stop()`，本任务退出前会 drop `AudioCapture` 并等后台任务结束，

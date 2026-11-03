@@ -1,4 +1,4 @@
-# 发布打包脚本（M5）
+# 发布打包脚本
 #
 # 产物：dist\kaols-<version>-win64.zip
 #   只包含 kaols.exe + README.md（不含 config.toml / config.example.toml / 调试工具 / 缓存 / 日志）。
