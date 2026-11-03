@@ -48,3 +48,21 @@ rubato = "5.0.1"
 audioadapter-buffers = "5.2.0"
 # 音色编辑器选择样例音频文件（Windows 原生文件对话框）
 rfd = "0.17"
+
+# 单实例：按 exe 路径哈希创建命名 Mutex（仅 Windows 需要）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# 把 assets/kaols.ico 写进 exe 资源（资源管理器/任务栏里的文件图标）
+winres = "0.1"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

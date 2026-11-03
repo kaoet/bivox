@@ -18,6 +18,42 @@ use chrono::Local;
 /// 界面日志面板保留的最大行数（D16）。
 pub const MAX_LOG_LINES: usize = 5000;
 
+/// 按天日志文件保留天数（含当天，M5）。
+pub const LOG_RETENTION_DAYS: i64 = 7;
+
+/// 删除超过保留期的按天日志文件（`kaols-YYYY-MM-DD.log`），返回删除数量。
+///
+/// 只处理本程序命名的文件；其它文件（用户放的说明、`.bak` 等）一律不动。
+pub fn cleanup_old_logs(log_dir: &Path, today: chrono::NaiveDate) -> usize {
+    let cutoff = today - chrono::Duration::days(LOG_RETENTION_DAYS - 1);
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(date_part) = name
+            .strip_prefix("kaols-")
+            .and_then(|rest| rest.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        let Ok(date) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < cutoff {
+            // best-effort: 清理失败不影响启动，下次启动再试
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 /// 一条待展示的日志。
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -229,5 +265,38 @@ mod tests {
     #[test]
     fn strip_ansi_keeps_unicode_and_emoji() {
         assert_eq!(strip_ansi("⬆️ 已上传样例音频"), "⬆️ 已上传样例音频");
+    }
+
+    #[test]
+    fn cleanup_removes_only_expired_kaols_logs() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("kaols-log-cleanup-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        // 保留窗口：today 和之前 6 天（cutoff = today - 6）
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
+        for name in [
+            "kaols-2026-10-20.log", // 过期
+            "kaols-2026-10-27.log", // 过期（cutoff=2026-10-28）
+            "kaols-2026-10-28.log", // 保留（边界）
+            "kaols-2026-11-03.log", // 今天
+            "notes.txt",            // 非日志文件
+            "kaols-bad-date.log",   // 格式不合法
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        assert_eq!(cleanup_old_logs(&dir, today), 2);
+        assert!(!dir.join("kaols-2026-10-20.log").exists());
+        assert!(!dir.join("kaols-2026-10-27.log").exists());
+        assert!(dir.join("kaols-2026-10-28.log").exists());
+        assert!(dir.join("kaols-2026-11-03.log").exists());
+        assert!(dir.join("notes.txt").exists());
+        assert!(dir.join("kaols-bad-date.log").exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

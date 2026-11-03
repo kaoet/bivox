@@ -1,4 +1,6 @@
 /target
+# 发布打包产物（scripts/package.ps1 输出），不提交
+/dist
 # 含 API Key 的本地配置，不提交
 /config.toml
 # GUI 写回配置前的备份（便携模式运行产物）

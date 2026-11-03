@@ -20,4 +20,6 @@ pub mod language;
 pub mod log_sink;
 pub mod paths;
 pub mod pipeline;
+#[cfg(windows)]
+pub mod single_instance;
 pub mod voice;

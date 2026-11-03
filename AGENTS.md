@@ -32,6 +32,8 @@ cargo test                # 全部单元测试（含本地 mock WebSocket / HTTP
 .\scripts\dev-run.ps1         # 开发期启动：复制 config.toml 到 target\debug（cache_file 指回仓库根 voice_cache.json）再运行
 .\scripts\dev-run.ps1 -Glow   # 同上，但用 glow/OpenGL 后端（截图核对时用）
 .\scripts\dev-run.ps1 -NoRun  # 只准备 target 目录，不启动 GUI（脚本自检用）
+.\scripts\package.ps1         # 发布打包：dist\kaols-<version>-win64.zip（仅 exe + README）
+.\scripts\package.ps1 -NoBuild # 用现有 target\release\kaols.exe 打包
 
 # 百炼音色调试 CLI（默认读当前目录 config.toml，可用 -c 指定）
 cargo run --bin admin -- list
@@ -48,12 +50,14 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 
 ## 项目结构速览
 
-- `src/main.rs`：GUI 入口（eframe），只负责定位便携目录并调用 `app::run`；release 不弹控制台。
+- `src/main.rs`：GUI 入口（eframe），定位便携目录、单实例检查后调用 `app::run`；release 不弹控制台。
 - `src/lib.rs`：库入口，暴露全部模块（两个 bin 共用）。
-- `src/app.rs`：应用状态、面板布局、事件泵、关闭流程、启动准备（日志/崩溃/默认配置）。
+- `src/app.rs`：应用状态、面板布局、事件泵、关闭流程、启动准备（日志/崩溃/默认配置/图标）。
+- `src/single_instance.rs`：单实例（Windows 命名 Mutex，按 exe 路径哈希；重复启动激活已有窗口后退出）。
+- `build.rs`：把 `assets/kaols.ico` 写入 exe 资源（文件图标）；窗口图标在 `app.rs` 里程序化生成。
 - `src/paths.rs`：便携路径解析 + 内置默认配置模板。
 - `src/config_edit.rs`：用 `toml_edit` 定点写回配置（只写 Key / 设备等指定字段），写前校验 + `.bak` 备份。
-- `src/log_sink.rs`：`log` 门面 → 内存环形缓冲（界面日志面板）+ 按天文件日志 + panic 钩子。
+- `src/log_sink.rs`：`log` 门面 → 内存环形缓冲（界面日志面板）+ 按天文件日志（保留 7 天）+ panic 钩子。
 - `src/gui/`：工具栏、实时/音频/语音合成/设置页签、日志面板、通用部件（每个文件 ≤ 300 行）。
 - `src/config.rs`：TOML 配置加载与校验（API Key、业务空间域名、设备、ASR/TTS 模型、
   `[asr] languages`、多语言自定义音色样本、VAD 参数）。
@@ -89,6 +93,9 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
   远程音色的列出/删除只走 `admin` 调试 CLI（D11/D19）。
 - **便携模式**：配置/缓存/日志/崩溃文件都在 exe 同目录，不写系统目录、不读环境变量改配置路径
   （唯一例外是调试用的 `EGUI_INSPECTION`，它只开 inspection 端口）。
+- **单实例 / 日志 / 发布**：同一目录只允许一个实例（`single_instance.rs` 命名 Mutex）；按天日志保留 7 天；
+  release 启用 `lto = "thin"` / `strip = true` / `codegen-units = 1`；发版用 `scripts/package.ps1`，
+  zip 只含 `kaols.exe` + `README.md`（不含 `config.toml`、密钥、调试工具）。
 - **构建门禁**同时覆盖两个 bin：`cargo fmt --check && cargo build --bins && cargo test`。
 - **调试**：`EGUI_INSPECTION=1` 启动 GUI，可接 egui_mcp 让 agent 读控件树/点击/截图（GUI_MIGRATION.md §11）。
 

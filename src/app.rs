@@ -838,6 +838,61 @@ fn preferred_renderer() -> eframe::Renderer {
     eframe::Renderer::Glow
 }
 
+/// 窗口图标（与 `assets/kaols.ico` 同设计：深色圆角底 + 绿色声波柱）。
+///
+/// 程序化生成，避免运行时依赖图片解码库；exe 文件图标由 `build.rs` + `assets/kaols.ico` 提供。
+fn app_icon() -> egui::IconData {
+    const SIZE: usize = 64;
+    const RADIUS: f32 = 14.0;
+    const BG: [u8; 4] = [31, 36, 48, 255];
+    const GREEN: [u8; 4] = [60, 201, 111, 255];
+    // 每根声波柱：(中心 x, 半高)
+    const BARS: [(f32, f32); 5] = [
+        (18.0, 14.0),
+        (26.0, 7.0),
+        (34.0, 19.0),
+        (42.0, 10.0),
+        (50.0, 5.0),
+    ];
+
+    let size = SIZE as f32;
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
+            // 圆角矩形判定：把点夹到内缩矩形上，看是否落在圆角半径内
+            let dx = if xf < RADIUS {
+                RADIUS - xf
+            } else if xf > size - RADIUS {
+                xf - (size - RADIUS)
+            } else {
+                0.0
+            };
+            let dy = if yf < RADIUS {
+                RADIUS - yf
+            } else if yf > size - RADIUS {
+                yf - (size - RADIUS)
+            } else {
+                0.0
+            };
+            if dx * dx + dy * dy > RADIUS * RADIUS {
+                continue;
+            }
+            let on_bar = BARS
+                .iter()
+                .any(|&(cx, half)| (xf - cx).abs() <= 2.0 && (yf - 32.0).abs() <= half);
+            let color = if on_bar { GREEN } else { BG };
+            let offset = (y * SIZE + x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&color);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
+
 /// GUI 入口：完成启动准备后进入 eframe 事件循环。
 pub fn run(paths: AppPaths) -> ExitCode {
     // 尽可能早地安装崩溃钩子：release 构建没有控制台，这是唯一的崩溃线索。
@@ -863,8 +918,17 @@ pub fn run(paths: AppPaths) -> ExitCode {
         }
     };
 
+    let removed_logs =
+        log_sink::cleanup_old_logs(&paths.log_dir, chrono::Local::now().date_naive());
+
     if let Err(err) = log_sink::init(&paths.log_dir) {
         record_error(format!("初始化日志失败：{err}"));
+    }
+    if removed_logs > 0 {
+        info!(
+            "已清理 {removed_logs} 个过期日志文件（保留 {} 天）",
+            log_sink::LOG_RETENTION_DAYS
+        );
     }
 
     info!(
@@ -897,6 +961,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
         renderer: preferred_renderer(),
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
+            .with_icon(app_icon())
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()

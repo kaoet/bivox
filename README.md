@@ -1,162 +1,100 @@
-# kaols (超低延迟流式语音识别与语音合成客户端)
+# kaols — 超低延迟实时语音识别 / 语音合成（Windows GUI）
 
-面向实时对话与 VRChat 场景的 **超低延迟** 语音识别与合成客户端原型（MVP）。
+基于阿里云百炼 **Qwen-Audio** 的实时语音识别（ASR）与语音合成（TTS）桌面客户端，面向实时对话、VRChat 等低延迟场景。
 
-> **迁移中**：本仓库正在从 CLI 迁移到纯 GUI（计划与决策见 [GUI_MIGRATION.md](GUI_MIGRATION.md)）。
-> 当前 `master` 已有 GUI 骨架（M0）与独立的百炼音色调试 CLI `admin`（M4）；
-> 下面的 CLI 用法在迁移完成前仍然有效，迁移完成后会被 GUI 用法替换。
+全双工流式流水线：麦克风采集 → 流式 ASR → 按标点/语义分块 → 流式 TTS → 平滑播放，无需等整句说完。
 
-不同于传统工具（如 VRCLS）的“整句录音等待 $\to$ 批量上传 $\to$ 整句 TTS”瀑布式流程，`kaols` 采用 **全双工流式流水线**：
-1. **音频采集**：通过 `cpal` 原生采集麦克风输入，100ms 切片持续推流。
-2. **实时流式识别**：直连阿里百炼 **`qwen-audio-3.1-asr-flash-streaming`**，在服务端流式输出转写文本。
-3. **流式切片 (Streaming Chunking)**：命中标点或达到 5~8 词语义断点时，立即切块触发语音合成，无需等待整句说完。
-4. **Qwen-Audio-TTS 实时合成**：通过百炼 **`qwen-audio-3.1-tts-flash`** WebSocket 流式接收 PCM 音频。
-5. **无缝平滑播放**：环形缓冲队列平滑连续播放，并支持新发言或打断信号即时清空旧语音。
+- 纯 GUI（egui/eframe），**便携模式**：配置、缓存、日志都在 exe 同目录，整个文件夹拷走即用；
+- **单实例**：同一目录只允许开一个窗口，重复启动会激活已有窗口；
+- 本地 VAD 门控、实时字幕（语言代码 + TTS 进度分色）、多语言自定义（复刻）音色。
 
 ---
 
-## 快速上手
+## 快速开始
 
-### 1. 创建配置文件
+1. 解压发布包（`kaols.exe` + `README.md`）到一个**可写目录**；
+2. 双击 `kaols.exe`：首次启动会在 exe 同目录生成 `config.toml` 并落在「设置」页；
+3. 在「设置」页填入百炼 API Key（[控制台](https://bailian.console.aliyun.com/)），点「保存」；
+4. 回到「实时」页点「开始」，对着麦克风说话即可看到字幕并听到合成语音。
 
-复制示例配置，并填入百炼 API Key（获取地址：https://bailian.console.aliyun.com/）：
+> 单实例行为：第二次启动会尝试把已有窗口恢复到前台并退出，不会抢麦克风。
 
-```bash
-cp config.example.toml config.toml     # Windows: copy config.example.toml config.toml
+### 目录结构（便携模式）
+
 ```
+kaols.exe
+config.toml          # 首次启动生成；含 API Key，注意保密
+voice_cache.json     # 自定义音色复刻缓存（模型 → 音频指纹 → voice_id）
+logs\kaols-YYYY-MM-DD.log  # 按天日志，保留最近 7 天
+crash.log            # 崩溃信息（如有）
+```
+
+程序只读 **exe 所在目录**的 `config.toml`，不读 `%APPDATA%`、当前工作目录或环境变量。
+
+---
+
+## 界面
+
+| 页签 | 说明 |
+|---|---|
+| 实时 | 「开始 / 停止」、VAD 指示器、实时字幕（最新句在最上，语言代码在左）；支持单句复制 |
+| 音频 | 选择输入 / 输出设备（完整设备名精确匹配），保存后配置热更新 |
+| 语音合成 | 顶部选择「当前音色」；下方编辑自定义音色（显示名、键名、多语言声线样本、拖拽排序） |
+| 设置 | API Key、接入域名、重新加载配置、打开程序目录、版本信息 |
+| 底部日志 | 运行日志（5000 行环形缓冲），可直接排查连接/识别/合成问题 |
+
+### 当前音色
+
+顶部 Radio 二选一，未选中的一侧控件禁用：
+
+- **现有音色**：输入框，填内置音色名（如 `qiaoxiaojiao_v3.1`）或任意百炼 voice_id；
+- **自定义音色**：下拉选择 `[tts.custom_voices]` 里的条目（写入 `custom:<键名>`）。
+
+改动后点页面右上角 **保存** 一次写回 `config.toml`；**放弃更改** 同时还原当前音色与下方的音色编辑草稿。
+运行中保存会按「配置热更新」自动用新配置重启管线。
+
+内置音色没有可查询的列表 API（官方只有文档表：[Qwen-Audio-TTS 音色列表](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list)），因此用输入框填写 voice id。
+
+---
+
+## 配置说明
+
+`config.toml` 首次启动自动生成，完整注释见文件本身。常用字段：
 
 ```toml
 [api]
-key = "sk-your-dashscope-api-key-here"
-```
+key = "sk-..."                 # 必填
+# workspace_host = "ws-xxxx.cn-beijing.maas.aliyuncs.com"  # 业务空间专属域名（纯 host）
 
-`config.toml` 已被 `.gitignore` 忽略，不会被提交。所有配置项都有默认值，完整字段见 [`config.example.toml`](config.example.toml)。
+[asr]
+# model = "qwen-audio-3.1-asr-flash-streaming"
+languages = ["zh", "ja"]       # 有序；只写一个 = 强提示该语言
 
-默认读取当前工作目录下的 `config.toml`；也可以指定其它路径：
+[tts]
+# model = "qwen-audio-3.1-tts-flash"
+voice = "qiaoxiaojiao_v3.1"    # 系统音色名 / 复刻 voice_id / custom:<配置名>
 
-```bash
-cargo run --release -- --config path/to/config.toml
-# 或使用短参数
-cargo run --release -- -c path/to/config.toml
-```
-
----
-
-### 2. 百炼接入域名（默认使用通用域名）
-
-默认使用百炼通用接入域名 `dashscope.aliyuncs.com`，无需额外配置：
-
-```bash
-cargo run --release
-```
-
-如果控制台开通了业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），可在 `config.toml` 中覆盖：
-
-```toml
-[api]
-workspace_host = "ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com"
-```
-
-`workspace_host` 只填写纯 host，不要带 `wss://` 前缀、路径或端口；格式不规范时程序会在启动阶段直接报错。语音识别/合成的 WebSocket 连接与音色管理的 HTTP 接口都使用这个域名。
-
----
-
-### 3. 常用运行命令
-
-#### 默认启动（使用系统默认麦克风与扬声器）：
-```bash
-cargo run --release
-# 等价于显式指定默认子命令
-cargo run --release -- run
-```
-
-#### 查看系统中所有可用音频设备（输入与输出，无需配置文件）：
-```bash
-cargo run -- devices
-```
-
-#### 指定特定麦克风与虚拟声卡（输出到 VRChat）：
-```toml
 [audio]
-input_device = "Microphone"
-output_device = "CABLE Input"
-```
+# input_device = "Microphone (USB Audio)"
+# output_device = "CABLE Input (VB-Audio Virtual Cable)"   # 不填 = 系统默认
 
-设备名称支持模糊匹配（不区分大小写）；留空或不写表示系统默认设备。
-
-#### 本地 VAD（默认开启，节省 ASR 费用）：
-
-```toml
 [vad]
-# 关闭 VAD（全量上传，便于对比 / 排查）
-enabled = false
-
-# 打印每个 100ms chunk 的电平、噪声底、阈值与发送决策，用于现场标定
-debug = true
-
-# 起音阈值 = 噪声底 + margin dB；hangover = 语音结束拖尾；tail = 句末静音
+enabled = true                 # 只上传语音段，省 ASR 费用
 margin_db = 9.0
 hangover_ms = 500
 tail_ms = 1000
+
+[chunking]
+words = 6                      # 投机分块阈值
 ```
 
-调参提示：安静说话被切掉时降低 `margin_db`（如 6）；键盘/环境噪声频繁触发时提高它（如 12）。
+`[audio]` 设备名按**完整名称精确匹配**：设备改名/被拔掉会明确报错，不会静默回退。
 
----
+### 自定义（复刻）音色
 
-## 多语言识别与声线
-
-### 1. `[asr] languages`：用户可能说的语言
+一个音色可以有多份不同语言的声线样本，合成时按本句判定的语言选样本（缺该语言回退第一个样本）：
 
 ```toml
-[asr]
-languages = ["zh", "ja", "en"]
-```
-
-- 有序列表，**首个元素是默认语言**；
-- 只写一个元素（如 `["ja"]`）相当于强提示只按该语言识别；
-
-### 2. 语言判定规则（不等待整句、不回溯）
-
-每个 TTS task（约等于一个 ASR 句子）在首个 chunk 送出前判定一次，之后整句沿用：
-
-- 出现**假名** → 日语；出现**谚文** → 韩语（这两类字符不会被中文/英文使用，属于强证据）；
-- **纯汉字句**：当前是日语且汉字数 ≥ 6 且无假名 → 切回中文；更短的汉字句保持当前语言（粘性）；
-- **拉丁字母**必须"占多数"（`拉丁数 ≥ 2` 且多于汉字）才算证据：`我找不到我的 U盘了` 不会被误判为英语；
-- 文本太短（< 2 个文字）或证据不足 → 沿用当前语言；
-- 判定结果不在 `languages` 列表中 → 落到 `languages[0]`；
-- 不等待整句、不额外调用语言识别模型；因此句尾才出现决定性字符时可能错判一句，下一句自动纠正。
-
-自动判定的脚本覆盖范围：
-
-- 中日韩：假名 / 谚文 / 汉字（规则如上）；
-- 拉丁字母语系：**无法区分具体语种**，归一到 `languages` 中出现的第一个拉丁语言（如 `["zh","en"]` 下识别为 en）；
-- 其它可映射脚本：西里尔→`ru`、阿拉伯→`ar`、泰文→`th`、希腊→`el`、天城文→`hi`；
-- 其它未覆盖文字 → 落到 `languages[0]`。
-
-### 3. 合成语言参数
-
-每个 TTS 句子的 `run-task` 都会带：
-
-- `language_hints`: 本句判定出的语言（官方说明：合成目标语言，与复刻样本语种无关）；
-- `instruction`: 有内置映射的非中英语种自动附带（ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar，如 `请讲日语。`）；
-  中英文不需要；其它 ASR-only 语种（nl/sv/no/hi/el 等）`language_hints` 使用 `other`、不附 instruction。
-
----
-
-## 自定义音色（声音复刻，多语言声线）
-
-无需在百炼控制台手动上传音频：在配置文件中声明每个语言的样本，程序会自动上传、复刻、缓存。
-
-### 1. 配置
-
-```toml
-[tts]
-model = "qwen-audio-3.1-tts-flash"
-voice = "custom:edgar"
-# cache_file = "voice_cache.json"
-
-# 先定义父表，再写 samples 数组表
 [tts.custom_voices.edgar]
 name = "异环 - 埃德嘉"
 
@@ -169,88 +107,51 @@ language = "ja"
 audio = "samples/edgar-ja.wav"
 ```
 
-- `samples` 是**有序数组**，`samples[0]` 是默认声线样本；
-- 每个样本都会按（`[tts] model`, 音频内容）单独复刻一个 voice_id；
-- 合成时：本句语言有对应样本 → 用该语言声线；没有 → 回退 `samples[0]`；
-- 三种常见来源都适用：
-  1. 同一个人多种语言录音（各自复刻，声线一致、母语发音更好）；
-  2. 游戏角色不同语言由不同配音演员录制（各语言用各自配音声线）；
-  3. 只有一种语言的网络样本（其它语言回退到该声线，合成时仍按目标语言发音，"凑合可用"）；
-- 音频要求：清晰单说话人、至少约 5 秒（推荐 10~20 秒，单条建议不超过 60 秒，≤10 MB）、wav/mp3/m4a；
-- 前缀：只由**配置键名**自动生成（去掉非字母数字、转小写；多语言追加语言代码，如 `edgarzh`/`edgarja`，≤10 字符）；建议键名使用 ASCII 小写字母/数字（非 ASCII 键名净化后可能为空，回退 `voice` 或只剩语言代码）。
-
-### 2. 首次使用
-
-启动程序（或执行 `kaols voices enroll`）时，对每个语言样本：
-
-1. 读取样例音频并计算内容指纹（SHA256）；
-2. 上传到百炼文件服务（`purpose=inference`）并换取临时下载 URL；
-3. 调用音色复刻接口创建音色，轮询到部署完成；
-4. 把 `模型 + 音频指纹 -> voice_id` 写入 `voice_cache.json`，清理临时文件。
-
-多个语言样本会**并行注册**（首次约十几秒到几十秒）；之后启动只读一次音频并逐样本
-`query_voice` 校验，**不会重复上传或复刻**。缓存命中后若云端音色被删除会自动重建；
-校验请求失败（网络抖动）时继续信任缓存。
-
-### 3. 缓存文件
-
-- 默认位置：与 `config.toml` 同目录的 `voice_cache.json`（已被 `.gitignore` 忽略）；
-- 按「TTS 模型 → 样例音频 SHA256」两层组织；每种语言样本因音频不同天然独立缓存；
-- 切换模型时为该模型单独复刻并缓存，不影响其它模型记录。
-
-### 4. 管理账号下的自定义音色
-
-```bash
-# 列出百炼账号下全部自定义音色（交叉显示本地缓存的音色名/语言/音频）
-cargo run --release -- voices list
-
-# 删除指定百炼原生 voice_id
-cargo run --release -- voices delete --voice-id qwen-audio-3.1-tts-flash-edgarzh-xxxx
-
-# 删除某个音色配置下的全部语言声线
-cargo run --release -- voices delete --voice edgar
-
-# 只删除某个音色的指定语言声线
-cargo run --release -- voices delete --voice edgar --language ja
-
-# 删除账号下全部自定义音色（交互确认；-y 跳过）
-cargo run --release -- voices delete-all
-cargo run --release -- voices delete-all -y
-
-# 立即上传并注册配置里的自定义音色（可指定音色名 / 语言）
-cargo run --release -- voices enroll
-cargo run --release -- voices enroll edgar --language ja
-```
-
-- 多目标删除（`--voice` 命中多个语言）默认需要交互确认，`-y` 跳过；
-- 删除后会同步清理对应的本地缓存记录；
-- `voices list` 会清理“云端已删除”的缓存记录（列表不完整时跳过，避免误删）。
-
-> ⚠️ `delete-all` 会删除该百炼账号下**全部**自定义音色（包括其它工具创建的），请确认后再执行。
+- 样本音频：清晰单人、≥5 秒（推荐 10–20 秒）、≤10 MB，wav/mp3/m4a；
+- 每个样本按（TTS 模型, 音频内容指纹）复刻一次并写入 `voice_cache.json`，重复启动不会重复上传；
+- 删除 `voice_cache.json` 只会导致下次重新复刻；
+- GUI 保存会整体重写 `[tts.custom_voices]`（表内注释不保留），写前校验并备份 `config.toml.bak`。
 
 ---
 
-## 命令行
+## 调试 CLI（`admin`）
 
-不写子命令时默认进入运行模式（等价于 `kaols run`）：
+发布包**不含**调试工具；开发构建里可用：`cargo run --bin admin -- list` / `delete --voice-id <id>`，用于查看/删除百炼账号下的远程复刻音色（不读写缓存、不做前缀过滤）。
 
-```bash
-kaols                       # 运行实时识别 -> 合成
-kaols -c other.toml         # 指定配置文件运行
-kaols run -c other.toml
-kaols devices               # 列出音频设备后退出（无需配置文件）
-kaols voices list           # 自定义音色管理
-kaols voices delete --voice-id <id>
-kaols voices delete --voice <配置名> [--language <code>] [-y]
-kaols voices delete-all [-y]
-kaols voices enroll [配置名] [--language <code>]
-kaols --help                # 查看全部子命令
-kaols voices --help
+---
+
+## 从源码构建
+
+```powershell
+cargo build --bins              # debug：kaols.exe + admin.exe
+cargo run                       # 直接运行 GUI
+cargo test                      # 单元测试
+
+.\scripts\dev-run.ps1           # 开发启动：复制 config.toml 到 target\debug 并共用根目录 voice_cache.json
+.\scripts\dev-run.ps1 -Glow     # 截图核对/OpenGL 兜底
+.\scripts\package.ps1           # 生成 dist\kaols-<version>-win64.zip（仅 exe + README）
 ```
 
-`-c/--config <path>` 是全局参数，任何子命令都可以用来指定配置文件（默认 `./config.toml`）。
+release 构建已启用 `lto = "thin"`、`strip = true`、`codegen-units = 1`；exe 图标在 `assets/kaols.ico`，由 `build.rs` 写入资源。
 
-> 语言代码一览：
-> - 复刻样本 / 合成完整支持：`zh/en/ja/ko/fr/de/ru/pt/th/id/vi/es/it/ms/fil/ar`；
-> - `[asr] languages` 还可用：`tl hi nl sv da fi no el pl cs hu ro bg hr sk`（以官方文档为准）；
-> - ASR 的菲律宾语代码是 `tl`、复刻是 `fil`，程序内部会自动归一。
+---
+
+## 故障排查
+
+- **启动提示未配置 API Key**：在「设置」页填写后保存，或编辑 `config.toml` 的 `[api] key` 后点「重新加载配置」；
+- **设备打不开/找不到**：到「音频」页重新选择设备（完整名称保存到配置）；
+- **GPU 初始化失败/远程桌面黑屏**：用 `renderer-glow` 变体构建（`cargo run --no-default-features --features renderer-glow`）；
+- **日志**：底部日志面板与 `logs\` 文件；崩溃看 `crash.log`。
+
+## 安全提示
+
+- `config.toml` 里是**明文 API Key**；不要把整个程序目录发给别人，发布 zip 里不含它；
+- 备份/分享目录等于分享 Key 与音色缓存，请自行评估风险；
+- 所有可写文件都在 exe 同目录，不需要管理员权限；建议放在可写目录（如 `D:\Apps\kaols`）。
+
+## 更多文档
+
+以下文档位于源码仓库（发布包只含本 README）：
+
+- 迁移计划与设计决策：`GUI_MIGRATION.md`
+- 开发约定：`AGENTS.md`

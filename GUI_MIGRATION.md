@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.52，**M0、M1、M2、M3、M4、D0 已完成**；下一步 M5（打包/图标/单实例/README）
+> **状态**：草案 v0.53，**M0–M5、D0 全部完成**；可发布（`scripts/package.ps1` → `dist/kaols-0.1.0-win64.zip`）
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -655,13 +655,15 @@ impl AppPaths {
 
 ### M5 打磨与发布
 
-- [ ] 应用图标（`ViewportBuilder::with_icon` + exe 资源，可选 `winres`）
-- [ ] 单实例（D17，命名 Mutex 按 exe 路径哈希）
-- [ ] 日志轮转与清理（保留 7 天）
-- [ ] `[profile.release]`：`lto = "thin"`、`strip = true`、`codegen-units = 1`；记录产物大小
-- [ ] `README.md` 改写（GUI 使用、便携模式、配置字段、安全提示、调试工具单独说明）
-- [ ] `AGENTS.md` 增补 GUI 约定（D15）
-- [ ] `scripts/package.ps1` → `dist/kaols-<ver>-win64.zip`（只含 `kaols.exe` + `README.md`；不含 `config.toml`、`config.example.toml`、调试工具）
+- [x] 应用图标（`ViewportBuilder::with_icon` 程序化窗口图标 + `build.rs`/`winres` 写入 `assets/kaols.ico` 作为 exe 资源）
+- [x] 单实例（D17，命名 Mutex 按 exe 路径哈希；重复启动激活已有窗口后退出）
+- [x] 日志轮转与清理（保留 7 天，启动时删除过期的 `kaols-YYYY-MM-DD.log`）
+- [x] `[profile.release]`：`lto = "thin"`、`strip = true`、`codegen-units = 1`；记录产物大小
+- [x] `README.md` 改写（GUI 使用、便携模式、配置字段、安全提示、调试工具单独说明）
+- [x] `AGENTS.md` 增补 GUI 约定（D15 / 单实例 / 日志 / 发布）
+- [x] `scripts/package.ps1` → `dist/kaols-<ver>-win64.zip`（只含 `kaols.exe` + `README.md`；不含 `config.toml`、`config.example.toml`、调试工具）
+
+**产物大小**：release `kaols.exe` ≈ **18.8 MB**（`lto="thin"` + `strip`），zip ≈ **7.8 MB**（仅 exe + README）。
 
 **验收**：干净机器解压到可写目录即用；整个目录拷到另一台机器后配置与缓存仍生效；zip 内无密钥
 **预估**：乐观 0.75 天 / 保守 1 天
@@ -841,3 +843,4 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.50 | 2026-11-01 | 修顶部「自定义音色」下拉与下方编辑器的键名同步：下拉正选中某音色时，在下方把配置键名 `kaoet` 改成 `kaoet2`，原来下拉会因找不到旧键名而退化成显示原始 `kaoet`；现在写回草稿时同步更新 `voice_custom_key`（删除该音色时切到剩余第一个/清空）。验证：egui_mcp 实测改名后下拉立即显示 `Kaoet（kaoet2）`，保存后配置生成 `[tts.custom_voices.kaoet2]` 且 `voice = "custom:kaoet2"`；fmt / clippy 0 警告 / 134 测试 |
 | v0.51 | 2026-11-01 | 修字幕历史去重把「两次相同的真实发音」也合并成一条的问题：原来按"与上一句文本相同"去重；现在把 ASR 的 `sentence_id` 一路透传（`AsrSentence` → `AsrEvent` → `PipelineEvent::Asr` → `SubtitleState`），只在**同一 sentence_id 重复下发最终结果**时忽略，相同文本的不同句（不同 id）都保留；空文本+句终的重置信号会清掉记录的 id（断线重连后 id 可能重新计数）。新增/调整 2 个单测（同 id 只记一次、相同文本不同 id 两条），ASR 解析测试断言 id；fmt / clippy 0 警告 / **135** 测试 |
 | v0.52 | 2026-11-01 | 修字幕语言列与 TTS 实际使用语言不一致：TTS 每个 task 在**首 chunk** 固定 `voice` / `language_hints` / `instruction`，而会话原来在**每个 ASR 句终事件**就清空 `sentence_language`——若该句终事件没有产生新的句终 chunk（chunker 已消费完），TTS task 仍开着，下一句的 chunk 会作为旧 task 的续写（沿用旧语言），GUI 却已按新判定显示语言。现在会话跟踪 `tts_task_language`：只有真正启动 TTS task 的首 chunk 才设置，直到该 task 收到 `is_sentence_end` chunk 才清空，`PipelineEvent::Asr.language` 直接用它；ASR 句终但没有新文本时补发「空文本 + is_sentence_end」请求结束旧 task，`qwen_tts` 对空文本请求只发 finish-task（不追加空 continue-task；空闲收到则忽略），避免音色/语言漏到下一句。新增单测 `empty_final_chunk_only_sends_finish_task`；fmt / clippy 0 警告 / **136** 测试 |
+| v0.53 | 2026-11-03 | **M5 打磨与发布完成**：①单实例（`single_instance.rs`，按 exe 路径哈希的命名 Mutex；重复启动 `FindWindowW` 激活已有窗口后退出）；②应用图标（`assets/kaols.ico` 经 `build.rs`/`winres` 写入 exe 资源，窗口图标由 `app.rs` 程序化生成）；③日志轮转（启动清理超过 7 天的 `kaols-YYYY-MM-DD.log`）；④release profile `lto="thin"`/`strip=true`/`codegen-units=1`（exe ≈18.8 MB，zip ≈7.8 MB）；⑤`README.md` 按 GUI/便携模式重写；⑥`scripts/package.ps1` 生成 `dist/kaols-<ver>-win64.zip`（仅 exe+README）；⑦`AGENTS.md` 增补单实例/日志/发布约定。验证：`cargo fmt/clippy` 0 警告、**138** 测试；debug 双开实测第二个进程立即退出、只剩一个 kaols 进程；`ExtractAssociatedIcon` 能读到 exe 图标；zip 条目仅 `kaols.exe` + `README.md`（无 config/密钥/调试工具） |
