@@ -80,7 +80,7 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 
 ## GUI 约定
 
-- **版本钉死**：`eframe` / `egui_kittest` 固定 0.37.x，API 以 https://docs.rs/eframe/0.37.0/ 为准。
+- **版本钉死**：`eframe` 固定在 0.37.x（egui 系列同版本），API 以 https://docs.rs/eframe/0.37.0/ 为准。
 - `eframe::App` 的绘制方法是 `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)`；
   **不要**写旧版 `fn update(&mut self, ctx: &egui::Context, ...)`（模型训练数据里几乎全是旧签名）。
 - **UI 线程只做绘制与状态更新**：禁止在 UI 线程 `await` / 阻塞 / 做网络请求；

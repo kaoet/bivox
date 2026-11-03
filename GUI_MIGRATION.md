@@ -1,6 +1,6 @@
 # GUI 迁移计划：从 CLI 工具到纯 GUI 应用
 
-> **状态**：草案 v0.53，**M0–M5、D0 全部完成**；可发布（`scripts/package.ps1` → `dist/kaols-0.1.0-win64.zip`）
+> **状态**：草案 v0.55，**M0–M5 功能与发布完成**；仅 M5 的跨机便携验收未做真机验证（kittest 计划已按用户要求删除，UI 回归改用纯函数单测 + egui_mcp 手工验证，见 D14）。
 > **最后更新**：2026-11-01
 > **目标产物**：Windows 单机图形界面应用 `kaols.exe`（便携模式），外加一个独立的百炼音色调试 CLI（仅开发自用）
 
@@ -60,7 +60,6 @@
 | 组件 | 版本 | 许可 | 说明 |
 |---|---|---|---|
 | [eframe/egui](https://docs.rs/eframe/0.37.0/eframe/) | 0.37.0（2026-10-15） | MIT / Apache-2.0 | 纯 Rust 立即模式；`App::ui(&mut self, ui, frame)` 为当前签名 |
-| [egui_kittest](https://docs.rs/egui_kittest/0.37.0/egui_kittest/) | 0.37.0 | MIT / Apache-2.0 | 无头 UI 测试 + 快照 + MP4 录制 |
 | [egui_mcp](https://github.com/rerun-io/kittest_inspector) | 随 inspection 协议 | — | MCP server，让 AI agent 读写运行中的界面 |
 
 关键能力（官方 CHANGELOG，已在 0.35–0.37 落地）：
@@ -88,7 +87,7 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 ```
 
 - **两个后端都能用**：默认 `cargo build` 用 wgpu；`cargo build --no-default-features --features renderer-glow` 产出 OpenGL 版（唯一支持 `EFRAME_SCREENSHOT_TO` 截图的组合）。
-- **理由**：纯 Rust、单 exe、零运行时依赖；立即模式使 UI 与状态同处一个函数，最适合"控制面板 + 日志 + 字幕"这类工具；inspection + kittest 让 AI 能"看见并操作"界面。
+- **理由**：纯 Rust、单 exe、零运行时依赖；立即模式使 UI 与状态同处一个函数，最适合"控制面板 + 日志 + 字幕"这类工具；egui_mcp（inspection）让 AI 能"看见并操作"界面。
 - **不启用 `persistence`**：窗口状态不持久化（D17 决定），避免它默认写系统配置目录、破坏便携性。
 - **MSRV**：egui 0.37 要求 Rust ≥ 1.95；本机 1.99.1，满足。
 - **注意**：0.37 的 `eframe::App` 方法是 `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)`，网上教程与模型生成代码多为旧的 `update(&mut self, ctx, frame)`，见 D15。
@@ -239,18 +238,18 @@ eframe = { version = "=0.37.0", default-features = false, features = [
 3. 完成后 `ViewportCommand::Close` 真正退出。
 - `PipelineSession` 持有 `AudioCapture`（现 `orchestrator.rs` 用 `let _capture` 保活，逻辑搬进 session）。
 
-### D14 ✅ 可测试性：核心逻辑纯函数 + kittest 守门
+### D14 ✅ 可测试性：核心逻辑纯函数 + egui_mcp 手工回归
 
-- `egui_kittest` 作为 dev-dependency（`=0.37.0`），守门用例 3 条：
-  1. 配置无效时设置页显示具体错误（Query 到错误文本）；
-  2. 点「开始」状态变运行中、点「停止」回到空闲；
-  3. 投递 N 条日志事件后日志面板行数增长。
-- 纯函数（路径解析、`config_edit` 的 TOML 改写、音色草稿→TOML 映射、事件→UI 状态 reducer）必须带单测。
+- **决定（2026-11-03）：不接入 `egui_kittest`**（原计划的 3 条守门用例取消）。真实 UI 与音频设备/网络管线耦合，kittest 需要为每个用例 mock 设备与管线，成本高于收益。
+- 替代方案（当前执行）：
+  1. **纯函数单测**：路径解析、`config_edit` TOML 改写、音色草稿→TOML 映射、事件→字幕 reducer、语言判定、chunking、协议解析等（`cargo test`，共 138 用例）；
+  2. **egui_mcp 运行期观测**：`EGUI_INSPECTION=1` 启动，由开发/agent 真实点击 + 截图核对关键流程（见 §11）；
+  3. **发布前手工冒烟**：开始/停止、配置保存、双开单实例、release 启动等。
 - 现有 `voice/mock_http.rs` 继续用于调试工具与 `voice/api.rs` 的测试。
 
 ### D15 ✅ 版本与 AI 协作约定
 
-- `eframe`、`egui_kittest` 钉 `=0.37.0`；不自动跨小版本。
+- `eframe` 钉 `=0.37.0`（egui 系列同版本）；不自动跨小版本。
 - `AGENTS.md` 增补：
 
   ```markdown
@@ -591,7 +590,7 @@ impl AppPaths {
 - [x] 工具栏同步显示当前设备（长名截断到 24 字符，避免挤掉版本号）
 
 **实施说明**：
-- `[tts] voice` / `[tts.custom_voices]` 的写回按计划留到 M3（`set_active_voice`/`set_custom_voices` 未实现）。
+- `[tts] voice` / `[tts.custom_voices]` 的写回已在 M3（`config_edit::set_active_voice` / `set_custom_voices`）与 D22（顶部「当前音色」+ Tab 级保存）完成。
 - device 写回逻辑：下拉变更后调 `update_audio_devices`，与「恢复系统默认」走同一条写回/重载路径。
 - egui_mcp 验证：点「设置」→ 改 Key 保存（日志出现"已保存 API Key"，`.bak` 生成、其它字段保留）→ 点「恢复系统默认」（配置里 `input_device`/`output_device` 键被移除、工具栏变"系统默认"）→ 手工把配置改成不存在的设备名后点「重新加载配置」，界面出现"…不在当前设备列表中"警告。
 - 已知：通过 egui_mcp 注入点击 ComboBox 弹层里的选项不会生效（injected click 与 0.37 的 Popup 交互问题），因此设备写回用「恢复系统默认」按钮验证；真实鼠标操作不受影响。
@@ -606,7 +605,7 @@ impl AppPaths {
 - [x] 库内 `println!`/`eprintln!` 全部改为 `log::*!`（audio/client/voice/app；`admin` 与 `main` 启动前保留终端输出）
 - [x] `app.rs`：事件泵（每帧排空）、字幕状态、状态机、开始/停止、关窗先停会话
 - [x] 工具栏：开始 / 停止（按状态启用），状态灯颜色（「停止播放」按钮已在 v0.20 按用户要求移除）
-- [x] 字幕：当前句 + 历史句（上限 500、单句复制、全部复制、自动滚到底）
+- [x] 字幕：当前句 + 历史句（上限 500、仅单句复制；列表最新在上；D16）
 - [x] 停止后设备释放：实测连续 3 次开始→运行中→停止→空闲，无设备占用错误
 - [x] 失败路径：设备名不匹配实测得到 `Failed` + 红色错误横幅（"未找到输入设备 …"）；后台服务异常退出会被识别并上报 `Error`（用无效 Key 实测 401 场景）；无 Key 在 `start_session` 阶段直接提示
 
@@ -618,21 +617,20 @@ impl AppPaths {
 **验收**：实测说话 → 当前句刷新、历史句出现、TTS 音频有输出；停止→开始可恢复，连续 3 次不掉设备
 **预估**：乐观 1.5 天 / 保守 2.5 天（实际约 2 小时，含以 log 化与事件化重构）
 
-### M3 音色配置编辑器（D11）（已完成 ✅，kittest 用例未做）
+### M3 音色配置编辑器（D11）（已完成 ✅）
 
 - [x] `voice/editor.rs`：`drafts_from_config` / `drafts_to_entries`（纯函数）+ `config_audio_path`；5 个单测覆盖 roundtrip、显示名缺省、非法草稿、相对/绝对路径
 - [x] `config_edit.rs::set_custom_voices` / `set_active_voice`（整体替换该表 + 写前校验 + `.bak`；2 个单测）
-- [x] 语音合成页：左侧音色列表（显示名 + weak 键名 + 语言列表）+ 「＋ 新增音色」；右侧详情编辑显示名、配置键名、样本增删改、上/下移、首样本「默认声线」标注
+- [x] 语音合成页：左侧音色列表（显示名 + weak 键名 + 语言列表）+ 「＋ 新增音色」；右侧详情编辑显示名、配置键名、样本增删改、拖拽排序、首样本「默认声线」标注
 - [x] 语言下拉（`language::CLONING_LANGUAGES`）+ `rfd` 选择音频文件 + 路径不存在时琥珀色警告（保存时再校验，缺失则拒绝保存）
 - [x] 音频路径策略：选中的文件在 exe 目录内 → 写相对路径，否则绝对路径
-- [x] 生效音色：选中音色可点「设为当前音色」写 `[tts] voice = "custom:<键名>"`；删除当前生效音色引用的音色时，保存会自动切到剩余的第一个音色
+- [x] 当前音色：顶部 Radio「现有音色（输入内置名/voice_id）/ 自定义音色（下拉）」，Tab 级「保存/放弃更改」一次写回 `[tts] voice` + `[tts.custom_voices]`（D22）；不再有单独的「设为当前音色」按钮
 - [x] 保存后自动重载配置；运行中保存会按 D20 自动重启实时管线（不再只是"下次生效"）
-- [ ] kittest 用例：项目尚未接入 kittest 工具链，暂以纯逻辑单测 + egui_mcp 手工验证替代（D14 的 kittest 门禁仍待接入）
 
 **实施说明**：
 - 草稿与 `config` 分离：未点保存前只改 `app.voice_drafts`，界面用 `voice_drafts_dirty()`（与配置重新构造的草稿比较）显示「● 未保存」并控制按钮状态。
-- 未做的部分：内置（系统）音色列表选择——`[tts] voice` 的内置音色仍需手改 TOML；当前 UI 只提供自定义音色的"设为当前音色"。
-- egui_mcp 实测：选中「东雪莲」→ 改显示名为「东雪莲测试」→ 保存（日志"已保存自定义音色"，`config.toml` 的 `name` 更新、`.bak` 保存旧内容）→「设为当前音色」（`voice = "custom:dongxue"`，标题旁出现绿色"当前生效音色"）。
+- 内置（系统）音色：后来的 D22 在页面顶部提供「现有音色」输入框，可直接填内置音色名或任意 voice_id；自定义音色走下拉。官方没有可查询的内置音色列表 API，故不做下拉。
+- egui_mcp 实测（当时 UI）：选中「东雪莲」→ 改显示名为「东雪莲测试」→ 保存（日志"已保存自定义音色"，`config.toml` 的 `name` 更新、`.bak` 保存旧内容）→「设为当前音色」（`voice = "custom:dongxue"`，标题旁出现绿色"当前生效音色"）。该按钮与标记已在 D22/v0.49 移除，改为顶部「当前音色」+ Tab 级保存。
 
 **验收**：新增/删除/编辑音色并保存 → TOML 结构正确、表外注释保留；非法语言/重复语言/缺文件有明确错误且不落盘
 **预估**：乐观 1.5 天 / 保守 2 天（实际约 1.5 小时，含 `rfd` 接入）
@@ -664,6 +662,9 @@ impl AppPaths {
 - [x] `scripts/package.ps1` → `dist/kaols-<ver>-win64.zip`（只含 `kaols.exe` + `README.md`；不含 `config.toml`、`config.example.toml`、调试工具）
 
 **产物大小**：release `kaols.exe` ≈ **18.8 MB**（`lto="thin"` + `strip`），zip ≈ **7.8 MB**（仅 exe + README）。
+
+**剩余事项（M5 之后）**：
+- ⏳ M5 验收里的「干净机器解压到可写目录即用」「整个目录拷到另一台机器」尚未做真机跨机验证（本地 release 冒烟、便携目录行为已测）。
 
 **验收**：干净机器解压到可写目录即用；整个目录拷到另一台机器后配置与缓存仍生效；zip 内无密钥
 **预估**：乐观 0.75 天 / 保守 1 天
@@ -709,16 +710,16 @@ impl AppPaths {
 
 ## 10. AI 协作与质量门禁
 
-1. **版本钉死**：`eframe = "=0.37.0"`、`egui_kittest = "=0.37.0"`（dev）。
+1. **版本钉死**：`eframe = "=0.37.0"`（egui 系列同版本）。
 2. **每轮门禁**：`cargo fmt --check && cargo build --bins && cargo test`，失败把完整错误贴回模型；不允许 `--no-verify`。
 3. **文件规模**：`gui/` 下每个文件 ≤ 300 行，便于 AI 精确修改与 review。
-4. **运行期观测**：`EGUI_INSPECTION=1` + egui_mcp 让 agent 自己点一遍（DSH 接法见 §11）；kittest 做回归。
+4. **运行期观测**：`EGUI_INSPECTION=1` + egui_mcp 让 agent 自己点一遍（DSH 接法见 §11），由人/agent 截图核对关键流程。
 5. **截图核对**：wgpu 后端不支持 `EFRAME_SCREENSHOT_TO`（上游未实现），需要临时用 glow 变体构建：
    `$env:EFRAME_SCREENSHOT_TO="xxx.png"; cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"`
    —— 无交互截屏后自动退出。⚠️ 但 `egui::Grid` 之类会触发 multi-pass（`request_discard`）的组件
-   会让它抓到**空帧**（M0 实测）；需要截图核对的页面避免用 Grid，或用 kittest 语义断言替代。
+   会让它抓到**空帧**（M0 实测）；需要截图核对的页面避免用 Grid。
 6. **提交粒度**：一个里程碑一组 commit；提交前按 AGENTS.md 跑全套检查。
-7. **回归测试**：M2 起补 kittest 三条守门用例（见 D14）。
+7. **回归测试**：纯函数单测覆盖核心逻辑；UI 回归用 egui_mcp 真实点击 + 截图核对（D14）。
 
 ---
 
@@ -773,7 +774,7 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 
 | 需求 | 手段 |
 |---|---|
-| CI/离线的语义回归（按钮状态、错误文案） | `egui_kittest`（D14） |
+| 核心逻辑回归（配置/TOML/音色草稿/字幕 reducer/语言判定） | 纯函数单测 `cargo test`（D14） |
 | agent 操作真实窗口、复现交互 bug、截图核对 | egui_mcp + inspection（本节） |
 | 静态截图产物（可保存/对比） | glow 变体 + `EFRAME_SCREENSHOT_TO`（§10） |
 
@@ -844,3 +845,5 @@ DSH 自带 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`（bundle 内置，v
 | v0.51 | 2026-11-01 | 修字幕历史去重把「两次相同的真实发音」也合并成一条的问题：原来按"与上一句文本相同"去重；现在把 ASR 的 `sentence_id` 一路透传（`AsrSentence` → `AsrEvent` → `PipelineEvent::Asr` → `SubtitleState`），只在**同一 sentence_id 重复下发最终结果**时忽略，相同文本的不同句（不同 id）都保留；空文本+句终的重置信号会清掉记录的 id（断线重连后 id 可能重新计数）。新增/调整 2 个单测（同 id 只记一次、相同文本不同 id 两条），ASR 解析测试断言 id；fmt / clippy 0 警告 / **135** 测试 |
 | v0.52 | 2026-11-01 | 修字幕语言列与 TTS 实际使用语言不一致：TTS 每个 task 在**首 chunk** 固定 `voice` / `language_hints` / `instruction`，而会话原来在**每个 ASR 句终事件**就清空 `sentence_language`——若该句终事件没有产生新的句终 chunk（chunker 已消费完），TTS task 仍开着，下一句的 chunk 会作为旧 task 的续写（沿用旧语言），GUI 却已按新判定显示语言。现在会话跟踪 `tts_task_language`：只有真正启动 TTS task 的首 chunk 才设置，直到该 task 收到 `is_sentence_end` chunk 才清空，`PipelineEvent::Asr.language` 直接用它；ASR 句终但没有新文本时补发「空文本 + is_sentence_end」请求结束旧 task，`qwen_tts` 对空文本请求只发 finish-task（不追加空 continue-task；空闲收到则忽略），避免音色/语言漏到下一句。新增单测 `empty_final_chunk_only_sends_finish_task`；fmt / clippy 0 警告 / **136** 测试 |
 | v0.53 | 2026-11-03 | **M5 打磨与发布完成**：①单实例（`single_instance.rs`，按 exe 路径哈希的命名 Mutex；重复启动 `FindWindowW` 激活已有窗口后退出）；②应用图标（`assets/kaols.ico` 经 `build.rs`/`winres` 写入 exe 资源，窗口图标由 `app.rs` 程序化生成）；③日志轮转（启动清理超过 7 天的 `kaols-YYYY-MM-DD.log`）；④release profile `lto="thin"`/`strip=true`/`codegen-units=1`（exe ≈18.8 MB，zip ≈7.8 MB）；⑤`README.md` 按 GUI/便携模式重写；⑥`scripts/package.ps1` 生成 `dist/kaols-<ver>-win64.zip`（仅 exe+README）；⑦`AGENTS.md` 增补单实例/日志/发布约定。验证：`cargo fmt/clippy` 0 警告、**138** 测试；debug 双开实测第二个进程立即退出、只剩一个 kaols 进程；`ExtractAssociatedIcon` 能读到 exe 图标；zip 条目仅 `kaols.exe` + `README.md`（无 config/密钥/调试工具） |
+| v0.54 | 2026-11-03 | 文档一致性审计（代码无改动）：修正 M1「voice 写回未实现」、M2「字幕全部复制/自动滚到底」、M3「上/下移、设为当前音色、内置音色未支持」等已被后续版本推翻的说明；D14 状态改为 🟡 并写明 kittest 未接入；M5 增加「剩余事项」；状态行改为「M0–M5 功能完成，余 D14 kittest 门禁待定」 |
+| v0.55 | 2026-11-03 | 按用户要求**删除 kittest 计划**：D14 重写为「核心逻辑纯函数 + egui_mcp 手工回归」（不接入 egui_kittest）；D15 只钉 eframe/egui 0.37；§10 版本钉死/回归测试去掉 kittest；§11.4 工具分工表去掉 kittest 行；M3 勾掉 kittest 用例；状态行改为「M0–M5 功能与发布完成，仅剩跨机便携验收」 |
