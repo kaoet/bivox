@@ -30,13 +30,15 @@ pub struct QwenTtsConfig {
     pub ws_url: String,
 }
 
-/// 一个待合成的文本切片；`voice`/`language` 由上游按"本句语言"解析好。
+/// 一个待合成的文本切片；`voice` / `rate` / `language` 由上游按"本句语言"解析好。
 #[derive(Clone)]
 pub struct TtsChunkRequest {
     pub text: String,
     pub is_sentence_end: bool,
     /// 本句使用的百炼 voice（系统音色名、复刻 voice_id 等）。
     pub voice: String,
+    /// 本句的语速倍率（百炼 TTS `rate`，内置音色固定 1.0；复刻音色取所选样本的配置）。
+    pub rate: f32,
     /// 本句语言（ASR 语言代码），用于合成的 `language_hints` / `instruction`。
     pub language: String,
 }
@@ -103,6 +105,13 @@ impl ws::SessionState for TtsRuntime {
 enum ChunkWait {
     Chunk(TtsChunkRequest),
     End(SessionEnd),
+}
+
+/// 把 f32 语速转成 JSON 数值：先取最短十进制表示再解析为 f64，
+/// 避免 `f32 → f64` 的二进制尾差让报文里出现 `1.350000023841858` 这类值。
+fn rate_json(rate: f32) -> serde_json::Value {
+    let decimal = format!("{rate}").parse::<f64>().unwrap_or(f64::from(rate));
+    json!(decimal)
 }
 
 pub struct QwenTtsClient;
@@ -179,7 +188,7 @@ impl QwenTtsClient {
             // ===== 每个句子一个 task：run-task -> continue-task* -> finish-task =====
             let task_id = Uuid::new_v4().simple().to_string();
 
-            // 本句 task 的 voice / 语言在此固定；同句后续 chunk 共享
+            // 本句 task 的 voice / 语速 / 语言在此固定；同句后续 chunk 共享
             let mut parameters = json!({
                 "text_type": "PlainText",
                 "format": "pcm",
@@ -187,7 +196,7 @@ impl QwenTtsClient {
                 "voice": &first_chunk.voice,
                 "language_hints": [language::tts_language_hint(&first_chunk.language)],
                 "volume": 50,
-                "rate": 1.0,
+                "rate": rate_json(first_chunk.rate),
                 "pitch": 1.0
             });
             if let Some(instruction) = language::instruction_for(&first_chunk.language) {
@@ -514,6 +523,7 @@ mod tests {
                 text: "第一句。".to_string(),
                 is_sentence_end: true,
                 voice: "test-voice".to_string(),
+                rate: 1.0,
                 language: "zh".to_string(),
             })
             .await
@@ -523,6 +533,7 @@ mod tests {
                 text: "第二句。".to_string(),
                 is_sentence_end: true,
                 voice: "test-voice".to_string(),
+                rate: 1.0,
                 language: "zh".to_string(),
             })
             .await
@@ -610,6 +621,7 @@ mod tests {
                 text: "第一句".to_string(),
                 is_sentence_end: false,
                 voice: "test-voice".to_string(),
+                rate: 1.0,
                 language: "zh".to_string(),
             })
             .await
@@ -619,6 +631,7 @@ mod tests {
                 text: String::new(),
                 is_sentence_end: true,
                 voice: "test-voice".to_string(),
+                rate: 1.0,
                 language: "zh".to_string(),
             })
             .await
@@ -719,6 +732,7 @@ mod tests {
                 text: "第一句。".to_string(),
                 is_sentence_end: true,
                 voice: "test-voice".to_string(),
+                rate: 1.0,
                 language: "zh".to_string(),
             })
             .await
@@ -808,6 +822,7 @@ mod tests {
                 text: "こんにちは。".to_string(),
                 is_sentence_end: true,
                 voice: "custom-ja-voice".to_string(),
+                rate: 1.35,
                 language: "ja".to_string(),
             })
             .await
@@ -821,6 +836,7 @@ mod tests {
         assert_eq!(parameters["voice"], "custom-ja-voice");
         assert_eq!(parameters["language_hints"], json!(["ja"]));
         assert_eq!(parameters["instruction"], "请讲日语。");
+        assert_eq!(parameters["rate"], json!(1.35), "应使用本句样本的语速");
 
         is_running.store(false, Ordering::SeqCst);
         client.abort();

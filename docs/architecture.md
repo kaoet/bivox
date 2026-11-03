@@ -2,7 +2,7 @@
 
 面向项目开发与贡献者，描述 kaols 当前实现的结构、数据流、关键算法与边界。
 
-- “为什么这样设计”见 [decisions.md](./decisions.md)（`D1`–`D22`）；
+- “为什么这样设计”见 [decisions.md](./decisions.md)；
 - 用户可见行为以 `README.md` 为准；
 - 本文只描述当前代码，不记录历史版本或迁移过程。改动模块边界、数据流或算法时，请同步更新本文；新的长期设计取舍写到 [decisions.md](./decisions.md)。
 
@@ -71,7 +71,7 @@ src/
 │   ├── chunker.rs       流式文本分块
 │   └── session.rs       实时会话编排（ASR → 语言 → 分块 → TTS）
 ├── voice/
-│   ├── mod.rs           生效音色解析、样本复刻/缓存注册、语言→voice_id 映射
+│   ├── mod.rs           生效音色解析、样本复刻/缓存注册、语言→(voice_id, 语速) 映射
 │   ├── api.rs           百炼声音复刻 HTTP API（不依赖 SDK）
 │   ├── cache.rs         voice_cache.json（模型 → 音频 SHA256 → voice_id）
 │   ├── editor.rs        音色编辑草稿（config ↔ 草稿 ↔ 写回数据，纯函数）
@@ -214,7 +214,7 @@ main()
 | `[tts]` | `model` | `qwen-audio-3.1-tts-flash` | 合成模型 |
 | | `voice` | `qiaoxiaojiao_v3.1` | 系统音色名 / 复刻 voice_id / `custom:<键名>` |
 | | `cache_file` | `voice_cache.json` | 相对配置文件所在目录 |
-| | `custom_voices` | 空 | 键名 → { `name`, `samples[]` } |
+| | `custom_voices` | 空 | 键名 → { `name`, `samples[]`（每个样本含 `language` / `audio` / `rate`） } |
 | `[audio]` | `input_device` / `output_device` | 空 = 系统默认 | 完整设备名 |
 | `[vad]` | `enabled` | `true` | 关闭后全量上传 |
 | | `margin_db` | `9.0` | 起音阈值 = 噪声底 + 该值 |
@@ -232,14 +232,17 @@ name = "异环 - 埃德嘉"      # 可选显示名，默认用键名
 [[tts.custom_voices.edgar.samples]]
 language = "zh"             # 声音复刻语言代码
 audio = "samples/edgar-zh.wav"
+rate = 1.0                  # 可选合成语速，默认 1.0，范围 0.5–2.0
 
 [[tts.custom_voices.edgar.samples]]
 language = "ja"
 audio = "samples/edgar-ja.wav"
+rate = 1.0
 ```
 
 - `samples` 是**有序数组**，第一个是默认声线；
-- 每个样本按（TTS 模型, 音频内容 SHA256）单独复刻/缓存；
+- 每个样本按（TTS 模型, 音频内容 SHA256）单独复刻/缓存；`rate` 不参与该键，改语速不会重新复刻；
+- `rate` 属于**样本**（同一音色不同语言的声线可不同），默认 `1.0`，范围 `0.5`–`2.0`；
 - `language` 做别名归一（如 `tl` → `fil`），同一音色内归一后不允许重复。
 
 **校验规则**（`AppConfig::validate`）：
@@ -247,7 +250,7 @@ audio = "samples/edgar-ja.wav"
 - `[api] key` 必填；`workspace_host` 必须是纯 host（无协议、路径、端口、空白，标签合法且长度符合 DNS 规则）；
 - ASR/TTS model、TTS voice 非空；
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
-- 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；
+- 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
 - `[chunking] words > 0`；`[vad] margin_db` 必须是有限数。
 
 **派生 URL**：
@@ -266,7 +269,7 @@ audio = "samples/edgar-ja.wav"
 
 ### 4.4 配置指纹与热更新
 
-`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/缓存路径、设备、VAD 参数、分块阈值，以及按配置名排序的自定义音色与样本。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
+`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/缓存路径、设备、VAD 参数、分块阈值，以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
 
 写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。
 
@@ -320,7 +323,7 @@ audio = "samples/edgar-ja.wav"
 ### 7.1 协议
 
 - **每句一个 run-task**：`task_group=audio`、`task=tts`、`function=SpeechSynthesizer`、配置的 TTS 模型。
-- 每句首 chunk 固定参数：`format=pcm`、`sample_rate=22050`、`voice`、`language_hints=[tts_language_hint(语言)]`、`volume=50`、`rate=1.0`、`pitch=1.0`；非中英语种附加内置 `instruction`。同一 task 的后续 chunk 复用这些参数。
+- 每句首 chunk 固定参数：`format=pcm`、`sample_rate=22050`、`voice`、`language_hints=[tts_language_hint(语言)]`、`volume=50`、`rate`（取本句所用样本的语速；内置音色/普通 voice_id 固定 `1.0`，回退默认样本时用该样本的 `rate`）、`pitch=1.0`；非中英语种附加内置 `instruction`。同一 task 的后续 chunk 复用这些参数。
 - 文本通过 `continue-task` 逐段追加；句终发 `finish-task`；服务端返回二进制 PCM 帧，直接推入播放队列。
 - 单条 WS 连接跨句子长期复用（省 TLS/握手）；空闲与任务中都定期发 Ping 保活。
 
@@ -352,7 +355,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
   7. 判定结果不在 `allowed` 内 → 回退 `allowed[0]`。
 - 判定生命周期：**每个 TTS task 在首个 chunk 送出前判定一次并冻结**，同一 task 内后续 ASR 修订不再改语言；空文本 + 句终重置。
 - 合成参数：`language_hints` 用 `tts_language_hint`（复刻语言集合内直接用，否则 `other`）；`instruction_for` 为 ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar 提供中文指令，zh/en 不附加。
-- 这套判定与复刻样本语种无关；样本缺失目标语言时回退第一个样本（D11）。
+- 这套判定与复刻样本语种无关；样本缺失目标语言时回退第一个样本（连同其 `rate`，D11）。
 
 ---
 
@@ -414,13 +417,13 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 ### 11.1 配置与展示
 
 - 音色结构见 4.2；显示名 = `name`（缺省为配置键名）。
-- 合成时按本句语言找样本：先归一语言，命中该语言样本则用其 voice_id；否则回退第一个样本（D11）。
+- 合成时按本句语言找样本：先归一语言，命中该语言样本则用其 voice_id 与该样本的 `rate`；否则回退第一个样本（并用其 `rate`，D11）。
 
 ### 11.2 GUI 编辑草稿（`voice/editor.rs`）
 
-- `drafts_from_config`：配置 → `VoiceDraft`（键名、显示名、有序样本），按显示名/键名排序；
-- 界面只改草稿，直到点「保存」才写回；
-- `drafts_to_entries` 校验：键名非空且唯一、每个音色至少一个样本、语言合法且归一后唯一、音频路径非空；
+- `drafts_from_config`：配置 → `VoiceDraft`（键名、显示名、有序样本，样本含语言、音频路径与 `rate`），按显示名/键名排序；
+- 界面只改草稿，直到点「保存」才写回；每个样本一行「语速」滑条（0.5–2.0，步长 0.05）与「重置」；
+- `drafts_to_entries` 校验：键名非空且唯一、每个音色至少一个样本、语言合法且归一后唯一、音频路径非空、`rate` 为有限数且在 0.5–2.0 内；
 - 音频路径策略：选中的文件在 exe 目录内 → 存相对路径；目录外 → 存绝对路径并在界面提示可能破坏便携性；
 - 保存前还会检查每个样本音频文件存在；写回走 `config_edit::set_custom_voices`（整体替换该表）。
 
@@ -435,7 +438,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
    - 按音频内容 SHA256 分组（同一音频多语言只复刻一次）；
    - 每组先查缓存并调用 `query_voice` 校验：可用则复用；云端不存在则重新复刻；网络错误则标记“未校验”并先沿用缓存；
    - 未命中的音频上传 → 取临时下载 URL → `create_voice` → 轮询到就绪（最多 60s）→ 写缓存；注册任务并行执行，部分失败时保留已成功记录并返回错误；
-   - 汇总「语言（归一后）→ voice_id」，默认语言取第一个样本的语言。
+   - 汇总「语言（归一后）→ (voice_id, rate)」，默认语言取第一个样本的语言；`rate` 不参与复刻/缓存键。
 
 百炼音色前缀由配置键名自动生成：仅保留 ASCII 字母/数字、转小写，最多 10 字符；多语言样本追加语言后缀（如 `edgarzh`）。
 
@@ -480,7 +483,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 |---|---|---|
 | 实时 | 字幕列表 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16） |
 | 音频 | 输入/输出设备 | 设备下拉保存完整设备名；改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告 |
-| 语音合成 | 当前音色 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色；Tab 级保存/放弃更改；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频） |
+| 语音合成 | 当前音色 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色；Tab 级保存/放弃更改；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」） |
 | 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/模型/语言/音色；配置无效时显示错误链 |
 
 - 错误展示：启动横幅（黄）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
@@ -491,7 +494,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **138** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **142** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块、ASR/TTS 协议解析、缓存、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。

@@ -1,6 +1,6 @@
 //! 音色编辑草稿模型：`config.toml` ↔ 草稿 ↔ 写回数据（纯函数，便于单测）。
 //!
-//! GUI 流程：`drafts_from_config` 读出草稿 → 界面直接改草稿 →
+//! GUI 流程：`drafts_from_config` 读出草稿 → 界面直接改草稿（含每个样本的语速）→
 //! `drafts_to_entries` 校验并生成 `(配置键名, CustomVoiceConfig)` 列表 →
 //! `config_edit::set_custom_voices` 写回（写前校验 + `.bak`）。
 
@@ -8,10 +8,15 @@ use std::collections::HashSet;
 
 use anyhow::{bail, Result};
 
-use crate::config::{AppConfig, CustomVoiceConfig, CustomVoiceSample};
+use crate::config::{
+    is_valid_sample_rate, AppConfig, CustomVoiceConfig, CustomVoiceSample, DEFAULT_SAMPLE_RATE,
+    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+};
 
 /// 一个自定义音色的编辑草稿。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 不含 `Eq`：`rate` 是 `f32`，草稿比较只用于判断“是否有未保存改动”，`PartialEq` 足够。
+#[derive(Debug, Clone, PartialEq)]
 pub struct VoiceDraft {
     /// 配置键名（`[tts] voice = "custom:<key>"` 用它引用）。
     pub key: String,
@@ -22,12 +27,14 @@ pub struct VoiceDraft {
 }
 
 /// 一份声线样本草稿。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SampleDraft {
     /// 声音复刻语言代码（如 `zh` / `ja`）。
     pub language: String,
     /// 样例音频路径（相对 exe 目录或绝对路径）。
     pub audio: String,
+    /// 该样本的语速倍率（百炼 TTS `rate`，0.5–2.0，默认 1.0）。
+    pub rate: f32,
 }
 
 impl VoiceDraft {
@@ -42,6 +49,7 @@ impl VoiceDraft {
                 .map(|sample| SampleDraft {
                     language: sample.language.clone(),
                     audio: sample.audio.to_string_lossy().into_owned(),
+                    rate: sample.rate,
                 })
                 .collect(),
         }
@@ -61,6 +69,7 @@ impl VoiceDraft {
                 .map(|sample| CustomVoiceSample {
                     language: sample.language.trim().to_string(),
                     audio: std::path::PathBuf::from(sample.audio.trim()),
+                    rate: sample.rate,
                 })
                 .collect(),
         }
@@ -115,6 +124,13 @@ pub fn drafts_to_entries(drafts: &[VoiceDraft]) -> Result<Vec<(String, CustomVoi
             if sample.audio.trim().is_empty() {
                 bail!("音色 `{key}` 的语言 `{language}` 缺少样例音频");
             }
+            if !is_valid_sample_rate(sample.rate) {
+                bail!(
+                    "音色 `{key}` 的语言 `{language}` 的语速 {} 无效；\
+                     语速倍率必须在 {MIN_SAMPLE_RATE}~{MAX_SAMPLE_RATE} 之间（默认 {DEFAULT_SAMPLE_RATE}）",
+                    sample.rate
+                );
+            }
         }
 
         entries.push((key.to_string(), draft.to_config()));
@@ -147,6 +163,7 @@ name = "甲音色"
 [[tts.custom_voices.a.samples]]
 language = "zh"
 audio = "voices/a-zh.wav"
+rate = 1.2
 
 [tts.custom_voices.b]
 [[tts.custom_voices.b.samples]]
@@ -172,13 +189,19 @@ audio = "C:/voices/b-ja.wav"
         assert_eq!(drafts[1].key, "a");
         assert_eq!(drafts[1].display_name, "甲音色");
         assert_eq!(drafts[1].samples[0].language, "zh");
+        assert!((drafts[1].samples[0].rate - 1.2).abs() < 1e-6);
 
         let entries = drafts_to_entries(&drafts).unwrap();
         let a = &entries.iter().find(|(key, _)| key == "a").unwrap().1;
         assert_eq!(a.name.as_deref(), Some("甲音色"));
         assert_eq!(a.samples[0].audio.to_string_lossy(), "voices/a-zh.wav");
+        assert!((a.samples[0].rate - 1.2).abs() < 1e-6);
         let b = &entries.iter().find(|(key, _)| key == "b").unwrap().1;
         assert_eq!(b.samples[0].language, "ja");
+        assert_eq!(
+            b.samples[0].rate, DEFAULT_SAMPLE_RATE,
+            "未配置 rate 的样本应使用默认语速 1.0"
+        );
     }
 
     #[test]
@@ -189,6 +212,7 @@ audio = "C:/voices/b-ja.wav"
             samples: vec![SampleDraft {
                 language: "zh".to_string(),
                 audio: "a.wav".to_string(),
+                rate: DEFAULT_SAMPLE_RATE,
             }],
         };
         assert_eq!(draft.to_config().name, None);
@@ -201,6 +225,7 @@ audio = "C:/voices/b-ja.wav"
         let sample = |language: &str, audio: &str| SampleDraft {
             language: language.to_string(),
             audio: audio.to_string(),
+            rate: DEFAULT_SAMPLE_RATE,
         };
         let draft = |key: &str, samples: Vec<SampleDraft>| VoiceDraft {
             key: key.to_string(),
@@ -225,6 +250,15 @@ audio = "C:/voices/b-ja.wav"
         )])
         .contains("重复"));
         assert!(err(&[draft("a", vec![sample("zh", "  ")])]).contains("缺少样例音频"));
+        assert!(err(&[draft(
+            "a",
+            vec![SampleDraft {
+                language: "zh".to_string(),
+                audio: "a.wav".to_string(),
+                rate: 2.5,
+            }]
+        )])
+        .contains("语速"));
     }
 
     #[test]

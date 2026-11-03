@@ -23,6 +23,20 @@ pub const DEFAULT_TTS_MODEL: &str = "qwen-audio-3.1-tts-flash";
 /// 合成音色默认值（Qwen-Audio-TTS 系统音色：乔小娇，俏丽可爱女声）。
 pub const DEFAULT_VOICE: &str = "qiaoxiaojiao_v3.1";
 
+/// 自定义音色样本的默认语速倍率（百炼 TTS `rate` 参数的默认值）。
+pub const DEFAULT_SAMPLE_RATE: f32 = 1.0;
+
+/// 百炼 TTS `rate` 参数允许的最小语速倍率（官方范围 [0.5, 2.0]）。
+pub const MIN_SAMPLE_RATE: f32 = 0.5;
+
+/// 百炼 TTS `rate` 参数允许的最大语速倍率（官方范围 [0.5, 2.0]）。
+pub const MAX_SAMPLE_RATE: f32 = 2.0;
+
+/// 语速倍率是否有效：必须是有限数且在百炼 TTS 允许范围内。
+pub fn is_valid_sample_rate(rate: f32) -> bool {
+    rate.is_finite() && (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate)
+}
+
 /// 自定义音色引用前缀：`[tts] voice = "custom:<配置名>"` 表示使用复刻音色。
 pub const CUSTOM_VOICE_PREFIX: &str = "custom:";
 
@@ -150,7 +164,7 @@ pub struct CustomVoiceConfig {
 }
 
 /// 某个语言的一份声线样本。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomVoiceSample {
     /// 该样本的语言（百炼复刻语言代码，如 zh / ja / en）。
@@ -158,6 +172,21 @@ pub struct CustomVoiceSample {
 
     /// 本地样例音频路径（相对配置文件所在目录）。
     pub audio: PathBuf,
+
+    /// 语速倍率（百炼 TTS `rate` 参数，0.5–2.0，默认 1.0）。
+    ///
+    /// 只有本句实际选用该样本合成时才会使用；回退到默认样本时使用默认样本的 rate。
+    pub rate: f32,
+}
+
+impl Default for CustomVoiceSample {
+    fn default() -> Self {
+        Self {
+            language: String::new(),
+            audio: PathBuf::new(),
+            rate: DEFAULT_SAMPLE_RATE,
+        }
+    }
 }
 
 impl CustomVoiceConfig {
@@ -376,6 +405,14 @@ impl AppConfig {
                     bail!(
                         "自定义音色 [{name}] 的第 {} 个声线样本缺少 audio（样例音频路径）",
                         index + 1
+                    );
+                }
+                if !is_valid_sample_rate(sample.rate) {
+                    bail!(
+                        "自定义音色 [{name}] 的第 {} 个声线样本 rate {:?} 无效；\
+                         语速倍率必须是 {MIN_SAMPLE_RATE}~{MAX_SAMPLE_RATE} 之间的数字（默认 {DEFAULT_SAMPLE_RATE}）",
+                        index + 1,
+                        sample.rate
                     );
                 }
                 if !is_cloning_language(language::canonical_language(&sample.language)) {
@@ -726,6 +763,56 @@ audio = "samples/edgar-ja.wav"
             PathBuf::from("voice_cache.json"),
             "默认缓存文件相对配置文件目录"
         );
+    }
+
+    #[test]
+    fn custom_voice_sample_rate_defaults_to_one_and_is_parsed() {
+        let text = r#"
+[api]
+key = "sk-test"
+
+[[tts.custom_voices.edgar.samples]]
+language = "zh"
+audio = "a.wav"
+
+[[tts.custom_voices.edgar.samples]]
+language = "ja"
+audio = "b.wav"
+rate = 1.25
+"#;
+        let config = AppConfig::from_toml_str(text).unwrap();
+        let samples = &config.tts.custom_voices["edgar"].samples;
+        assert_eq!(
+            samples[0].rate, DEFAULT_SAMPLE_RATE,
+            "缺省 rate 应为默认语速 1.0"
+        );
+        assert!((samples[1].rate - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn custom_voice_sample_rate_out_of_range_is_rejected() {
+        for rate in ["0.4", "2.1"] {
+            let text = format!(
+                "[api]\nkey = \"sk-test\"\n[[tts.custom_voices.kaoet.samples]]\n\
+                 language = \"zh\"\naudio = \"a.wav\"\nrate = {rate}\n"
+            );
+            let err = AppConfig::from_toml_str(&text).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("rate"),
+                "rate={rate} 应被拒绝: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_rate_validity_requires_finite_and_in_range() {
+        assert!(is_valid_sample_rate(MIN_SAMPLE_RATE));
+        assert!(is_valid_sample_rate(MAX_SAMPLE_RATE));
+        assert!(is_valid_sample_rate(1.0));
+        assert!(!is_valid_sample_rate(0.49));
+        assert!(!is_valid_sample_rate(2.01));
+        assert!(!is_valid_sample_rate(f32::NAN));
+        assert!(!is_valid_sample_rate(f32::INFINITY));
     }
 
     #[test]

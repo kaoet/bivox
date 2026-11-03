@@ -272,18 +272,20 @@ pub async fn run(
             }
 
             let language = language_state.language_for_chunk();
-            // TTS 在 task 首个 chunk 时固定 voice / language_hints，后续 chunk 的这两个
-            // 字段会被忽略；界面语言因此取 task 首 chunk 的语言，保证显示与实际合成一致。
+            // TTS 在 task 首个 chunk 时固定 voice / rate / language_hints，后续 chunk 的
+            // 这些字段会被忽略；界面语言因此取 task 首 chunk 的语言，保证显示与实际合成一致。
             if tts_task_language.is_none() {
                 tts_task_language = Some(language.clone());
             }
-            let voice_id = voice.voice_for(&language).to_string();
+            let (voice_id, rate) = voice.selection_for(&language);
+            let voice_id = voice_id.to_string();
             let is_sentence_end = chunk.is_sentence_end;
 
             let req = TtsChunkRequest {
                 text: chunk.chunk_text,
                 is_sentence_end,
                 voice: voice_id,
+                rate,
                 language,
             };
             if tx_tts.send(req).await.is_err() {
@@ -300,10 +302,12 @@ pub async fn run(
         // 补一个「只结束、不追加文本」的请求，避免下一句的音色/语言漏进旧 task。
         if event.is_sentence_end && !sent_sentence_end {
             if let Some(language) = tts_task_language.clone() {
+                let (voice_id, rate) = voice.selection_for(&language);
                 let req = TtsChunkRequest {
                     text: String::new(),
                     is_sentence_end: true,
-                    voice: voice.voice_for(&language).to_string(),
+                    voice: voice_id.to_string(),
+                    rate,
                     language,
                 };
                 if tx_tts.send(req).await.is_ok() {

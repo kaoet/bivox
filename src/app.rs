@@ -799,7 +799,11 @@ fn config_signature(config: &AppConfig) -> String {
     for (name, voice) in voices {
         let _ = write!(signature, "voice:{name}:{:?}:", voice.name);
         for sample in &voice.samples {
-            let _ = write!(signature, "{}={:?};", sample.language, sample.audio);
+            let _ = write!(
+                signature,
+                "{}={:?}@{:?};",
+                sample.language, sample.audio, sample.rate
+            );
         }
         signature.push('\n');
     }
@@ -1173,6 +1177,27 @@ input_device = "mic-a"
         let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
         let changed =
             crate::config::AppConfig::from_toml_str(&toml.replace("mic-a", "mic-b")).unwrap();
+
+        assert_ne!(config_signature(&base), config_signature(&changed));
+    }
+
+    #[test]
+    fn config_signature_detects_sample_rate_changes() {
+        // 语速变化会影响运行期合成参数，必须计入指纹（D20 热重启依据）。
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[tts.custom_voices.edgar]
+[[tts.custom_voices.edgar.samples]]
+language = "zh"
+audio = "edgar-zh.wav"
+rate = 1.0
+"#;
+        let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let changed =
+            crate::config::AppConfig::from_toml_str(&toml.replace("rate = 1.0", "rate = 1.5"))
+                .unwrap();
 
         assert_ne!(config_signature(&base), config_signature(&changed));
     }

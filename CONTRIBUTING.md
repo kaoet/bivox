@@ -2,7 +2,7 @@
 
 本文件面向**开发与贡献者**（以及需要维护本仓库的 AI 编码代理），是项目开发流程、编码规范与发布流程的**唯一权威来源**。
 
-- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D22`）
+- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D23`）
 - 模块、数据流与算法：[`docs/architecture.md`](docs/architecture.md)
 - 用户使用说明：[`README.md`](README.md)
 - AI 代理入口：[`AGENTS.md`](AGENTS.md)（只做导航，不重复本文件规则）
@@ -59,7 +59,7 @@ cargo test                # 全部单元测试
 
 ## 3. 测试
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，不放根目录 `tests/`；当前共 **138** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，不放根目录 `tests/`；当前共 **142** 个（以 `cargo test` 输出为准）。
 - 测试使用本地 mock，**不访问真实百炼网络**：
   - WebSocket 协议：测试代码内起本地 `TcpListener`，手写握手/事件；
   - HTTP（音色接口）：`src/voice/mock_http.rs` 的手写 mock 服务。
@@ -232,7 +232,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 | 开发流程、规范、测试、发布、调试 | 本文件 | 其它文档只引用，不复制 |
 | AI 代理入口 | `AGENTS.md` | 只做导航与阅读顺序 |
 | 模块/数据流/算法 | `docs/architecture.md` | 当前实现的“怎么做” |
-| 设计决定与理由 | `docs/decisions.md` | `D1`–`D22`，编号稳定 |
+| 设计决定与理由 | `docs/decisions.md` | `D1`–`D23`，编号稳定 |
 | 配置字段与默认值 | `config.example.toml` | 编译期内嵌为首次启动模板 |
 | 语言代码集合 | `src/language.rs` | README 的用户表格据此维护 |
 | 模块职责概览 | `docs/architecture.md` | 本文件不重复维护目录树 |

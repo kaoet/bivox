@@ -56,6 +56,11 @@
 # 同时合成请求始终携带目标语言的 language_hints；
 # 有内置映射的非中英语种（ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar）会附带 instruction。
 #
+# 每个样本可单独设置合成语速 rate：
+#   - 默认 1.0，范围 0.5~2.0；同一音色的不同语言声线可以不同；
+#   - 合成时用本句所选样本的 rate，回退默认样本时用该样本的 rate；
+#   - 内置音色/普通 voice_id 固定 1.0；语速不参与复刻/缓存，改它不会重新上传音频。
+#
 # 注意 TOML 顺序：先写父表 [tts.custom_voices.<名字>]，再写 [[...samples]]。
 # 配置键名（如 edgar）会自动派生百炼音色前缀：去掉非字母数字、转小写；
 # 多语言样本追加语言代码（如 edgarzh / edgarja），单语言直接使用。
@@ -69,10 +74,12 @@
 # [[tts.custom_voices.edgar.samples]]
 # language = "zh"             # 必填，该样本语言（zh/ja/ko/en/...）
 # audio = "samples/edgar-zh.wav"
+# rate = 1.0                  # 可选，该样本合成语速（0.5~2.0，默认 1.0）
 #
 # [[tts.custom_voices.edgar.samples]]
 # language = "ja"
 # audio = "samples/edgar-ja.wav"
+# rate = 1.0
 
 [audio]
 # 不填 = 系统默认设备。GUI 从下拉框选择后写入**完整设备名**，启动时按精确名称匹配；

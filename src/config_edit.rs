@@ -69,6 +69,10 @@ pub fn set_custom_voices(original: &str, voices: &[(String, CustomVoiceConfig)])
             let mut sample_table = Table::new();
             sample_table["language"] = toml_edit::value(sample.language.trim());
             sample_table["audio"] = toml_edit::value(sample.audio.to_string_lossy().as_ref());
+            // 默认语速不写进配置，保持 TOML 简洁（缺省即 1.0）。
+            if sample.rate != crate::config::DEFAULT_SAMPLE_RATE {
+                sample_table["rate"] = rate_value(sample.rate);
+            }
             samples.push(sample_table);
         }
         voice_table["samples"] = Item::ArrayOfTables(samples);
@@ -78,6 +82,16 @@ pub fn set_custom_voices(original: &str, voices: &[(String, CustomVoiceConfig)])
 
     tts["custom_voices"] = Item::Table(table);
     render(&doc, original)
+}
+
+/// 语速写回值：用 f32 的最短十进制表示再转 f64 写出，避免 `f32 → f64` 的二进制尾差
+/// （否则 1.3 会被写成 `1.2999999523162842`）。
+fn rate_value(rate: f32) -> Item {
+    match format!("{rate}").parse::<f64>() {
+        Ok(value) => toml_edit::value(value),
+        // best-effort: f32 的 Display 输出一定可被 f64 解析，这里只是不 panic 的兜底。
+        Err(_) => toml_edit::value(f64::from(rate)),
+    }
 }
 
 /// 设置生效音色 `[tts] voice`（内置音色名或 `custom:<键名>`）。
@@ -280,10 +294,12 @@ languages = ["zh", "ja"]
                         crate::config::CustomVoiceSample {
                             language: "zh".to_string(),
                             audio: "voices/a-zh.wav".into(),
+                            rate: 1.3,
                         },
                         crate::config::CustomVoiceSample {
                             language: "ja".to_string(),
                             audio: "voices/a-ja.wav".into(),
+                            rate: crate::config::DEFAULT_SAMPLE_RATE,
                         },
                     ],
                 },
@@ -295,6 +311,7 @@ languages = ["zh", "ja"]
                     samples: vec![crate::config::CustomVoiceSample {
                         language: "en".to_string(),
                         audio: "voices/b-en.wav".into(),
+                        rate: crate::config::DEFAULT_SAMPLE_RATE,
                     }],
                 },
             ),
@@ -307,6 +324,13 @@ languages = ["zh", "ja"]
         // 注释与其它字段保留
         assert!(updated.contains("# 顶部注释"));
         assert!(updated.contains("workspace_host"));
+        // 非默认语速写回为最简十进制，默认语速不写
+        assert!(updated.contains("rate = 1.3"), "{updated}");
+        assert_eq!(
+            updated.matches("rate = ").count(),
+            1,
+            "默认语速 1.0 不应写进配置: {updated}"
+        );
         // 旧音色被整体替换、新音色结构可被正确解析
         assert!(!updated.contains("custom_voices.old"));
         let config = AppConfig::from_toml_str(&updated).unwrap();
@@ -316,6 +340,12 @@ languages = ["zh", "ja"]
         assert_eq!(alpha.name.as_deref(), Some("甲"));
         assert_eq!(alpha.samples.len(), 2);
         assert_eq!(alpha.samples[0].language, "zh");
+        assert!((alpha.samples[0].rate - 1.3).abs() < 1e-6);
+        assert_eq!(
+            alpha.samples[1].rate,
+            crate::config::DEFAULT_SAMPLE_RATE,
+            "默认语速读取时应回到 1.0"
+        );
         assert_eq!(
             config.tts.custom_voices["beta"].samples[0]
                 .audio

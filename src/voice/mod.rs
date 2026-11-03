@@ -3,7 +3,8 @@
 //! 配置里通过 `[tts] voice = "custom:<名字>"` 引用 `[tts.custom_voices.<名字>]`。
 //! 一个音色可以配置多种语言的声线样本（`[[...samples]]` 有序数组）：
 //! 每个样本都会按 (`[tts] model`, 音频内容哈希) 单独复刻并缓存一个 voice_id；
-//! 合成时由 pipeline 判定本句语言，选择对应语言的声线，缺语言时回退到第一个样本。
+//! 合成时由 pipeline 判定本句语言，选择对应语言的声线（连同该样本配置的语速），
+//! 缺语言时回退到第一个样本（D11/D23）。
 
 pub mod admin;
 pub mod api;
@@ -20,7 +21,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{AppConfig, CustomVoiceConfig, CustomVoiceSample, MAX_VOICE_PREFIX_LEN};
+use crate::config::{
+    AppConfig, CustomVoiceConfig, CustomVoiceSample, DEFAULT_SAMPLE_RATE, MAX_VOICE_PREFIX_LEN,
+};
 use crate::language;
 use api::BailianVoiceApi;
 use cache::{VoiceCache, VoiceCacheEntry};
@@ -40,41 +43,67 @@ pub enum ActiveVoice {
     Custom(ResolvedCustomVoice),
 }
 
+/// 已解析完成的单个语言声线：百炼 voice_id + 该样本配置的语速倍率。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedSample {
+    pub voice_id: String,
+    /// 该样本的语速倍率（百炼 TTS `rate`，0.5–2.0，默认 1.0）。
+    pub rate: f32,
+}
+
 /// 已解析完成的自定义音色（所有样本的 voice_id 均已就绪）。
 #[derive(Debug, Clone)]
 pub struct ResolvedCustomVoice {
     pub display_name: String,
     /// 默认声线样本的语言（`samples` 第一个，声音复刻语言代码）。
     pub default_language: String,
-    /// 语言（canonical 复刻代码）→ 百炼 voice_id。
-    pub voices: HashMap<String, String>,
+    /// 语言（canonical 复刻代码）→ 声线（voice_id + 语速）。
+    pub samples: HashMap<String, ResolvedSample>,
 }
 
 impl ActiveVoice {
-    /// 按本句语言返回应使用的百炼 voice。
-    pub fn voice_for(&self, asr_language: &str) -> String {
+    /// 按本句语言返回应使用的百炼 voice 与语速倍率。
+    pub fn selection_for(&self, asr_language: &str) -> (&str, f32) {
         match self {
-            Self::Builtin { name } => name.clone(),
-            Self::Custom(custom) => custom.voice_for(asr_language).to_string(),
+            Self::Builtin { name } => (name.as_str(), DEFAULT_SAMPLE_RATE),
+            Self::Custom(custom) => custom.selection_for(asr_language),
         }
+    }
+
+    /// 按本句语言返回应使用的百炼 voice（语速见 [`Self::selection_for`]）。
+    pub fn voice_for(&self, asr_language: &str) -> String {
+        self.selection_for(asr_language).0.to_string()
     }
 }
 
 impl ResolvedCustomVoice {
+    /// 按本句语言选择声线：无该语言样本时回退到 `samples[0]`（默认声线）。
+    pub fn sample_for(&self, asr_language: &str) -> Option<(&str, &ResolvedSample)> {
+        let canonical = language::canonical_language(asr_language);
+        self.samples
+            .get_key_value(canonical)
+            .or_else(|| self.samples.get_key_value(&self.default_language))
+            .or_else(|| self.samples.iter().next())
+            .map(|(language, sample)| (language.as_str(), sample))
+    }
+
+    /// 按本句语言返回（voice_id, rate）：无样本时返回空 voice + 默认语速。
+    pub fn selection_for(&self, asr_language: &str) -> (&str, f32) {
+        self.sample_for(asr_language)
+            .map(|(_, sample)| (sample.voice_id.as_str(), sample.rate))
+            .unwrap_or(("", DEFAULT_SAMPLE_RATE))
+    }
+
     /// 按本句语言选择 voice_id：无该语言样本时回退到 `samples[0]`（默认声线）。
     pub fn voice_for(&self, asr_language: &str) -> &str {
-        let canonical = language::canonical_language(asr_language);
-        self.voices
-            .get(canonical)
-            .or_else(|| self.voices.get(&self.default_language))
-            .or_else(|| self.voices.values().next())
-            .map(String::as_str)
+        self.sample_for(asr_language)
+            .map(|(_, sample)| sample.voice_id.as_str())
             .unwrap_or_default()
     }
 
     /// 已配置的语言（按字典序，便于展示）。
     pub fn languages(&self) -> Vec<&str> {
-        let mut languages: Vec<&str> = self.voices.keys().map(String::as_str).collect();
+        let mut languages: Vec<&str> = self.samples.keys().map(String::as_str).collect();
         languages.sort_unstable();
         languages
     }
@@ -273,8 +302,8 @@ pub async fn resolve_custom_voice(
         }
     }
 
-    // 4. 汇总语言 → voice_id
-    let mut voices: HashMap<String, String> = HashMap::new();
+    // 4. 汇总语言 → 声线（voice_id + 语速）
+    let mut samples: HashMap<String, ResolvedSample> = HashMap::new();
     for (index, sample) in prepared.iter().enumerate() {
         let voice_id = match &sample.source {
             PreparedSource::Bytes { hash, .. } => entries
@@ -296,12 +325,18 @@ pub async fn resolve_custom_voice(
                 .map(|(_, voice_id)| voice_id.clone())
                 .context("缓存兜底记录缺失")?,
         };
-        voices.insert(sample.canonical_language.clone(), voice_id);
+        samples.insert(
+            sample.canonical_language.clone(),
+            ResolvedSample {
+                voice_id,
+                rate: sample.rate,
+            },
+        );
     }
 
     let default_language =
         language::canonical_language(&prepared[0].canonical_language).to_string();
-    let mut languages: Vec<String> = voices.keys().cloned().collect();
+    let mut languages: Vec<String> = samples.keys().cloned().collect();
     languages.sort_unstable();
     log::info!(
         "🎙️ 自定义音色「{}」已就绪，语言声线: {}（默认 {}）",
@@ -313,7 +348,7 @@ pub async fn resolve_custom_voice(
     Ok(ResolvedCustomVoice {
         display_name,
         default_language,
-        voices,
+        samples,
     })
 }
 
@@ -321,6 +356,8 @@ pub async fn resolve_custom_voice(
 struct PreparedSample {
     canonical_language: String,
     audio_path_text: String,
+    /// 该样本配置的语速倍率（与音频内容无关，只影响合成参数）。
+    rate: f32,
     source: PreparedSource,
 }
 
@@ -374,6 +411,7 @@ async fn prepare_sample(
                 return Ok(PreparedSample {
                     canonical_language,
                     audio_path_text,
+                    rate: sample.rate,
                     source: PreparedSource::Cached {
                         hash: hash.to_string(),
                         entry: entry.clone(),
@@ -413,6 +451,7 @@ async fn prepare_sample(
     Ok(PreparedSample {
         canonical_language,
         audio_path_text,
+        rate: sample.rate,
         source: PreparedSource::Bytes {
             bytes,
             hash,
@@ -659,7 +698,7 @@ mod tests {
         let text = format!(
             "[api]\nkey = \"sk-test\"\n[tts]\nvoice = \"custom:edgar\"\ncache_file = \"{}\"\n\
              [tts.custom_voices.edgar]\nname = \"埃德嘉\"\n\
-             [[tts.custom_voices.edgar.samples]]\nlanguage = \"zh\"\naudio = \"{}\"\n\
+             [[tts.custom_voices.edgar.samples]]\nlanguage = \"zh\"\naudio = \"{}\"\nrate = 1.25\n\
              [[tts.custom_voices.edgar.samples]]\nlanguage = \"ja\"\naudio = \"{}\"\n",
             cache_path.display().to_string().replace('\\', "\\\\"),
             zh.display().to_string().replace('\\', "\\\\"),
@@ -682,8 +721,14 @@ mod tests {
         let resolved = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)
             .await
             .unwrap();
-        assert_eq!(resolved.voices.get("zh").unwrap(), "voice-for-edgarzh");
-        assert_eq!(resolved.voices.get("ja").unwrap(), "voice-for-edgarja");
+        assert_eq!(resolved.samples["zh"].voice_id, "voice-for-edgarzh");
+        assert_eq!(resolved.samples["ja"].voice_id, "voice-for-edgarja");
+        assert!((resolved.samples["zh"].rate - 1.25).abs() < 1e-6);
+        assert_eq!(
+            resolved.samples["ja"].rate,
+            crate::config::DEFAULT_SAMPLE_RATE,
+            "未配置 rate 的样本应使用默认语速"
+        );
         assert_eq!(resolved.default_language, "zh");
         assert_eq!(mock.created.load(Ordering::SeqCst), 2, "两个语言各复刻一次");
         assert_eq!(cache.len(), 2);
@@ -693,7 +738,7 @@ mod tests {
         let resolved_again = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)
             .await
             .unwrap();
-        assert_eq!(resolved_again.voices, resolved.voices);
+        assert_eq!(resolved_again.samples, resolved.samples);
         assert_eq!(
             mock.created.load(Ordering::SeqCst),
             2,
@@ -724,9 +769,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            second.voices.get("zh"),
-            first.voices.get("zh"),
+            second.samples.get("zh").map(|sample| &sample.voice_id),
+            first.samples.get("zh").map(|sample| &sample.voice_id),
             "中文样本缺失时应复用缓存记录"
+        );
+        assert_eq!(
+            second.samples.get("zh").map(|sample| sample.rate),
+            first.samples.get("zh").map(|sample| sample.rate),
+            "缓存兜底不应丢失该样本的语速"
         );
         assert_eq!(mock.created.load(Ordering::SeqCst), 2, "不应重复创建");
 
@@ -764,22 +814,39 @@ mod tests {
 
     #[test]
     fn active_voice_falls_back_to_default_sample_language() {
-        let mut voices = HashMap::new();
-        voices.insert("zh".to_string(), "voice-zh".to_string());
-        voices.insert("ja".to_string(), "voice-ja".to_string());
+        let mut samples = HashMap::new();
+        samples.insert(
+            "zh".to_string(),
+            ResolvedSample {
+                voice_id: "voice-zh".to_string(),
+                rate: 1.3,
+            },
+        );
+        samples.insert(
+            "ja".to_string(),
+            ResolvedSample {
+                voice_id: "voice-ja".to_string(),
+                rate: 1.0,
+            },
+        );
         let custom = ActiveVoice::Custom(ResolvedCustomVoice {
             display_name: "埃德嘉".to_string(),
             default_language: "zh".to_string(),
-            voices,
+            samples,
         });
+        assert_eq!(custom.selection_for("ja"), ("voice-ja", 1.0));
+        assert_eq!(custom.selection_for("zh"), ("voice-zh", 1.3));
+        // 没有对应语言样本（例如 en）时回退默认样本，语速也用默认样本的
+        assert_eq!(custom.selection_for("en"), ("voice-zh", 1.3));
         assert_eq!(custom.voice_for("ja"), "voice-ja");
-        assert_eq!(custom.voice_for("zh"), "voice-zh");
-        // 没有对应语言样本（例如 en）时回退默认样本
-        assert_eq!(custom.voice_for("en"), "voice-zh");
 
         let builtin = ActiveVoice::Builtin {
             name: "qiaoxiaojiao_v3.1".to_string(),
         };
+        assert_eq!(
+            builtin.selection_for("ja"),
+            ("qiaoxiaojiao_v3.1", crate::config::DEFAULT_SAMPLE_RATE)
+        );
         assert_eq!(builtin.voice_for("ja"), "qiaoxiaojiao_v3.1");
     }
 

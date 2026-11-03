@@ -3,7 +3,8 @@
 //! 顶部选择「当前音色」：现有音色（输入框，填内置音色名或任意 voice_id）或
 //! 自定义音色（下拉，写 `custom:<键名>`），右上角「保存」同时写回 `[tts] voice`
 //! 与 `[tts.custom_voices]`。
-//! 下方左栏是自定义音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线与样例音频。
+//! 下方左栏是自定义音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线、样例音频
+//! 与每个样本的语速。
 //! 草稿只在点「保存」后写回（`[tts.custom_voices]`，同时校验并备份）；
 //! 保存后自动重载配置（运行中会按 D20 自动重启实时管线）。
 
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 
 use crate::app::{KaolsApp, VoiceMode};
+use crate::config::{DEFAULT_SAMPLE_RATE, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use crate::language::CLONING_LANGUAGES;
 use crate::voice::editor::{config_audio_path, SampleDraft, VoiceDraft};
 
@@ -122,6 +124,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
             samples: vec![SampleDraft {
                 language,
                 audio: String::new(),
+                rate: DEFAULT_SAMPLE_RATE,
             }],
         });
         app.selected_voice = Some(key);
@@ -208,6 +211,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
                         draft.samples.push(SampleDraft {
                             language: language.to_string(),
                             audio: String::new(),
+                            rate: DEFAULT_SAMPLE_RATE,
                         });
                     }
 
@@ -375,6 +379,9 @@ fn edit_samples(
                     }
                 });
 
+                // 语速只作用于用这个样本合成的句子，因此放在样本块内单独一行
+                sample_rate_slider(ui, &mut sample.rate);
+
                 if !sample.audio.trim().is_empty() {
                     let resolved = resolve_audio(exe_dir, &sample.audio);
                     if !resolved.is_file() {
@@ -450,6 +457,27 @@ fn edit_samples(
             }
         }
     }
+}
+
+/// 单个样本的语速滑条：0.5×–2.0×，步进 0.05，只影响使用该样本合成的句子。
+fn sample_rate_slider(ui: &mut egui::Ui, rate: &mut f32) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("语速");
+        ui.add(
+            egui::Slider::new(rate, MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE)
+                .step_by(0.05)
+                .fixed_decimals(2)
+                .suffix("×"),
+        );
+        if ui
+            .button("重置")
+            .on_hover_text(format!("恢复默认语速 {:.2}×", DEFAULT_SAMPLE_RATE))
+            .clicked()
+        {
+            *rate = DEFAULT_SAMPLE_RATE;
+        }
+        ui.label(egui::RichText::new("只影响使用该样本合成的句子").weak());
+    });
 }
 
 fn resolve_audio(exe_dir: &Path, audio: &str) -> PathBuf {
