@@ -35,6 +35,9 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
                            └─ 事件泵：字幕 / 状态 / VAD / 错误 → egui 界面
 ```
 
+实时页打字输入 ──(TypedInput 命令通道)──▶ 会话调度循环
+  └─ 作为独立 TTS task 排到队尾（不打断播放；必要时先收口 ASR 当前句的 task，D24）
+
 关键取舍：
 
 - **低延迟优先**：不等整句识别结束，ASR 文本一稳定就分块送 TTS；语言判定在每句首个 chunk 前完成并冻结。
@@ -69,7 +72,7 @@ src/
 │   └── qwen_tts.rs      Qwen-Audio-TTS 流式合成
 ├── pipeline/
 │   ├── chunker.rs       流式文本分块
-│   └── session.rs       实时会话编排（ASR → 语言 → 分块 → TTS）
+│   └── session.rs       实时会话编排（ASR → 语言 → 分块 → TTS；打字输入排队）
 ├── voice/
 │   ├── mod.rs           生效音色解析、样本复刻/缓存注册、语言→(voice_id, 语速) 映射
 │   ├── api.rs           百炼声音复刻 HTTP API（不依赖 SDK）
@@ -79,7 +82,8 @@ src/
 │   └── mock_http.rs     单元测试用的手写 HTTP mock
 ├── gui/
 │   ├── toolbar.rs       顶栏：状态灯、VAD 指示器、开始/停止、版本号
-│   ├── realtime_tab.rs  实时页：字幕列表
+│   ├── realtime_tab.rs  实时页：字幕列表（底部嵌入打字输入行）
+│   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
 │   ├── audio_tab.rs     音频页：输入/输出设备
 │   ├── tts_tab.rs       语音合成页：当前音色 + 自定义音色编辑器
 │   ├── settings_tab.rs  设置页：路径、API Key、配置概览
@@ -133,6 +137,7 @@ main()
 - 路径与运行时：`paths`、`runtime`、`egui_ctx`；
 - 会话：`state: SessionState`、`session: Option<PipelineSessionHandle>`、`events_rx`、`running_config_signature`、`restart_pending`；
 - 配置：`config: ConfigState`（`Loaded` / `Invalid`）、`api_key_input`、设备列表与当前设备；
+- 打字输入：`typed_input`（输入框内容）、`typed_input_error`（行内错误）；提交通过 `PipelineSessionHandle::speak_typed` 走命令通道；
 - 音色编辑：`voice_drafts`（未保存草稿）、`selected_voice`、`voice_mode` / `voice_input` / `voice_custom_key`；
 - 展示：`subtitles`、`log`、`vad_active`、错误横幅（`startup_error` / `pipeline_error` / `config_write_error` / `crash`）；
 - 生命周期：`closing`。
@@ -156,7 +161,7 @@ main()
 点「开始」后 `app.start_session`：
 
 1. 校验配置为 `Loaded`，否则直接显示错误、不创建会话；
-2. 创建无界事件通道与 `PipelineSessionHandle`，记录当前配置指纹，状态置 `Starting`；
+2. 创建无界事件通道、打字输入命令通道与 `PipelineSessionHandle`，记录当前配置指纹，状态置 `Starting`；
 3. 只清空「当前字幕句」，历史字幕保留；
 4. `runtime.spawn` 执行 `pipeline::session::run(...)`；若返回 `Err`，包装任务补发 `PipelineEvent::Error` + `StateChanged(Failed)`。
 
@@ -173,10 +178,10 @@ main()
 
 ### 3.5 停止、失败与关闭
 
-- `PipelineSessionHandle` 持有两个 `Arc<AtomicBool>`：
+- `PipelineSessionHandle` 持有两个 `Arc<AtomicBool>`，以及一个 GUI → 会话的打字输入无界 `Sender`（D24）：
   - `running`：后台任务的“继续运行”标志，初值 `true`；
   - `stop_requested`：区分“用户主动停止”与“服务异常自行退出”。
-- 「停止」：GUI 置 `Stopping`，请求 handle 停止，并立即清空当前字幕句；后台调度循环最多 100ms 内退出。
+- 「停止」：GUI 置 `Stopping`，请求 handle 停止，并立即清空当前字幕句；后台调度循环最多 100ms 内退出。已在命令通道里、尚未开始朗读的打字输入句随会话丢弃（字幕历史保留）。
 - 会话收尾顺序：复位 VAD → drop 采集（释放麦克风）→ 关闭 TTS 输入通道 → 最多等待 ASR/TTS 任务 3s → 若非用户主动停止，补发 `Error` → 发 `StateChanged(Idle)`。
 - 收到 `Idle`/`Failed` 后 GUI 清空 `session`、配置指纹与 VAD 指示，并清当前字幕句；若 `restart_pending` 且未在关窗，则用新配置自动重启（D20）。
 - 关窗：首次收到 close request 时 `CancelClose`、置 `closing`、请求停止会话；下一帧刷新日志并真正 `Close`。这样保证后台任务与音频设备先释放（D13）。
@@ -289,9 +294,13 @@ rate = 1.0
 ```text
 后台任务 ──(PipelineEvent, unbounded)──▶ KaolsApp::pump_events
       └── ctx.request_repaint() ──▶ egui 下一帧
+
+实时页输入框 ──(TypedInput, unbounded)──▶ session 调度循环（biased 优先）
 ```
 
 - `PipelineEvent` 字段以 `src/events.rs` 为唯一事实源；事件不携带 egui 类型。
+- `TypedSentence`：会话接受一句打字输入、已交给 TTS 排队后发给界面（进字幕历史）。
+- GUI → 后台唯一命令通道是打字输入通道；会话调度循环用 `biased` select 优先处理它，避免按下回车后又把当前 ASR 句的 chunk 送进 TTS（D24）。
 - ASR→会话、会话→TTS、采集→ASR 使用有界 channel（容量 100）；采集端用 `try_send`，满则丢弃，避免阻塞实时回调。
 - 会话状态机：`Idle → Starting → Running → Stopping → Idle`；失败路径为 `Starting/Running → Failed`。GUI 以 `Idle`/`Failed` 作为“会话已结束”的信号。
 - 后台服务非用户主动退出时，会补发 `Error` 再发 `Idle`：错误条保留，状态回到可再次启动的空闲态。
@@ -338,6 +347,15 @@ rate = 1.0
 
 TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设备采样率不同时用 rubato FFT 重采样。播放回调每帧从队列取一个样本复制到所有声道，队列为空时补静音。每句 task 结束后 `flush()` 把重采样器内部余量补齐。
 
+### 7.4 打字输入与任务边界（D24）
+
+打字输入句不走流式分块，而是整句一条 `continue-task` + `finish-task`，由会话在**任务边界**处插入：
+
+- 不取消 task、不清空播放队列：已排队/正在播放的音频照常播完，打字输入句的音频排在其后（FIFO）。
+- 若当前 ASR 句的 TTS task 还开着（会话侧 `tts_task_language` 非空），会话先发「空文本 + 句终」：TTS 只发 `finish-task` 正常收口已收到的文本，然后新请求自然成为下一个 task。
+- 若 ASR 当前句尚未句终，会话先按「已送 TTS 前缀」把字幕句收尾，再丢弃该句剩余事件到服务端句终，期间不再送 TTS；因此被丢弃部分的文本不会被合成。
+- 播放层与 TTS 客户端因此无需感知“打字输入”：它们只看到正常的 task 序列。
+
 ---
 
 ## 8. 语言判定
@@ -354,6 +372,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
   6. 文本文字数 <2 或证据不足 → 保持当前语言；
   7. 判定结果不在 `allowed` 内 → 回退 `allowed[0]`。
 - 判定生命周期：**每个 TTS task 在首个 chunk 送出前判定一次并冻结**，同一 task 内后续 ASR 修订不再改语言；空文本 + 句终重置。
+- **打字输入句与 ASR 共用同一个 `LanguageTracker`**：判定时继承当前对话的粘性语言，并把结果回写 `current`，因此打字输入会影响后续句子的语言判定（D24）。收口当前 ASR 句时只清句文本/任务态，不重建 tracker。
 - 合成参数：`language_hints` 用 `tts_language_hint`（复刻语言集合内直接用，否则 `other`）；`instruction_for` 为 ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar 提供中文指令，zh/en 不附加。
 - 这套判定与复刻样本语种无关；样本缺失目标语言时回退第一个样本（连同其 `rate`，D11）。
 
@@ -481,20 +500,21 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 | 页签 | 职责 | 关键行为 |
 |---|---|---|
-| 实时 | 字幕列表 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16） |
+| 实时 | 字幕列表 + 打字输入 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16）；底部多行输入框 Shift+Enter 换行、Enter/「朗读」排队朗读打字输入（D24），仅运行中可提交，上限 500 字符 |
 | 音频 | 输入/输出设备 | 设备下拉保存完整设备名；改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告 |
 | 语音合成 | 当前音色 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色；Tab 级保存/放弃更改；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」） |
 | 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/模型/语言/音色；配置无效时显示错误链 |
 
 - 错误展示：启动横幅（黄）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
 - 音色编辑草稿的“脏”状态 = 草稿与从配置重建的草稿不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
-- 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `app::SubtitleState` 的纯函数 `apply_asr` 维护，并有单测覆盖。
+- 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `app::SubtitleState` 的纯函数 `apply_asr` / `push_typed` 维护，并有单测覆盖。
+- 打字输入行在 `gui/typed_input.rs`：多行输入，Shift+Enter 换行、Enter 提交并保持焦点；Windows 的 IME 确认候选由 egui-winit 的 `VK_PROCESSKEY` 过滤，不会误提交。
 
 ---
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **142** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **146** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块、ASR/TTS 协议解析、缓存、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -516,4 +536,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
   - 「自定义音色编辑器」（左侧列表、右侧详情、样本增删/拖拽排序）。
   当前仅记录，拆分作为后续重构任务。
 - `AudioPlaybackHandle::interrupt` 与 `AudioCapture::stop` 当前没有调用方（预留接口）；播放/采集的生命周期由 drop 控制。
+- 打字输入句是**排队**语义：当前排队/播放的音频全部播完后才轮到它；界面在提交时就把该句加入字幕历史，可能与实际发声时间有延迟。
+- 若提交打字输入时 ASR 当前句尚未句终，该句剩余部分会被丢弃、不会补读（字幕只保留已送 TTS 的前缀，D24）；极端情况下用户持续说话期间打字输入会暂停该句后续合成。
+- 打字输入句上限 500 字符；TTS 连续启动失败 3 次时该句按现有机制丢弃（只写日志，不弹错误条）。
 - 没有 CI；UI 与真实音频链路的回归依赖人工验证。

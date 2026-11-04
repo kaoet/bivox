@@ -54,6 +54,14 @@ pub enum PipelineEvent {
         language: Option<String>,
         sentence_id: Option<u64>,
     },
+    /// 用户在「实时」页输入框提交的一句**打字输入**，已交给 TTS 排队朗读。
+    ///
+    /// `language`：本句实际使用的 TTS 语言（与 ASR 句共用同一个粘性语言判定）。
+    /// 它与 ASR 字幕走同一套历史列表，但不按 `sentence_id` 去重。
+    TypedSentence {
+        text: String,
+        language: String,
+    },
     /// 本地 VAD 是否处于语音段（顶栏指示器用）。
     VadActive(bool),
     Error {

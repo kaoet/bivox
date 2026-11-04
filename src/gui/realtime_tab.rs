@@ -31,6 +31,13 @@ struct Row<'a> {
 }
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+    // 底部输入行先占位（嵌套 Panel 从当前 Ui 底部切走输入行高度），剩余空间给字幕列表。
+    super::typed_input::show(app, ui);
+    show_subtitles(app, ui);
+}
+
+/// 字幕列表：从底部输入行上方剩余的空间向下填满。
+fn show_subtitles(app: &mut KaolsApp, ui: &mut egui::Ui) {
     // 显示顺序：当前句（ASR 持续修订中）在最上，历史句按 新 → 旧 往下排。
     let mut rows: Vec<Row<'_>> = Vec::with_capacity(app.subtitles.history.len() + 1);
     if !app.subtitles.current.is_empty() {
@@ -50,108 +57,113 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .id_salt("subtitle_list_scroll")
         .show(ui, |ui| {
-            // 0.37 的 ScrollArea 没有 stick_to_top；默认滚动偏移按像素保存，
-            // 停在顶部（偏移 0）时新字幕插入顶部不会把视图顶走，效果就是 stick top。
-            if rows.is_empty() {
-                ui.add_space(16.0);
-                ui.label(
-                    egui::RichText::new("（点工具栏「开始」后，说话即可看到识别字幕）").weak(),
-                );
-                return;
-            }
-
-            let font_id = egui::FontId::proportional(SUBTITLE_FONT_SIZE);
-            let normal_color = ui.visuals().text_color();
-            let unsent_color = normal_color.gamma_multiply(UNSENT_COLOR_SCALE);
-            let language_color = normal_color.gamma_multiply(0.55);
-
-            for (index, row) in rows.iter().enumerate() {
-                if index > 0 {
-                    ui.separator();
+            // ScrollArea 的内容 Ui 会继承外层 bottom_up 布局，必须显式改为 top_down，
+            // 否则空状态提示等会贴到字幕区底部。
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                // 0.37 的 ScrollArea 没有 stick_to_top；默认滚动偏移按像素保存，
+                // 停在顶部（偏移 0）时新字幕插入顶部不会把视图顶走，效果就是 stick top。
+                if rows.is_empty() {
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("（点工具栏「开始」后，说话即可看到识别字幕）").weak(),
+                    );
+                    return;
                 }
 
-                let inner = ui.horizontal_top(|ui| {
-                    language_column(ui, row.language, language_color);
+                let font_id = egui::FontId::proportional(SUBTITLE_FONT_SIZE);
+                let normal_color = ui.visuals().text_color();
+                let unsent_color = normal_color.gamma_multiply(UNSENT_COLOR_SCALE);
+                let language_color = normal_color.gamma_multiply(0.55);
 
-                    match row.sent_bytes {
-                        // 当前句：不显示复制按钮；已送 TTS 的前缀用正常色，其余用弱色。
-                        Some(sent_bytes) => {
-                            let mut sent = sent_bytes.min(row.text.len());
-                            while sent > 0 && !row.text.is_char_boundary(sent) {
-                                sent -= 1;
+                for (index, row) in rows.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
+                    }
+
+                    let inner = ui.horizontal_top(|ui| {
+                        language_column(ui, row.language, language_color);
+
+                        match row.sent_bytes {
+                            // 当前句：不显示复制按钮；已送 TTS 的前缀用正常色，其余用弱色。
+                            Some(sent_bytes) => {
+                                let mut sent = sent_bytes.min(row.text.len());
+                                while sent > 0 && !row.text.is_char_boundary(sent) {
+                                    sent -= 1;
+                                }
+
+                                let mut job = egui::text::LayoutJob::default();
+                                job.append(
+                                    &row.text[..sent],
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: normal_color,
+                                        ..Default::default()
+                                    },
+                                );
+                                job.append(
+                                    &row.text[sent..],
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: unsent_color,
+                                        ..Default::default()
+                                    },
+                                );
+                                // 必须显式 .wrap()：水平布局里 Label 的默认 wrap_mode 是 Extend，
+                                // 会把我们设好的 max_width 覆盖成 INFINITY（长句不换行、直接溢出）。
+                                job.wrap.max_width = ui.available_width();
+                                ui.add(egui::Label::new(job).wrap());
                             }
-
-                            let mut job = egui::text::LayoutJob::default();
-                            job.append(
-                                &row.text[..sent],
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: normal_color,
-                                    ..Default::default()
-                                },
-                            );
-                            job.append(
-                                &row.text[sent..],
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: unsent_color,
-                                    ..Default::default()
-                                },
-                            );
-                            // 必须显式 .wrap()：水平布局里 Label 的默认 wrap_mode 是 Extend，
-                            // 会把我们设好的 max_width 覆盖成 INFINITY（长句不换行、直接溢出）。
-                            job.wrap.max_width = ui.available_width();
-                            ui.add(egui::Label::new(job).wrap());
+                            // 历史句：右侧为复制图标留出空位，文本按剩余宽度换行。
+                            None => {
+                                let text_width = (ui.available_width()
+                                    - COPY_SLOT_WIDTH
+                                    - ui.spacing().item_spacing.x)
+                                    .max(40.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(text_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(row.text)
+                                                    .size(SUBTITLE_FONT_SIZE),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                // 把右侧空位真正占掉，行矩形才包含图标位置（悬停判定/图标不压字）
+                                ui.add_space(COPY_SLOT_WIDTH);
+                            }
                         }
-                        // 历史句：右侧为复制图标留出空位，文本按剩余宽度换行。
-                        None => {
-                            let text_width = (ui.available_width()
-                                - COPY_SLOT_WIDTH
-                                - ui.spacing().item_spacing.x)
-                                .max(40.0);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(text_width, 0.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(row.text).size(SUBTITLE_FONT_SIZE),
-                                        )
-                                        .wrap(),
-                                    );
-                                },
+                    });
+
+                    // 历史句：只有鼠标悬停这一行时，才在右端显示复制图标。
+                    if row.sent_bytes.is_none() {
+                        let row_rect = inner.response.rect;
+                        // 用指针位置判断整行悬停（不注册额外交互层，避免和文本/hit-test 打架）
+                        let hovered = ui
+                            .ctx()
+                            .pointer_hover_pos()
+                            .is_some_and(|pos| row_rect.contains(pos));
+                        if hovered {
+                            let center = egui::pos2(
+                                row_rect.right() - COPY_SLOT_WIDTH * 0.55,
+                                row_rect.center().y,
                             );
-                            // 把右侧空位真正占掉，行矩形才包含图标位置（悬停判定/图标不压字）
-                            ui.add_space(COPY_SLOT_WIDTH);
+                            let icon_rect = egui::Rect::from_center_size(
+                                center,
+                                egui::vec2(COPY_BUTTON_SIZE, COPY_BUTTON_SIZE),
+                            );
+                            copy_icon_button(ui, icon_rect, row.text);
                         }
                     }
-                });
 
-                // 历史句：只有鼠标悬停这一行时，才在右端显示复制图标。
-                if row.sent_bytes.is_none() {
-                    let row_rect = inner.response.rect;
-                    // 用指针位置判断整行悬停（不注册额外交互层，避免和文本/hit-test 打架）
-                    let hovered = ui
-                        .ctx()
-                        .pointer_hover_pos()
-                        .is_some_and(|pos| row_rect.contains(pos));
-                    if hovered {
-                        let center = egui::pos2(
-                            row_rect.right() - COPY_SLOT_WIDTH * 0.55,
-                            row_rect.center().y,
-                        );
-                        let icon_rect = egui::Rect::from_center_size(
-                            center,
-                            egui::vec2(COPY_BUTTON_SIZE, COPY_BUTTON_SIZE),
-                        );
-                        copy_icon_button(ui, icon_rect, row.text);
-                    }
+                    ui.add_space(4.0);
                 }
-
-                ui.add_space(4.0);
-            }
+            });
         });
 }
 

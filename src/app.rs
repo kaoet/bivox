@@ -15,7 +15,7 @@ use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::paths::AppPaths;
-use crate::pipeline::session::PipelineSessionHandle;
+use crate::pipeline::session::{PipelineSessionHandle, TypedInput, MAX_TYPED_INPUT_CHARS};
 use crate::voice::editor::{self, VoiceDraft};
 
 /// 窗口标题。
@@ -62,6 +62,17 @@ impl SubtitleState {
         self.sent_bytes = 0;
         self.language = None;
         self.last_finalized_sentence_id = None;
+    }
+
+    /// 打字输入句：提交即进历史（不经过 ASR 的 `sentence_id` 去重）。
+    pub fn push_typed(&mut self, text: String, language: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.history.push(SubtitleLine { language, text });
+        if self.history.len() > MAX_SUBTITLES {
+            self.history.remove(0);
+        }
     }
 
     /// 把一条 ASR 事件并入字幕状态（纯逻辑，便于单测）。
@@ -172,6 +183,10 @@ pub struct KaolsApp {
     pub selected_voice: Option<String>,
     /// 设置页的 API Key 草稿（点「保存」才写回 config.toml）。
     pub api_key_input: String,
+    /// 实时页底部「打字输入」的输入框内容。
+    pub typed_input: String,
+    /// 打字输入的行内错误（超长、会话未开始等）。
+    pub typed_input_error: Option<String>,
     /// 设备下拉的可选项（启动时与「刷新设备」时重新枚举）。
     pub input_devices: Vec<String>,
     pub output_devices: Vec<String>,
@@ -236,6 +251,8 @@ impl KaolsApp {
             config,
             selected_voice: None,
             api_key_input: String::new(),
+            typed_input: String::new(),
+            typed_input_error: None,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             config_write_error: None,
@@ -531,13 +548,16 @@ impl KaolsApp {
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let handle = PipelineSessionHandle::new();
+        // 打字输入命令通道：GUI 提交、会话调度循环消费（无界，界面不会阻塞）。
+        let (typed_tx, typed_rx) = mpsc::unbounded_channel::<TypedInput>();
+        let handle = PipelineSessionHandle::new(typed_tx);
         self.restart_pending = false;
         self.running_config_signature = Some(config_signature(&config));
         self.session = Some(handle.clone());
         self.events_rx = Some(rx);
         self.state = SessionState::Starting;
         self.pipeline_error = None;
+        self.typed_input_error = None;
         self.vad_active = false;
         // 只清当前未完成的句子；历史字幕保留（用户要求停止管线后不清空历史）
         self.subtitles.reset_current();
@@ -546,8 +566,14 @@ impl KaolsApp {
         let events_for_run = tx.clone();
         let repaint = ctx.clone();
         runtime.spawn(async move {
-            if let Err(err) =
-                crate::pipeline::session::run(config, events_for_run, repaint.clone(), handle).await
+            if let Err(err) = crate::pipeline::session::run(
+                config,
+                events_for_run,
+                repaint.clone(),
+                handle,
+                typed_rx,
+            )
+            .await
             {
                 let detail = format!("{err:#}");
                 // best-effort: 界面可能已退出，事件丢弃即可
@@ -570,6 +596,39 @@ impl KaolsApp {
             // 停止按钮立即清空「当前句」（历史保留），不用等下次开始
             self.subtitles.reset_current();
             info!("正在停止实时管线…");
+        }
+    }
+
+    /// 「朗读」/ Enter：把实时页输入框里的一句打字输入交给会话排队朗读。
+    ///
+    /// 校验顺序：空文本 → 长度 → 会话是否运行中 → 命令通道是否仍存活。
+    /// 提交成功后清空输入框并保持焦点；失败时把原因留在输入框下方（不弹全局横幅）。
+    pub fn submit_typed_input(&mut self) {
+        let text = self.typed_input.trim().to_string();
+        if text.is_empty() {
+            self.typed_input_error = None;
+            return;
+        }
+        let chars = text.chars().count();
+        if chars > MAX_TYPED_INPUT_CHARS {
+            self.typed_input_error = Some(format!(
+                "最多 {MAX_TYPED_INPUT_CHARS} 个字符（当前 {chars} 个）"
+            ));
+            return;
+        }
+        if !matches!(self.state, SessionState::Running) {
+            self.typed_input_error = Some("先点工具栏「开始」启动实时会话，再朗读".to_string());
+            return;
+        }
+        let Some(session) = &self.session else {
+            self.typed_input_error = Some("实时会话已结束，请重新开始".to_string());
+            return;
+        };
+        if session.speak_typed(text) {
+            self.typed_input.clear();
+            self.typed_input_error = None;
+        } else {
+            self.typed_input_error = Some("实时会话已结束，请重新开始".to_string());
         }
     }
 
@@ -625,6 +684,7 @@ impl KaolsApp {
                     self.session = None;
                     self.running_config_signature = None;
                     self.vad_active = false;
+                    self.typed_input_error = None;
                     // 会话结束：清掉可能残留的「当前句」（历史保留）
                     self.subtitles.reset_current();
                     // 配置变更触发的停止：旧会话已退出，用新配置自动重启
@@ -650,6 +710,9 @@ impl KaolsApp {
             } => {
                 self.subtitles
                     .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id)
+            }
+            PipelineEvent::TypedSentence { text, language } => {
+                self.subtitles.push_typed(text, language);
             }
             PipelineEvent::VadActive(active) => self.vad_active = active,
             PipelineEvent::Error { context, detail } => {
@@ -1103,6 +1166,22 @@ mod tests {
         apply_with_id(&mut state, "重复句。", true, Some("zh"), 1);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].text, "重复句。");
+    }
+
+    #[test]
+    fn typed_sentence_goes_to_history_without_touching_current_or_dedup() {
+        let mut state = SubtitleState::default();
+        apply(&mut state, "识别中的半句", false, 0, None);
+
+        state.push_typed("打字输入的句子。".to_string(), "ja".to_string());
+        // 打字输入只进历史，不改当前正在修订的 ASR 句
+        assert_eq!(state.current, "识别中的半句");
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].language, "ja");
+
+        // 同一句输入两次是两次真实朗读，都要保留
+        state.push_typed("打字输入的句子。".to_string(), "ja".to_string());
+        assert_eq!(state.history.len(), 2);
     }
 
     #[test]

@@ -119,7 +119,8 @@
 
 - 后台 → 界面统一走 `tokio::sync::mpsc::unbounded_channel::<PipelineEvent>()`；后台每次发事件后调用 `ctx.request_repaint()`，界面每帧 `try_recv()` 排空。
 - 事件里不出现 egui 类型，保持可测试；字段以 `src/events.rs` 为唯一事实源：
-  `StateChanged`、`Devices`、`VoiceInfo`、`Asr { text, is_sentence_end, sent_bytes, language, sentence_id }`、`VadActive`、`Error`。
+  `StateChanged`、`Devices`、`VoiceInfo`、`Asr { text, is_sentence_end, sent_bytes, language, sentence_id }`、`TypedSentence`、`VadActive`、`Error`。
+- 反向命令（GUI → 会话）同样走通道：`PipelineSessionHandle` 持有打字输入的无界 `Sender`，会话调度循环用 `biased` select 优先处理它（D24）。
 - 管线内部（音频、ASR 事件、TTS 输入）使用有界 channel（容量 100）；音频回调用 `try_send`，满即丢包。
 
 **理由**
@@ -412,6 +413,37 @@
 **理由**
 
 - 不同语言的复刻声线本身语速未必合适；把语速绑定到样本，可以分别校正，且不改变音色与缓存语义。
+
+---
+
+## D24 实时页「打字输入」：排队朗读，不打断播放
+
+**决定**
+
+- 「实时」页字幕区下方提供输入框（支持多行，Shift+Enter 换行）；按 Enter 或点「朗读」把输入内容交给当前实时会话排队朗读（下称**打字输入**）。
+- 只有会话处于 `Running` 时可提交；未运行时输入框仍可输入，提交时给行内提示。空白不提交；单次输入上限 **500 字符**（界面校验；会话侧对异常调用的超长文本按字符边界防御性截断并记 warning，不整句丢弃）。
+- 打字输入句的合成方式：
+  1. 作为**独立的新 TTS task**：整句一条 `continue-task` + `finish-task`，不经过流式分块；
+  2. 语言判定与 ASR 共用**同一个** `LanguageTracker`（继承当前对话的粘性语言，并把判定结果回写 `current`）；voice / rate / instruction 按该语言解析（与 ASR 句相同）；
+  3. 提交即进字幕历史（不按 `sentence_id` 去重、不额外标记来源）。
+- 插入语义：
+  - **不打断、不清空播放队列、不取消 TTS task**：已排队/正在播放的音频照常播完，打字输入句排在队尾（FIFO）。
+  - 若 ASR 当前句的 TTS task 还开着（已送 chunk、未发句终），先发「空文本 + 句终」让它正常收口（已收到的文本合成完、音频继续入队），再发打字输入句作为下一个 task。
+  - 若 ASR 当前句尚未识别结束：把当前字幕句按**已送 TTS 的字节前缀**收尾进历史（前缀为空则直接清空当前行），重置本地分块与句状态，并丢弃该句剩余部分直到服务端给出句子结束；期间不再送 TTS。
+- 不引入第二 TTS 模型或第二协议，沿用 `[tts] model`（D3）。
+- GUI 回车用「多行输入框保持焦点」语义：`TextEdit::multiline` 的 `return_key` 设为 **Shift+Enter**（原生插入换行），单独 Enter 由界面检测后提交；中文 IME 确认候选的 Enter 由 egui-winit 的 `VK_PROCESSKEY` 过滤保证不会提交。
+
+**理由**
+
+- 播放队列是 FIFO，排队语义符合“不要打断当前朗读”的预期；在任务边界处排队，避免把打字文本拼进 ASR 当前句、也避免打断正在播放的音频。
+- 打字输入与语音输入同属一段对话，语言粘性应共享，否则“日语句子中间打‘东京’却按中文读”会违背用户意图。
+- 不取消 task、不清播放队列后，TTS 客户端与播放层无需改动，行为风险最低。
+
+**边界**
+
+- 打字输入句的语言仍受 `[asr] languages` 约束（与 ASR 相同），列表外的语言回退到列表首个。
+- 排队期间停止或热重启会话时，尚未播放的打字输入句随会话丢弃，字幕历史保留。
+- 被打断的 ASR 句剩余部分不会补读；字幕只保留已送 TTS 的前缀。
 
 ---
 
