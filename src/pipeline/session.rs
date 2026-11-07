@@ -370,8 +370,13 @@ pub async fn run(
                         runtime.bump_generation();
                         chunker.reset();
                         language_state.on_event("", true);
-                        asr_sentence_open = false;
-                        discard_asr_sentence = true;
+                        // 只有此刻确实有 ASR 句在服务端识别中，才需要丢弃它的剩余部分；
+                        // 空闲时打字输入不能把「下一句」当成被收口句丢掉（否则下一句整句
+                        // 的事件都会在 discard 分支里被吞掉，界面毫无反应）。
+                        if asr_sentence_open {
+                            asr_sentence_open = false;
+                            discard_asr_sentence = true;
+                        }
                         tts_task_language = None;
 
                         let source_language = language_state.typed_language(&text);
