@@ -58,6 +58,15 @@ pub const DEFAULT_VAD_TAIL_MS: u32 = 1000;
 /// 默认投机分块词数阈值。
 pub const DEFAULT_CHUNK_WORDS: usize = 6;
 
+/// 翻译模型默认值（qwen-mt-flash：低延迟文本翻译，支持 92 种语言互译）。
+pub const DEFAULT_TRANSLATE_MODEL: &str = "qwen-mt-flash";
+
+/// 翻译目标语言默认值（英语）。
+pub const DEFAULT_TRANSLATE_TARGET: &str = "en";
+
+/// 默认翻译粒度：标点/句终即翻（低延迟，可能翻碎句）。
+pub const DEFAULT_TRANSLATE_GRANULARITY: TranslateGranularity = TranslateGranularity::Clause;
+
 /// 应用配置，对应 `config.toml` 的顶层结构。
 ///
 /// 所有字段都有默认值：最小的配置文件只需要提供 `[api] key`。
@@ -68,6 +77,7 @@ pub struct AppConfig {
     pub api: ApiConfig,
     pub asr: AsrConfig,
     pub tts: TtsConfig,
+    pub translate: TranslateConfig,
     pub audio: AudioConfig,
     pub vad: VadConfig,
     pub chunking: ChunkingConfig,
@@ -144,6 +154,62 @@ impl Default for TtsConfig {
             voice: DEFAULT_VOICE.to_string(),
             custom_voices: HashMap::new(),
             cache_file: PathBuf::from(DEFAULT_VOICE_CACHE_FILE),
+        }
+    }
+}
+
+/// 翻译粒度：决定多长的源文片段送去翻译。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TranslateGranularity {
+    /// 标点或句终即送翻（延迟低，可能翻碎句）。
+    #[default]
+    Clause,
+    /// 整句结束再送翻（质量优先，延迟高）。
+    Sentence,
+}
+
+impl TranslateGranularity {
+    /// 配置/日志里的稳定写法。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Clause => "clause",
+            Self::Sentence => "sentence",
+        }
+    }
+}
+
+/// `[translate]`：翻译模式。
+///
+/// 开启后：输入文本先翻成 `target` 语言，再交给 TTS 合成并以字幕显示；
+/// 关闭时完全走原有识别/合成链路（见 docs/translation.md）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranslateConfig {
+    /// 是否启用翻译模式（GUI 可改）。
+    pub enabled: bool,
+
+    /// 目标语言代码（[`language::TRANSLATION_LANGUAGES`] 之一，默认 en）。
+    pub target: String,
+
+    /// 翻译模型（只读；手改配置后「重新加载配置」生效）。
+    pub model: String,
+
+    /// 翻译粒度（GUI 可改）。
+    pub granularity: TranslateGranularity,
+
+    /// 字幕是否同时显示原文（GUI 可改；只影响渲染，不触发会话重启）。
+    pub show_source: bool,
+}
+
+impl Default for TranslateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: DEFAULT_TRANSLATE_TARGET.to_string(),
+            model: DEFAULT_TRANSLATE_MODEL.to_string(),
+            granularity: DEFAULT_TRANSLATE_GRANULARITY,
+            show_source: true,
         }
     }
 }
@@ -311,6 +377,10 @@ impl AppConfig {
             .collect();
         self.tts.model = self.tts.model.trim().to_string();
         self.tts.voice = self.tts.voice.trim().to_string();
+        self.translate.target =
+            language::canonical_language(self.translate.target.trim().to_lowercase().as_str())
+                .to_string();
+        self.translate.model = self.translate.model.trim().to_string();
         self.audio.input_device = normalize_optional(self.audio.input_device.take());
         self.audio.output_device = normalize_optional(self.audio.output_device.take());
         for custom in self.tts.custom_voices.values_mut() {
@@ -338,6 +408,7 @@ impl AppConfig {
             bail!("配置项 [tts] voice 不能为空");
         }
         self.validate_custom_voices()?;
+        self.validate_translate()?;
         if self.chunking.words == 0 {
             bail!("配置项 [chunking] words 必须大于 0");
         }
@@ -435,6 +506,26 @@ impl AppConfig {
         Ok(())
     }
 
+    /// 校验 `[translate]`：模型必须有值；启用翻译时目标语言必须可合成。
+    ///
+    /// 关闭翻译时不校验目标语言，允许用户先改开关、后选语言；
+    /// 真正启用时会在下一次配置加载/写回校验中报错。
+    fn validate_translate(&self) -> Result<()> {
+        if self.translate.model.trim().is_empty() {
+            bail!("配置项 [translate] model 不能为空");
+        }
+        if self.translate.enabled
+            && !language::is_cloning_language(language::canonical_language(&self.translate.target))
+        {
+            bail!(
+                "配置项 [translate] target {:?} 不是可合成的目标语言；可用代码: {:?}",
+                self.translate.target,
+                language::TRANSLATION_LANGUAGES
+            );
+        }
+        Ok(())
+    }
+
     /// 把配置里的相对路径解析为相对「配置文件所在目录」的绝对/可用路径。
     pub fn resolve_path(&self, path: &Path) -> PathBuf {
         if path.is_absolute() || self.base_dir.as_os_str().is_empty() {
@@ -480,6 +571,15 @@ impl AppConfig {
     /// 百炼 HTTP API 基址（音色上传 / 管理等），如 `https://dashscope.aliyuncs.com/api/v1`
     pub fn http_api_base(&self) -> String {
         format!("https://{}/api/v1", self.api.workspace_host)
+    }
+
+    /// 翻译（qwen-mt）使用的 OpenAI 兼容 chat 端点，如
+    /// `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
+    pub fn translate_chat_url(&self) -> String {
+        format!(
+            "https://{}/compatible-mode/v1/chat/completions",
+            self.api.workspace_host
+        )
     }
 }
 
@@ -593,6 +693,15 @@ mod tests {
         assert_eq!(config.vad.tail_ms, DEFAULT_VAD_TAIL_MS);
         assert!(!config.vad.debug);
         assert_eq!(config.chunking.words, DEFAULT_CHUNK_WORDS);
+        assert!(!config.translate.enabled);
+        assert_eq!(config.translate.target, DEFAULT_TRANSLATE_TARGET);
+        assert_eq!(config.translate.model, DEFAULT_TRANSLATE_MODEL);
+        assert_eq!(
+            config.translate.granularity,
+            TranslateGranularity::Clause,
+            "默认翻译粒度是标点即翻"
+        );
+        assert!(config.translate.show_source);
         assert_eq!(
             config.inference_ws_url(),
             "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
@@ -613,6 +722,12 @@ languages = ["ja", "zh", "en"]
 [tts]
 model = "tts-test"
 voice = "voice-test"
+
+[translate]
+enabled = true
+target = "ja"
+granularity = "sentence"
+show_source = false
 
 [audio]
 input_device = "Microphone"
@@ -642,6 +757,11 @@ words = 10
         );
         assert_eq!(config.tts.model, "tts-test");
         assert_eq!(config.tts.voice, "voice-test");
+        assert!(config.translate.enabled);
+        assert_eq!(config.translate.target, "ja");
+        assert_eq!(config.translate.model, DEFAULT_TRANSLATE_MODEL);
+        assert_eq!(config.translate.granularity, TranslateGranularity::Sentence);
+        assert!(!config.translate.show_source);
         assert_eq!(config.audio.input_device.as_deref(), Some("Microphone"));
         assert_eq!(config.audio.output_device.as_deref(), Some("CABLE Input"));
         assert!(!config.vad.enabled);
@@ -920,5 +1040,83 @@ rate = 1.25
         let config = AppConfig::from_toml_str(&with_key).unwrap();
         assert_eq!(config.api.key.as_deref(), Some("sk-test"));
         assert_eq!(config.api.workspace_host, DEFAULT_WORKSPACE_HOST);
+    }
+
+    #[test]
+    fn translate_target_is_normalized_and_validated() {
+        let config = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = true\ntarget = \" TL \"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.translate.target, "fil",
+            "tl 应归一为 fil，并去掉空白"
+        );
+
+        let err = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = true\ntarget = \"xx\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[translate] target"),
+            "启用翻译时非法目标语言应被拒绝: {err:#}"
+        );
+
+        // 关闭翻译时不校验目标语言，允许先填错、之后再改
+        let config = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = false\ntarget = \"xx\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.translate.target, "xx");
+    }
+
+    #[test]
+    fn translate_granularity_is_parsed() {
+        let default = AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n").unwrap();
+        assert_eq!(
+            default.translate.granularity,
+            TranslateGranularity::Clause,
+            "缺省粒度应为 clause"
+        );
+
+        let sentence = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[translate]\ngranularity = \"sentence\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sentence.translate.granularity,
+            TranslateGranularity::Sentence
+        );
+        assert_eq!(sentence.translate.granularity.label(), "sentence");
+
+        let err = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[translate]\ngranularity = \"word\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown variant"),
+            "非法粒度应解析失败: {err:#}"
+        );
+    }
+
+    #[test]
+    fn translate_model_must_not_be_empty() {
+        let err =
+            AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[translate]\nmodel = \"  \"\n")
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("[translate] model"), "{err:#}");
+    }
+
+    #[test]
+    fn translate_endpoint_uses_compatible_chat_path() {
+        let config = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n\
+             workspace_host = \"ws-test.cn-beijing.maas.aliyuncs.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.translate_chat_url(),
+            "https://ws-test.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
     }
 }

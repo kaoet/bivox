@@ -18,6 +18,12 @@ pub const ASR_LANGUAGES: &[&str] = &[
     "it", "nl", "sv", "da", "fi", "no", "el", "pl", "cs", "hu", "ro", "bg", "hr", "sk",
 ];
 
+/// 翻译模式的目标语言：与 TTS 官方支持的语言一致（翻出来必须念得出来）。
+///
+/// 限制在 16 种而不是 qwen-mt 的 92 种，是为了目标语言的译文一定能交给 TTS；
+/// 扩语言等 TTS 覆盖扩展后再做（见 docs/translation.md §3.3）。
+pub const TRANSLATION_LANGUAGES: &[&str] = CLONING_LANGUAGES;
+
 /// 拉丁字母语系（文本无法可靠区分，统一取配置列表里第一个拉丁语言）。
 const LATIN_LANGUAGES: &[&str] = &[
     "en", "fr", "de", "es", "pt", "it", "id", "ms", "vi", "tl", "fil", "nl", "sv", "da", "fi",
@@ -51,6 +57,29 @@ pub fn tts_language_hint(asr_code: &str) -> &str {
         canonical
     } else {
         "other"
+    }
+}
+
+/// 语言代码的中文显示名（翻译目标语言下拉框用；未知代码原样返回）。
+pub fn language_display_name(code: &str) -> &str {
+    match canonical_language(code) {
+        "zh" => "中文",
+        "en" => "英语",
+        "fr" => "法语",
+        "de" => "德语",
+        "ja" => "日语",
+        "ko" => "韩语",
+        "ru" => "俄语",
+        "pt" => "葡萄牙语",
+        "th" => "泰语",
+        "id" => "印尼语",
+        "vi" => "越南语",
+        "es" => "西班牙语",
+        "it" => "意大利语",
+        "ms" => "马来语",
+        "fil" => "菲律宾语",
+        "ar" => "阿拉伯语",
+        other => other,
     }
 }
 
@@ -458,5 +487,16 @@ mod tests {
         assert!(!is_asr_language("fil"), "ASR 用 tl，不用 fil");
         assert!(!is_cloning_language("hi"), "复刻不支持印地语");
         assert_eq!(canonical_language("tl"), "fil");
+    }
+
+    #[test]
+    fn translation_languages_match_tts_languages_with_display_names() {
+        assert_eq!(TRANSLATION_LANGUAGES, CLONING_LANGUAGES);
+        for code in TRANSLATION_LANGUAGES {
+            let name = language_display_name(code);
+            assert_ne!(name, *code, "目标语言 {code} 应有中文显示名");
+        }
+        assert_eq!(language_display_name("tl"), "菲律宾语");
+        assert_eq!(language_display_name("xx"), "xx", "未知代码原样返回");
     }
 }

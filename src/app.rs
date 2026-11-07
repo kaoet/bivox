@@ -714,6 +714,22 @@ impl KaolsApp {
             PipelineEvent::TypedSentence { text, language } => {
                 self.subtitles.push_typed(text, language);
             }
+            PipelineEvent::Translation {
+                text,
+                sent_bytes,
+                is_sentence_end,
+                language,
+                sentence_id,
+            } => {
+                // 翻译模式：字幕只显示译文，复用同一套「当前句 + 历史」状态机。
+                self.subtitles.apply_asr(
+                    &text,
+                    is_sentence_end,
+                    sent_bytes,
+                    Some(language),
+                    sentence_id,
+                );
+            }
             PipelineEvent::VadActive(active) => self.vad_active = active,
             PipelineEvent::Error { context, detail } => {
                 self.pipeline_error = Some(format!("{context}：{detail}"));
@@ -842,7 +858,7 @@ fn config_signature(config: &AppConfig) -> String {
     let mut signature = String::new();
     let _ = write!(
         signature,
-        "key={:?}\nhost={}\nasr={}\nlangs={:?}\ntts={}\nvoice={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\n",
+        "key={:?}\nhost={}\nasr={}\nlangs={:?}\ntts={}\nvoice={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\ntranslate={}/{}/{}/{}\n",
         config.api.key,
         config.api.workspace_host,
         config.asr.model,
@@ -858,6 +874,10 @@ fn config_signature(config: &AppConfig) -> String {
         config.vad.tail_ms,
         config.vad.debug,
         config.chunking.words,
+        config.translate.enabled,
+        config.translate.target,
+        config.translate.model,
+        config.translate.granularity.label(),
     );
     for (name, voice) in voices {
         let _ = write!(signature, "voice:{name}:{:?}:", voice.name);
@@ -1279,6 +1299,33 @@ rate = 1.0
                 .unwrap();
 
         assert_ne!(config_signature(&base), config_signature(&changed));
+    }
+
+    #[test]
+    fn config_signature_detects_translate_changes_but_ignores_show_source() {
+        // 翻译开关/目标语言/模型/粒度影响运行期行为，必须计入指纹（D20 热重启依据）；
+        // show_source 只影响字幕渲染，不应触发重启。
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[translate]
+enabled = true
+target = "en"
+show_source = true
+"#;
+        let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let target_changed = crate::config::AppConfig::from_toml_str(
+            &toml.replace(r#"target = "en""#, r#"target = "ja""#),
+        )
+        .unwrap();
+        assert_ne!(config_signature(&base), config_signature(&target_changed));
+
+        let show_changed = crate::config::AppConfig::from_toml_str(
+            &toml.replace("show_source = true", "show_source = false"),
+        )
+        .unwrap();
+        assert_eq!(config_signature(&base), config_signature(&show_changed));
     }
 
     #[test]

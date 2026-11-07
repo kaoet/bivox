@@ -54,6 +54,17 @@ pub enum PipelineEvent {
         language: Option<String>,
         sentence_id: Option<u64>,
     },
+    /// 翻译模式当前句的累计译文（会持续增长；`is_sentence_end` 表示这句结束）。
+    ///
+    /// `sent_bytes`：`text` 中已送入 TTS 的字节前缀长度（一定是字符边界）。
+    /// `language`：目标语言代码；`sentence_id`：源 ASR 句的服务端 id（用于字幕去重）。
+    Translation {
+        text: String,
+        sent_bytes: usize,
+        is_sentence_end: bool,
+        language: String,
+        sentence_id: Option<u64>,
+    },
     /// 用户在「实时」页输入框提交的一句**打字输入**，已交给 TTS 排队朗读。
     ///
     /// `language`：本句实际使用的 TTS 语言（与 ASR 句共用同一个粘性语言判定）。

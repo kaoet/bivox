@@ -102,3 +102,16 @@
 [chunking]
 # 投机分块词数阈值
 # words = 6
+
+[translate]
+# 翻译模式（默认关闭）：开启后输入先翻成目标语言，再合成目标语言语音并显示字幕。
+# 当前版本只能手改本段后「重新加载配置」；后续 GUI「翻译」页可改 enabled/target/granularity/show_source，model 只读。
+# enabled = false
+# 目标语言（TTS 支持的 16 种）：zh/en/fr/de/ja/ko/ru/pt/th/id/vi/es/it/ms/fil/ar
+# target = "en"
+# 翻译模型
+# model = "qwen-mt-flash"
+# 翻译粒度：clause = 有标点/句终就翻（延迟低）；sentence = 整句结束再翻（质量优先）
+# granularity = "clause"
+# 字幕是否同时显示原文（当前版本尚未生效，M2 实现）
+# show_source = true

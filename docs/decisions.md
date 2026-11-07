@@ -447,6 +447,33 @@
 
 ---
 
+## D25 翻译模式：ASR/打字 → MT → 现有 TTS
+
+**决定**
+
+- 翻译模式作为现有实时管线的**中间层**：源文分块后逐块调用 `qwen-mt-flash`（OpenAI 兼容 HTTP），译文再走现有 TTS、播放与字幕；不引入第二套实时语音协议，也不改播放层。
+- 目标语言限 **16 种** TTS 官方支持语言（`TRANSLATION_LANGUAGES = CLONING_LANGUAGES`），默认 `en`；翻译模型默认 `qwen-mt-flash`。请求必须带 `translation_options = { source_lang, target_lang }`（缺失会退化成普通对话模型）；源语言直接用 ISO 代码，无法判定时用 `auto`。
+- 配置放 `[translate]`（`enabled` / `target` / `model` / `granularity` / `show_source`）：M1 只读配置、字幕只显示译文；GUI 翻译页与双语字幕是后续里程碑。
+- 分块：默认 `clause` = 标点/句终切，且标点切点必须离开 ASR 尾部 ≥3 字符；可选 `sentence` = 只句终切。默认 `ChunkPolicy` 与现有 TTS 路径行为完全不变。
+- 翻译 worker 独立 tokio 任务、单 in-flight 保序；打字输入 bump `generation` 丢弃旧句在途译文；源文句终用「等 `pending` 归零再 finish-task」的屏障。
+- 源语言 == 目标语言时跳过 MT，直接送 TTS。
+- 翻译失败按 D8 显示错误条，失败片段不送 TTS；已送 TTS 的译文不可撤回，也不重试已送内容。
+
+**理由**
+
+- 复用现有 ASR/TTS/播放/音色/字幕与打字输入，改动面最小；spike 实测 `qwen-mt-flash` 短句 0.2–0.3s、16 语种全部可用，端到端延迟可控。
+- LiveTranslate 一体模型延迟更低，但不支持打字输入、音色需按该模型另建、RPM 仅 10，无法覆盖现有打字输入与自定义音色路径。
+- 字幕只显示译文可保证“看到的字幕 = 听到的音频”，避免原文/译文错位。
+
+**边界**
+
+- M1 无 GUI 开关；启用或改目标语言需手改 `config.toml` 后「重新加载配置」。
+- 已送 TTS 的译文不能撤回；`clause` 模式每个标点最多多等一次 ASR 更新（约 100–300ms）。
+- 自定义音色缺目标语言样本时按 D11 的样本回退规则处理，不额外提示。
+- 翻译逐块 HTTP，不做跨句上下文；长文连贯性依赖模型自身。
+
+---
+
 ## 新增或修改决策时
 
 1. 先确认这是**长期约束**，而不是一次实现细节；实现细节写进 [architecture.md](./architecture.md)。

@@ -12,7 +12,7 @@ pub mod cache;
 pub mod editor;
 
 #[cfg(test)]
-mod mock_http;
+pub(crate) mod mock_http;
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;

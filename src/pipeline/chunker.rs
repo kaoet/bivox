@@ -2,6 +2,51 @@ pub struct TextChunker {
     emitted_text: String,
     chunk_word_threshold: usize,
     guard_tail_chars: usize,
+    policy: ChunkPolicy,
+}
+
+/// 切分策略。
+///
+/// 默认策略保持现有“TTS 边说边合成”的行为；翻译模式按粒度选择更保守的策略
+/// （见 docs/translation.md §6.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkPolicy {
+    /// 是否允许按词数/字数兜底硬切。
+    pub word_cut: bool,
+    /// 是否允许遇到标点即切。
+    pub punctuation_cut: bool,
+    /// 标点切点距当前文本末尾不足该字符数时先不切（0 = 关闭）。
+    pub punctuation_tail_guard: usize,
+}
+
+impl ChunkPolicy {
+    /// 翻译模式 · clause：只按标点/句终切，且标点须离开 ASR 不稳定尾部。
+    pub fn translation_clause() -> Self {
+        Self {
+            word_cut: false,
+            punctuation_cut: true,
+            punctuation_tail_guard: TextChunker::DEFAULT_GUARD_TAIL_CHARS,
+        }
+    }
+
+    /// 翻译模式 · sentence：只在句终切。
+    pub fn translation_sentence() -> Self {
+        Self {
+            word_cut: false,
+            punctuation_cut: false,
+            punctuation_tail_guard: 0,
+        }
+    }
+}
+
+impl Default for ChunkPolicy {
+    fn default() -> Self {
+        Self {
+            word_cut: true,
+            punctuation_cut: true,
+            punctuation_tail_guard: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +203,7 @@ impl TextChunker {
             emitted_text: String::new(),
             chunk_word_threshold,
             guard_tail_chars: Self::DEFAULT_GUARD_TAIL_CHARS,
+            policy: ChunkPolicy::default(),
         }
     }
 
@@ -166,6 +212,17 @@ impl TextChunker {
             emitted_text: String::new(),
             chunk_word_threshold,
             guard_tail_chars,
+            policy: ChunkPolicy::default(),
+        }
+    }
+
+    /// 使用指定切分策略（翻译模式用；默认策略见 [`ChunkPolicy::default`]）。
+    pub fn with_policy(chunk_word_threshold: usize, policy: ChunkPolicy) -> Self {
+        Self {
+            emitted_text: String::new(),
+            chunk_word_threshold,
+            guard_tail_chars: Self::DEFAULT_GUARD_TAIL_CHARS,
+            policy,
         }
     }
 
@@ -217,16 +274,24 @@ impl TextChunker {
         while !pending_slice.is_empty() {
             let mut cut_point = None;
 
-            // 1. 优先检查标点符号切分点（英文逗号、句号等以及中文标点）
-            for (idx, ch) in pending_slice.char_indices() {
-                if SENTENCE_PUNCTUATION.contains(&ch) {
-                    cut_point = Some(idx + ch.len_utf8());
-                    break;
+            // 1. 优先检查标点符号切分点（英文逗号、句号等以及中文标点）。
+            //    翻译模式要求标点离开 ASR 不稳定尾部后再切：切点之后的字符数不足
+            //    guard 时先跳过，等文本继续延展（句终分支不受此限制）。
+            if self.policy.punctuation_cut {
+                for (idx, ch) in pending_slice.char_indices() {
+                    if SENTENCE_PUNCTUATION.contains(&ch) {
+                        let cut = idx + ch.len_utf8();
+                        let tail_chars = pending_slice[cut..].chars().count();
+                        if tail_chars >= self.policy.punctuation_tail_guard {
+                            cut_point = Some(cut);
+                            break;
+                        }
+                    }
                 }
             }
 
             // 2. 若未遇到标点，检查分词/字数阈值（应用 guard_tail 尾部保护，防止切到未稳定的浮动字）：
-            if cut_point.is_none() {
+            if cut_point.is_none() && self.policy.word_cut {
                 if contains_cjk(pending_slice) {
                     // 中文连续文字：超过设定的字符数阈值（默认 12 字 + guard_tail_chars）
                     let char_count = pending_slice.chars().count();
@@ -440,5 +505,46 @@ mod tests {
         let chunks = chunker.process_stream(text, false);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_text, "one two three");
+    }
+
+    #[test]
+    fn test_translation_clause_waits_for_punctuation_to_leave_tail() {
+        let mut chunker = TextChunker::with_policy(6, ChunkPolicy::translation_clause());
+        // 逗号紧贴当前文本末尾（剩余 0 字 < guard 3）：先不切
+        assert!(chunker.process_stream("你好，", false).is_empty());
+        // 文本延展后逗号已离开尾部（剩余 3 字）：切出
+        let chunks = chunker.process_stream("你好，世界啊", false);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_text, "你好，");
+        assert!(!chunks[0].is_sentence_end);
+        // 句终不受 guard 限制
+        let chunks = chunker.process_stream("你好，世界啊。", true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_text, "世界啊。");
+        assert!(chunks[0].is_sentence_end);
+    }
+
+    #[test]
+    fn test_translation_clause_never_hard_cuts_without_punctuation() {
+        let mut chunker = TextChunker::with_policy(6, ChunkPolicy::translation_clause());
+        let text = "字".repeat(40);
+        // 没有标点：翻译模式不做兜底硬切
+        assert!(chunker.process_stream(&text, false).is_empty());
+        // 句终时整句一次切出
+        let sentence = format!("{text}。");
+        let chunks = chunker.process_stream(&sentence, true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_text, sentence);
+        assert!(chunks[0].is_sentence_end);
+    }
+
+    #[test]
+    fn test_translation_sentence_only_cuts_at_sentence_end() {
+        let mut chunker = TextChunker::with_policy(6, ChunkPolicy::translation_sentence());
+        assert!(chunker.process_stream("你好，世界！", false).is_empty());
+        let chunks = chunker.process_stream("你好，世界！第二句", true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_text, "你好，世界！第二句");
+        assert!(chunks[0].is_sentence_end);
     }
 }

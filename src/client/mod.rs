@@ -1,4 +1,5 @@
 pub mod qwen_asr;
+pub mod qwen_mt;
 pub mod qwen_tts;
 pub mod ws;
 

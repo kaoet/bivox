@@ -16,6 +16,7 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 - 内部全异步：tokio runtime 跑后台任务，eframe 占主线程（D5）；
 - 两个二进制：`kaols.exe`（GUI 主程序）与 `admin.exe`（百炼音色调试 CLI，不随发布包分发，D19）；
 - 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口，以及声音复刻 HTTP 接口；
+- 翻译模式（`[translate] enabled`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成、字幕显示译文（M1，GUI 开关与双语字幕在后续里程碑）；
 - 没有本地语音模型，运行必须联网并配置 API Key。
 
 ### 数据流
@@ -37,6 +38,12 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 
 实时页打字输入 ──(TypedInput 命令通道)──▶ 会话调度循环
   └─ 作为独立 TTS task 排到队尾（不打断播放；必要时先收口 ASR 当前句的 task，D24）
+
+翻译模式（`[translate] enabled = true`，D25）：
+  ASR/打字文本 → 翻译模式分块（clause：标点离开尾部才切；sentence：只句终）
+    └─ 翻译 worker（qwen-mt-flash，单任务保序）→ 译文
+         └─ 现有 TTS（目标语言音色）→ 播放；PipelineEvent::Translation → 字幕
+            （M1 只显示译文，双语字幕是 M2）
 
 关键取舍：
 
@@ -69,10 +76,12 @@ src/
 ├── client/
 │   ├── ws.rs            鉴权建连、Ping 保活、指数退避重连的公共骨架
 │   ├── qwen_asr.rs      Qwen-Audio 实时流式识别
-│   └── qwen_tts.rs      Qwen-Audio-TTS 流式合成
+│   ├── qwen_tts.rs      Qwen-Audio-TTS 流式合成
+│   └── qwen_mt.rs       机器翻译（qwen-mt-flash，OpenAI 兼容 HTTP）
 ├── pipeline/
-│   ├── chunker.rs       流式文本分块
-│   └── session.rs       实时会话编排（ASR → 语言 → 分块 → TTS；打字输入排队）
+│   ├── chunker.rs       流式文本分块（含翻译模式 ChunkPolicy）
+│   ├── translator.rs    翻译 worker（单 in-flight 保序，generation 丢弃旧结果）
+│   └── session.rs       实时会话编排（ASR → 语言 → 分块 → TTS；打字输入/翻译接入）
 ├── voice/
 │   ├── mod.rs           生效音色解析、样本复刻/缓存注册、语言→(voice_id, 语速) 映射
 │   ├── api.rs           百炼声音复刻 HTTP API（不依赖 SDK）
@@ -227,6 +236,11 @@ main()
 | | `tail_ms` | `1000` | 句末补发的静音，用于触发服务端 sentence_end |
 | | `debug` | `false` | 打印每个 chunk 的 VAD 决策 |
 | `[chunking]` | `words` | `6` | 投机分块阈值 |
+| `[translate]` | `enabled` | `false` | 翻译模式开关 |
+| | `target` | `en` | 目标语言（16 种 TTS 语言之一） |
+| | `model` | `qwen-mt-flash` | 翻译模型 |
+| | `granularity` | `clause` | `clause`（标点/句终切 + 安全尾）或 `sentence`（只句终切） |
+| | `show_source` | `true` | 预留：字幕是否显示原文（M2 生效） |
 
 `[tts.custom_voices.<键名>]`：
 
@@ -256,12 +270,14 @@ rate = 1.0
 - ASR/TTS model、TTS voice 非空；
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
 - 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
-- `[chunking] words > 0`；`[vad] margin_db` 必须是有限数。
+- `[chunking] words > 0`；`[vad] margin_db` 必须是有限数；
+- `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`。
 
 **派生 URL**：
 
 - WebSocket（ASR/TTS 共用）：`wss://{workspace_host}/api-ws/v1/inference`
 - HTTP（声音复刻）：`https://{workspace_host}/api/v1`
+- HTTP（翻译，OpenAI 兼容）：`https://{workspace_host}/compatible-mode/v1/chat/completions`
 
 ### 4.3 配置写回
 
@@ -274,7 +290,7 @@ rate = 1.0
 
 ### 4.4 配置指纹与热更新
 
-`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/缓存路径、设备、VAD 参数、分块阈值，以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
+`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
 
 写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。
 
@@ -300,6 +316,7 @@ rate = 1.0
 
 - `PipelineEvent` 字段以 `src/events.rs` 为唯一事实源；事件不携带 egui 类型。
 - `TypedSentence`：会话接受一句打字输入、已交给 TTS 排队后发给界面（进字幕历史）。
+- `Translation`：翻译模式下的译文（可能随 ASR 修订多次到达），`language` 固定为目标语言；界面复用它更新「当前句」，句终时进历史（M1 只显示译文）。
 - GUI → 后台唯一命令通道是打字输入通道；会话调度循环用 `biased` select 优先处理它，避免按下回车后又把当前 ASR 句的 chunk 送进 TTS（D24）。
 - ASR→会话、会话→TTS、采集→ASR 使用有界 channel（容量 100）；采集端用 `try_send`，满则丢弃，避免阻塞实时回调。
 - 会话状态机：`Idle → Starting → Running → Stopping → Idle`；失败路径为 `Starting/Running → Failed`。GUI 以 `Idle`/`Failed` 作为“会话已结束”的信号。
@@ -387,11 +404,14 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
    - 实质字符不一致时，在前后 3 个字符窗口内重新同步，否则按“单字替换”推进；
    - 已发射 ≥6 字符但当前文本更短且完全对不上时，视为外部重置。
 2. **句终**：直接把未消费的剩余文本 trim 后作为一个 `is_sentence_end` 切片，然后重置。
-3. **句中标点**：遇到 `, . ? ! ; :` 或中文标点即切。
-4. **无标点时**：
+3. **句中标点**：默认策略遇到 `, . ? ! ; :` 或中文标点即切。
+4. **无标点时（默认策略）**：
    - 含 CJK：字符数达到 `chunking.words × 2 + guard_tail`（默认 12+3）后切，避免把中英混排的英文单词截断；
    - 无 CJK：空格分词数达到 `chunking.words + guard` 后按词边界切。
-5. **尾部保护**：保留约 3 个字符/1 个词的“安全尾部”，避免切到 ASR 尚未稳定的浮动字。
+5. **策略开关（`ChunkPolicy`）**：默认 `word_cut = true`、`punctuation_cut = true`、`punctuation_tail_guard = 0`，行为与第 1–4 条一致。
+   - `translation_clause()`：关闭词数兜底，只按标点/句终切；标点切点距当前文本末尾不足 3 个字符时**先不切**，等 ASR 文本延展后再切（译文不可撤回，避免送未收敛尾部）；`is_sentence_end` 不受该限制。
+   - `translation_sentence()`：只在句终切，句内不送翻译。
+   - 安全尾只作用于标点分支，且仅翻译模式开启；现有 TTS 路径行为与测试不变。
 6. `emitted_byte_len(full_text)` 返回已送入 TTS 的字节前缀，供字幕分色；该前缀一定是字符边界。
 
 ---
@@ -514,8 +534,8 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **146** 个（以 `cargo test` 输出为准）。
-- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块、ASR/TTS 协议解析、缓存、VAD、单实例命名等纯逻辑。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **164** 个（以 `cargo test` 输出为准）。
+- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
 - 静态截图：glow 变体 + `EFRAME_SCREENSHOT_TO`（wgpu 不支持该调试特性）。
@@ -539,4 +559,22 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 打字输入句是**排队**语义：当前排队/播放的音频全部播完后才轮到它；界面在提交时就把该句加入字幕历史，可能与实际发声时间有延迟。
 - 若提交打字输入时 ASR 当前句尚未句终，该句剩余部分会被丢弃、不会补读（字幕只保留已送 TTS 的前缀，D24）；极端情况下用户持续说话期间打字输入会暂停该句后续合成。
 - 打字输入句上限 500 字符；TTS 连续启动失败 3 次时该句按现有机制丢弃（只写日志，不弹错误条）。
+- 翻译模式（M1）没有 GUI 开关与双语字幕：启用/改目标语言需手改 `config.toml` 后「重新加载配置」，字幕只显示译文（D25）。
+- 翻译是逐块 HTTP 请求：clause 模式的实际延迟、端到端 1s 目标、16 语种 TTS 自然度与碎句译文质量尚未做真实语料评估。
+- 已送 TTS 的译文不可撤回；翻译失败的片段不发声，只按 D8 显示错误条。
 - 没有 CI；UI 与真实音频链路的回归依赖人工验证。
+
+---
+
+## 15. 翻译模式（M1）
+
+链路：现有 ASR/打字输入 → 本地语言判定与分块 → **翻译 worker**（`client/qwen_mt.rs` + `pipeline/translator.rs`）→ 译文 → 现有 TTS/播放与字幕。
+
+- **开关与目标语言**：`[translate] enabled/target/model/granularity/show_source`（D25）。M1 只读配置；GUI 翻译页与双语字幕在后续里程碑。`enabled = false` 时整条链路与旧行为完全一致。
+- **翻译接口**：`POST https://{workspace_host}/compatible-mode/v1/chat/completions`，`model = qwen-mt-flash`；`messages` 单条 user 文本；`translation_options = { source_lang, target_lang }` **必填**（缺失时模型会退化成普通对话）。源/目标语言直接用 ISO 代码，`source_lang = "auto"` 可兜底；目标语言限 16 种 TTS 语言。
+- **worker**：独立 tokio 任务，单 in-flight 顺序处理（`TranslationJob`/`TranslationDone` 带 `generation` 与 `seq`），主循环不 await HTTP；打字输入会 bump `generation` 并丢弃旧句在途译文。
+- **句终屏障**：源文句终时若还有译文在途，等 `pending` 归零后再发「空文本 + 句终」收口 TTS task；打字输入立即收口当前 task 并丢弃未返回译文。
+- **分块策略**：`clause`（默认）= 标点/句终切 + 安全尾；`sentence` = 只句终切（见第 9 节）。
+- **字幕/事件**：`PipelineEvent::Translation{text, sent_bytes, is_sentence_end, language, sentence_id}`，`language` 固定为目标语言；M1 复用 `SubtitleState::apply_asr` 的当前句/历史/去重逻辑，只显示译文。
+- **失败处理**：翻译失败发 `PipelineEvent::Error`（D8），该片段不送 TTS，后续片段继续。
+- **验证**：`cargo test` 覆盖 qwen_mt 协议/重试/错误、chunker 安全尾、config 校验与语言表；运行期用真实接口 + 打字输入验证 zh→en（字幕与 TTS 请求均进入目标语言），ASR 语音路径用环境中英文语音间接验证（en→en 跳过 MT）。

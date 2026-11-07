@@ -19,12 +19,14 @@ use crate::audio::device::AudioDeviceManager;
 use crate::audio::playback::AudioPlaybackEngine;
 use crate::audio::vad;
 use crate::client::qwen_asr::QwenAsrClient;
+use crate::client::qwen_mt::QwenMtClient;
 use crate::client::qwen_tts::{QwenTtsClient, QwenTtsConfig, TtsChunkRequest};
 use crate::client::AsrEvent;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, TranslateGranularity};
 use crate::events::{PipelineEvent, SessionState};
-use crate::language::LanguageTracker;
-use crate::pipeline::chunker::TextChunker;
+use crate::language::{canonical_language, LanguageTracker};
+use crate::pipeline::chunker::{ChunkPolicy, TextChunker};
+use crate::pipeline::translator::{self, TranslationDone, TranslationJob};
 use crate::voice::ActiveVoice;
 
 /// 取消检查间隔：ASR 事件本身是事件驱动的，短轮询兼顾停止响应速度与开销。
@@ -221,7 +223,7 @@ pub async fn run(
         let running = handle.running.clone();
         let user_stopped = handle.stop_requested.clone();
         let tts_config = QwenTtsConfig {
-            api_key,
+            api_key: api_key.clone(),
             tts_model: config.tts.model.clone(),
             ws_url: inference_ws_url,
         };
@@ -243,11 +245,42 @@ pub async fn run(
         }));
     }
 
+    // 翻译 worker：开启后 ASR/打字文本先经 MT 再送 TTS。目标语言与音色在会话内固定，
+    // 运行中改配置由 D20 热重启处理；主循环只通过通道收发，不 await HTTP。
+    let translate = config.translate.clone();
+    let mut translation: Option<TranslationRuntime> = None;
+    let mut rx_mt: Option<UnboundedReceiver<TranslationDone>> = None;
+    if translate.enabled {
+        let target = canonical_language(&translate.target).to_string();
+        let client = QwenMtClient::new(
+            api_key.clone(),
+            translate.model.clone(),
+            config.translate_chat_url(),
+        )?;
+        let (tx_job, done_rx, worker) =
+            translator::spawn(client, target.clone(), handle.running.clone());
+        tasks.push(worker);
+        let (voice_id, rate) = voice.selection_for(&target);
+        translation = Some(TranslationRuntime::new(
+            target,
+            voice_id.to_string(),
+            rate,
+            tx_job,
+        ));
+        rx_mt = Some(done_rx);
+    }
+
     emit(PipelineEvent::StateChanged(SessionState::Running));
 
     // 调度中枢：ASR 事件 -> 句子级语言判定 -> 分块 -> 带 voice/语言推入 TTS；
     // 同时接收「打字输入」命令：排队朗读，不打断播放、不清空播放队列。
-    let mut chunker = TextChunker::new(config.chunking.words);
+    // 翻译模式按粒度选更保守的切分策略；默认路径行为不变。
+    let chunker_policy = match (translate.enabled, translate.granularity) {
+        (true, TranslateGranularity::Clause) => ChunkPolicy::translation_clause(),
+        (true, TranslateGranularity::Sentence) => ChunkPolicy::translation_sentence(),
+        (false, _) => ChunkPolicy::default(),
+    };
+    let mut chunker = TextChunker::with_policy(config.chunking.words, chunker_policy);
     let mut language_state = SentenceLanguageState::new(config.asr.languages.clone());
     // 当前 TTS task 的语言（首个 chunk 送出时固定，task 结束后清空）。
     // TTS 每个 task 只认首 chunk 的 voice/language_hints，所以界面字幕语言必须用它，
@@ -264,6 +297,7 @@ pub async fn run(
     enum Incoming {
         Typed(Option<TypedInput>),
         Asr(Option<AsrEvent>),
+        Mt(Option<TranslationDone>),
         Tick,
     }
 
@@ -272,6 +306,13 @@ pub async fn run(
             // 打字输入优先于还没处理的 ASR 事件：按下回车后不再多送当前句的 chunk。
             biased;
             cmd = typed_rx.recv(), if typed_rx_open => Incoming::Typed(cmd),
+            // 翻译结果要先于后续 ASR 事件处理，保证 TTS 入队顺序与源文一致。
+            done = async {
+                match rx_mt.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<TranslationDone>>().await,
+                }
+            } => Incoming::Mt(done),
             event = rx_asr.recv() => Incoming::Asr(event),
             _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => Incoming::Tick,
         };
@@ -300,69 +341,119 @@ pub async fn run(
                     );
                 }
                 if !text.is_empty() {
-                    // 1) 当前 ASR 句的 TTS task 还开着：先让它正常收口（空文本 + 句终）。
-                    //    服务端会把已收到的文本合成完、音频继续入队；不取消 task、不清播放队列。
-                    let task_language = tts_task_language.clone();
-                    if let Some(language) = task_language.as_deref() {
-                        let (voice_id, rate) = voice.selection_for(language);
-                        let close = TtsChunkRequest {
-                            text: String::new(),
-                            is_sentence_end: true,
-                            voice: voice_id.to_string(),
-                            rate,
-                            language: language.to_string(),
-                        };
-                        if tx_tts.send(close).await.is_err() {
-                            break;
-                        }
-                        tts_task_language = None;
-                    }
-
-                    // 2) ASR 当前句还没结束：字幕只保留「已送 TTS 的前缀」，该句剩余部分
-                    //    丢弃到服务端句终为止（期间不再送 TTS；已送前缀的音频照常播完）。
-                    if asr_sentence_open {
-                        let full = language_state.current_text();
-                        let sent = chunker.emitted_byte_len(full);
-                        let prefix = sent_prefix(full, sent).to_string();
-                        if prefix.is_empty() {
-                            // 一个字都还没送 TTS：当前行没有会被朗读的内容，直接清空。
-                            emit(PipelineEvent::Asr {
+                    if let Some(runtime) = translation.as_mut() {
+                        // 翻译模式：立即收口旧 TTS task、丢弃该句未返回的译文，
+                        // 再把打字内容交给翻译 worker（结果回来后才送 TTS/字幕）。
+                        if runtime.tts_open && !runtime.tts_closed {
+                            let close = TtsChunkRequest {
                                 text: String::new(),
                                 is_sentence_end: true,
-                                sent_bytes: 0,
-                                language: None,
-                                sentence_id: None,
-                            });
-                        } else {
-                            emit(PipelineEvent::Asr {
-                                text: prefix.clone(),
+                                voice: runtime.voice.clone(),
+                                rate: runtime.rate,
+                                language: runtime.target_language.clone(),
+                            };
+                            if tx_tts.send(close).await.is_err() {
+                                break;
+                            }
+                        }
+                        // 旧句已有部分译文：先让界面把当前句归档，避免被下一句覆盖。
+                        if !runtime.translated.is_empty() && !runtime.end_event_sent {
+                            emit(PipelineEvent::Translation {
+                                text: runtime.translated.clone(),
+                                sent_bytes: runtime.translated.len(),
                                 is_sentence_end: true,
-                                sent_bytes: prefix.len(),
-                                language: task_language,
-                                sentence_id: None,
+                                language: runtime.target_language.clone(),
+                                sentence_id: runtime.sentence_id,
                             });
                         }
+                        runtime.bump_generation();
                         chunker.reset();
                         language_state.on_event("", true);
                         asr_sentence_open = false;
                         discard_asr_sentence = true;
-                    }
+                        tts_task_language = None;
 
-                    // 3) 语言与 ASR 共用同一个粘性 tracker：打字输入也属于当前对话，
-                    //    判定结果会回写 current，影响后续句子的语言。
-                    let language = language_state.typed_language(&text);
-                    let (voice_id, rate) = voice.selection_for(&language);
-                    let req = TtsChunkRequest {
-                        text: text.clone(),
-                        is_sentence_end: true,
-                        voice: voice_id.to_string(),
-                        rate,
-                        language: language.clone(),
-                    };
-                    if tx_tts.send(req).await.is_ok() {
-                        emit(PipelineEvent::TypedSentence { text, language });
+                        let source_language = language_state.typed_language(&text);
+                        let skip = canonical_language(&source_language)
+                            == runtime.target_language.as_str();
+                        runtime.pending = 1;
+                        let job = TranslationJob {
+                            generation: runtime.generation,
+                            seq: runtime.next_seq,
+                            text,
+                            source_language,
+                            skip_translation: skip,
+                            is_sentence_end: true,
+                        };
+                        runtime.next_seq += 1;
+                        if runtime.tx_job.send(job).is_err() {
+                            break;
+                        }
                     } else {
-                        break;
+                        // 1) 当前 ASR 句的 TTS task 还开着：先让它正常收口（空文本 + 句终）。
+                        //    服务端会把已收到的文本合成完、音频继续入队；不取消 task、不清播放队列。
+                        let task_language = tts_task_language.clone();
+                        if let Some(language) = task_language.as_deref() {
+                            let (voice_id, rate) = voice.selection_for(language);
+                            let close = TtsChunkRequest {
+                                text: String::new(),
+                                is_sentence_end: true,
+                                voice: voice_id.to_string(),
+                                rate,
+                                language: language.to_string(),
+                            };
+                            if tx_tts.send(close).await.is_err() {
+                                break;
+                            }
+                            tts_task_language = None;
+                        }
+
+                        // 2) ASR 当前句还没结束：字幕只保留「已送 TTS 的前缀」，该句剩余部分
+                        //    丢弃到服务端句终为止（期间不再送 TTS；已送前缀的音频照常播完）。
+                        if asr_sentence_open {
+                            let full = language_state.current_text();
+                            let sent = chunker.emitted_byte_len(full);
+                            let prefix = sent_prefix(full, sent).to_string();
+                            if prefix.is_empty() {
+                                // 一个字都还没送 TTS：当前行没有会被朗读的内容，直接清空。
+                                emit(PipelineEvent::Asr {
+                                    text: String::new(),
+                                    is_sentence_end: true,
+                                    sent_bytes: 0,
+                                    language: None,
+                                    sentence_id: None,
+                                });
+                            } else {
+                                emit(PipelineEvent::Asr {
+                                    text: prefix.clone(),
+                                    is_sentence_end: true,
+                                    sent_bytes: prefix.len(),
+                                    language: task_language,
+                                    sentence_id: None,
+                                });
+                            }
+                            chunker.reset();
+                            language_state.on_event("", true);
+                            asr_sentence_open = false;
+                            discard_asr_sentence = true;
+                        }
+
+                        // 3) 语言与 ASR 共用同一个粘性 tracker：打字输入也属于当前对话，
+                        //    判定结果会回写 current，影响后续句子的语言。
+                        let language = language_state.typed_language(&text);
+                        let (voice_id, rate) = voice.selection_for(&language);
+                        let req = TtsChunkRequest {
+                            text: text.clone(),
+                            is_sentence_end: true,
+                            voice: voice_id.to_string(),
+                            rate,
+                            language: language.clone(),
+                        };
+                        if tx_tts.send(req).await.is_ok() {
+                            emit(PipelineEvent::TypedSentence { text, language });
+                        } else {
+                            break;
+                        }
                     }
                 }
                 if handle.is_cancelled() {
@@ -382,75 +473,142 @@ pub async fn run(
                     continue;
                 }
 
-                language_state.on_event(&event.text, event.is_sentence_end);
-
-                let chunks = chunker.process_stream(&event.text, event.is_sentence_end);
-                let mut sent_sentence_end = false;
-                for chunk in chunks {
-                    if handle.is_cancelled() {
-                        break;
+                if let Some(runtime) = translation.as_mut() {
+                    // 翻译模式：源文只做语言判定与分块，译文回传后才送 TTS 与字幕；
+                    // 源文本身不作为字幕输出，与译文严格一一对应。
+                    language_state.on_event(&event.text, event.is_sentence_end);
+                    let chunks = chunker.process_stream(&event.text, event.is_sentence_end);
+                    for chunk in chunks {
+                        if handle.is_cancelled() {
+                            break;
+                        }
+                        let source_language = language_state.language_for_chunk();
+                        if runtime.sentence_id.is_none() {
+                            runtime.sentence_id = event.sentence_id;
+                        }
+                        // 源语言与目标语言相同（含中文句子切到中文模式）：跳过 MT，直送 TTS。
+                        let skip = canonical_language(&source_language)
+                            == runtime.target_language.as_str();
+                        let job = TranslationJob {
+                            generation: runtime.generation,
+                            seq: runtime.next_seq,
+                            text: chunk.chunk_text,
+                            source_language,
+                            skip_translation: skip,
+                            is_sentence_end: chunk.is_sentence_end,
+                        };
+                        runtime.next_seq = runtime.next_seq.wrapping_add(1);
+                        runtime.pending = runtime.pending.saturating_add(1);
+                        if runtime.tx_job.send(job).is_err() {
+                            break;
+                        }
+                        language_state.on_chunk(chunk.is_sentence_end);
                     }
-
-                    let language = language_state.language_for_chunk();
-                    // TTS 在 task 首个 chunk 时固定 voice / rate / language_hints，后续 chunk 的
-                    // 这些字段会被忽略；界面语言因此取 task 首 chunk 的语言，保证显示与实际合成一致。
-                    if tts_task_language.is_none() {
-                        tts_task_language = Some(language.clone());
+                    // 句终：还有译文在途就等最后一条回来再收口 TTS task（句终屏障）；
+                    // 没有在途译文则立即收口，避免 task 跨句。
+                    if event.is_sentence_end {
+                        if runtime.pending > 0 {
+                            runtime.finish_pending = true;
+                        } else {
+                            if runtime.tts_open && !runtime.tts_closed {
+                                let req = TtsChunkRequest {
+                                    text: String::new(),
+                                    is_sentence_end: true,
+                                    voice: runtime.voice.clone(),
+                                    rate: runtime.rate,
+                                    language: runtime.target_language.clone(),
+                                };
+                                if tx_tts.send(req).await.is_err() {
+                                    break;
+                                }
+                                runtime.tts_closed = true;
+                                if !runtime.end_event_sent {
+                                    emit(PipelineEvent::Translation {
+                                        text: runtime.translated.clone(),
+                                        sent_bytes: runtime.translated.len(),
+                                        is_sentence_end: true,
+                                        language: runtime.target_language.clone(),
+                                        sentence_id: runtime.sentence_id,
+                                    });
+                                    runtime.end_event_sent = true;
+                                }
+                            }
+                            runtime.reset_sentence();
+                        }
                     }
-                    let (voice_id, rate) = voice.selection_for(&language);
-                    let voice_id = voice_id.to_string();
-                    let is_sentence_end = chunk.is_sentence_end;
+                    language_state.on_event_end(event.is_sentence_end);
+                    asr_sentence_open = !event.is_sentence_end;
+                } else {
+                    language_state.on_event(&event.text, event.is_sentence_end);
 
-                    let req = TtsChunkRequest {
-                        text: chunk.chunk_text,
-                        is_sentence_end,
-                        voice: voice_id,
-                        rate,
-                        language,
-                    };
-                    if tx_tts.send(req).await.is_err() {
-                        // TTS 任务已退出：结束会话
-                        break;
-                    }
-                    if is_sentence_end {
-                        sent_sentence_end = true;
-                    }
-                    language_state.on_chunk(is_sentence_end);
-                }
+                    let chunks = chunker.process_stream(&event.text, event.is_sentence_end);
+                    let mut sent_sentence_end = false;
+                    for chunk in chunks {
+                        if handle.is_cancelled() {
+                            break;
+                        }
 
-                // 句终但本事件没有可送的新文本（chunker 已消费完）：TTS 侧 task 还开着，
-                // 补一个「只结束、不追加文本」的请求，避免下一句的音色/语言漏进旧 task。
-                if event.is_sentence_end && !sent_sentence_end {
-                    if let Some(language) = tts_task_language.clone() {
+                        let language = language_state.language_for_chunk();
+                        // TTS 在 task 首个 chunk 时固定 voice / rate / language_hints，后续 chunk 的
+                        // 这些字段会被忽略；界面语言因此取 task 首 chunk 的语言，保证显示与实际合成一致。
+                        if tts_task_language.is_none() {
+                            tts_task_language = Some(language.clone());
+                        }
                         let (voice_id, rate) = voice.selection_for(&language);
+                        let voice_id = voice_id.to_string();
+                        let is_sentence_end = chunk.is_sentence_end;
+
                         let req = TtsChunkRequest {
-                            text: String::new(),
-                            is_sentence_end: true,
-                            voice: voice_id.to_string(),
+                            text: chunk.chunk_text,
+                            is_sentence_end,
+                            voice: voice_id,
                             rate,
                             language,
                         };
-                        if tx_tts.send(req).await.is_ok() {
+                        if tx_tts.send(req).await.is_err() {
+                            // TTS 任务已退出：结束会话
+                            break;
+                        }
+                        if is_sentence_end {
                             sent_sentence_end = true;
                         }
+                        language_state.on_chunk(is_sentence_end);
                     }
-                }
 
-                // 带上「已送入 TTS 的字节前缀」：界面把这段显示为正常色，其余显示为弱色；
-                // language 取当前 TTS task 实际使用的语言（首 chunk 决定），与实际合成严格一致。
-                emit(PipelineEvent::Asr {
-                    text: event.text.clone(),
-                    is_sentence_end: event.is_sentence_end,
-                    sent_bytes: chunker.emitted_byte_len(&event.text),
-                    language: tts_task_language.clone(),
-                    sentence_id: event.sentence_id,
-                });
+                    // 句终但本事件没有可送的新文本（chunker 已消费完）：TTS 侧 task 还开着，
+                    // 补一个「只结束、不追加文本」的请求，避免下一句的音色/语言漏进旧 task。
+                    if event.is_sentence_end && !sent_sentence_end {
+                        if let Some(language) = tts_task_language.clone() {
+                            let (voice_id, rate) = voice.selection_for(&language);
+                            let req = TtsChunkRequest {
+                                text: String::new(),
+                                is_sentence_end: true,
+                                voice: voice_id.to_string(),
+                                rate,
+                                language,
+                            };
+                            if tx_tts.send(req).await.is_ok() {
+                                sent_sentence_end = true;
+                            }
+                        }
+                    }
 
-                if sent_sentence_end {
-                    tts_task_language = None;
+                    // 带上「已送入 TTS 的字节前缀」：界面把这段显示为正常色，其余显示为弱色；
+                    // language 取当前 TTS task 实际使用的语言（首 chunk 决定），与实际合成严格一致。
+                    emit(PipelineEvent::Asr {
+                        text: event.text.clone(),
+                        is_sentence_end: event.is_sentence_end,
+                        sent_bytes: chunker.emitted_byte_len(&event.text),
+                        language: tts_task_language.clone(),
+                        sentence_id: event.sentence_id,
+                    });
+
+                    if sent_sentence_end {
+                        tts_task_language = None;
+                    }
+                    language_state.on_event_end(event.is_sentence_end);
+                    asr_sentence_open = !event.is_sentence_end;
                 }
-                language_state.on_event_end(event.is_sentence_end);
-                asr_sentence_open = !event.is_sentence_end;
 
                 // 处理 ASR 事件后同样检查 VAD 状态变化（语音段起止）
                 let vad_active = handle.vad_active();
@@ -463,13 +621,119 @@ pub async fn run(
                     break;
                 }
             }
+            Incoming::Mt(None) => {
+                // 翻译 worker 已退出（通常发生在停止会话、命令通道关闭之后）。
+                break;
+            }
+            Incoming::Mt(Some(done)) => {
+                let Some(runtime) = translation.as_mut() else {
+                    continue;
+                };
+                // 打字会 bump generation：旧句在途译文直接丢弃，避免串到新句。
+                if done.generation != runtime.generation {
+                    continue;
+                }
+                runtime.pending = runtime.pending.saturating_sub(1);
+
+                let text = match done.result {
+                    Ok(text) => text,
+                    Err(err) => {
+                        log::error!("翻译失败：{err}");
+                        emit(PipelineEvent::Error {
+                            context: "翻译失败".to_string(),
+                            detail: err,
+                        });
+                        String::new()
+                    }
+                };
+
+                if !text.is_empty() {
+                    runtime.translated.push_str(&text);
+                    // TTS 与字幕只用译文；语种固定为目标语言，音色按目标语言选择。
+                    let req = TtsChunkRequest {
+                        text: text.clone(),
+                        is_sentence_end: done.is_sentence_end,
+                        voice: runtime.voice.clone(),
+                        rate: runtime.rate,
+                        language: runtime.target_language.clone(),
+                    };
+                    if tx_tts.send(req).await.is_err() {
+                        break;
+                    }
+                    runtime.tts_open = true;
+                    runtime.tts_closed = done.is_sentence_end;
+                    emit(PipelineEvent::Translation {
+                        text: runtime.translated.clone(),
+                        sent_bytes: runtime.translated.len(),
+                        is_sentence_end: done.is_sentence_end,
+                        language: runtime.target_language.clone(),
+                        sentence_id: runtime.sentence_id,
+                    });
+                    runtime.end_event_sent = done.is_sentence_end;
+                } else if done.is_sentence_end && runtime.tts_open && !runtime.tts_closed {
+                    // 译文为空也要收口：发「只结束」请求，让 TTS 侧正常 finish-task。
+                    let req = TtsChunkRequest {
+                        text: String::new(),
+                        is_sentence_end: true,
+                        voice: runtime.voice.clone(),
+                        rate: runtime.rate,
+                        language: runtime.target_language.clone(),
+                    };
+                    if tx_tts.send(req).await.is_err() {
+                        break;
+                    }
+                    runtime.tts_closed = true;
+                    emit(PipelineEvent::Translation {
+                        text: runtime.translated.clone(),
+                        sent_bytes: runtime.translated.len(),
+                        is_sentence_end: true,
+                        language: runtime.target_language.clone(),
+                        sentence_id: runtime.sentence_id,
+                    });
+                    runtime.end_event_sent = true;
+                }
+
+                // 句终屏障：源文已句终且最后一条译文刚回来，补一个收口请求并复位本句状态。
+                if runtime.pending == 0 && (runtime.finish_pending || done.is_sentence_end) {
+                    if runtime.tts_open && !runtime.tts_closed {
+                        let req = TtsChunkRequest {
+                            text: String::new(),
+                            is_sentence_end: true,
+                            voice: runtime.voice.clone(),
+                            rate: runtime.rate,
+                            language: runtime.target_language.clone(),
+                        };
+                        if tx_tts.send(req).await.is_err() {
+                            break;
+                        }
+                        runtime.tts_closed = true;
+                        if !runtime.end_event_sent {
+                            emit(PipelineEvent::Translation {
+                                text: runtime.translated.clone(),
+                                sent_bytes: runtime.translated.len(),
+                                is_sentence_end: true,
+                                language: runtime.target_language.clone(),
+                                sentence_id: runtime.sentence_id,
+                            });
+                            runtime.end_event_sent = true;
+                        }
+                    }
+                    runtime.reset_sentence();
+                }
+
+                if handle.is_cancelled() {
+                    break;
+                }
+            }
         }
     }
 
-    // 收尾（D13）：先停采集，再关 TTS 通道，最后等后台任务退出。
+    // 收尾（D13）：先停采集，再关翻译/TTS 通道，最后等后台任务退出。
     handle.abort_background();
     handle.reset_vad();
     drop(capture);
+    drop(rx_mt);
+    drop(translation);
     drop(tx_tts);
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
         for task in tasks {
@@ -533,6 +797,68 @@ fn truncate_typed_input(text: &mut String) -> Option<usize> {
         .unwrap_or(text.len());
     text.truncate(cut);
     Some(chars)
+}
+
+/// 翻译模式的会话内状态：目标语言固定，一句内的译文按到达顺序累积。
+struct TranslationRuntime {
+    target_language: String,
+    voice: String,
+    rate: f32,
+    tx_job: UnboundedSender<TranslationJob>,
+    /// 打字打断时 +1：旧 generation 的在途译文直接丢弃，避免串到新句。
+    generation: u64,
+    next_seq: u64,
+    pending: u32,
+    /// 本句已生成的译文（与已送 TTS 的前缀一致）。
+    translated: String,
+    tts_open: bool,
+    tts_closed: bool,
+    end_event_sent: bool,
+    sentence_id: Option<u64>,
+    /// 源文已句终，等最后一条译文回来再收口 TTS task。
+    finish_pending: bool,
+}
+
+impl TranslationRuntime {
+    fn new(
+        target_language: String,
+        voice: String,
+        rate: f32,
+        tx_job: UnboundedSender<TranslationJob>,
+    ) -> Self {
+        Self {
+            target_language,
+            voice,
+            rate,
+            tx_job,
+            generation: 0,
+            next_seq: 0,
+            pending: 0,
+            translated: String::new(),
+            tts_open: false,
+            tts_closed: false,
+            end_event_sent: false,
+            sentence_id: None,
+            finish_pending: false,
+        }
+    }
+
+    /// 打字打断：作废在途译文并清空当前句状态。
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.reset_sentence();
+    }
+
+    fn reset_sentence(&mut self) {
+        self.next_seq = 0;
+        self.pending = 0;
+        self.translated.clear();
+        self.tts_open = false;
+        self.tts_closed = false;
+        self.end_event_sent = false;
+        self.sentence_id = None;
+        self.finish_pending = false;
+    }
 }
 
 /// 句子级语言状态机。
