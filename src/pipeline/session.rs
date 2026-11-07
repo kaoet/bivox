@@ -6,6 +6,7 @@
 //! - 停止时 GUI 调 `handle.stop()`，本任务退出前会 drop `AudioCapture` 并等后台任务结束，
 //!   确保麦克风/扬声器被释放。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -290,6 +291,9 @@ pub async fn run(
     let mut asr_sentence_open = false;
     // 打字输入收口当前 ASR 句后，丢弃该句剩余事件，直到服务端给出句子结束。
     let mut discard_asr_sentence = false;
+    // 句终屏障期间暂存的 ASR 事件：上一句的最后一条译文还没回来时，下一句的源文
+    // 不能先落到界面（否则会把「新句原文」和「旧句译文」配成一句，见 D28）。
+    let mut asr_backlog: VecDeque<AsrEvent> = VecDeque::new();
     let mut typed_rx_open = true;
     // 上一次推给界面的 VAD 状态（避免每 100ms 都发事件）
     let mut last_vad_active = false;
@@ -302,19 +306,31 @@ pub async fn run(
     }
 
     loop {
-        let incoming = tokio::select! {
-            // 打字输入优先于还没处理的 ASR 事件：按下回车后不再多送当前句的 chunk。
-            biased;
-            cmd = typed_rx.recv(), if typed_rx_open => Incoming::Typed(cmd),
-            // 翻译结果要先于后续 ASR 事件处理，保证 TTS 入队顺序与源文一致。
-            done = async {
-                match rx_mt.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending::<Option<TranslationDone>>().await,
+        // 句终屏障未完成时先不把下一句的 ASR 事件交给分块器/界面：等上一句最后一条
+        // 译文回来、句终事件发出后，再按原顺序处理缓存里的事件。
+        let incoming = loop {
+            let barrier_pending = translation
+                .as_ref()
+                .is_some_and(|runtime| runtime.finish_pending);
+            if !barrier_pending {
+                if let Some(event) = asr_backlog.pop_front() {
+                    break Incoming::Asr(Some(event));
                 }
-            } => Incoming::Mt(done),
-            event = rx_asr.recv() => Incoming::Asr(event),
-            _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => Incoming::Tick,
+            }
+            break tokio::select! {
+                // 打字输入优先于还没处理的 ASR 事件：按下回车后不再多送当前句的 chunk。
+                biased;
+                cmd = typed_rx.recv(), if typed_rx_open => Incoming::Typed(cmd),
+                // 翻译结果要先于后续 ASR 事件处理，保证 TTS 入队顺序与源文一致。
+                done = async {
+                    match rx_mt.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<TranslationDone>>().await,
+                    }
+                } => Incoming::Mt(done),
+                event = rx_asr.recv() => Incoming::Asr(event),
+                _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => Incoming::Tick,
+            };
         };
 
         match incoming {
@@ -370,6 +386,13 @@ pub async fn run(
                         runtime.bump_generation();
                         chunker.reset();
                         language_state.on_event("", true);
+                        // 缓存里可能已有「上一句句终后刚开始的新句」：打字同样要打断它，
+                        // 否则新句会在打字内容之后继续冒出（D24）。
+                        if !asr_backlog.is_empty() {
+                            asr_backlog.clear();
+                            asr_sentence_open = false;
+                            discard_asr_sentence = true;
+                        }
                         // 只有此刻确实有 ASR 句在服务端识别中，才需要丢弃它的剩余部分；
                         // 空闲时打字输入不能把「下一句」当成被收口句丢掉（否则下一句整句
                         // 的事件都会在 discard 分支里被吞掉，界面毫无反应）。
@@ -478,6 +501,15 @@ pub async fn run(
                 break;
             }
             Incoming::Asr(Some(event)) => {
+                // 上一句还在等最后一条译文：先把事件缓存，句终屏障完成后按序补处理，
+                // 避免新句源文先于旧句句终译文落到界面（D28）。
+                if translation
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.finish_pending)
+                {
+                    asr_backlog.push_back(event);
+                    continue;
+                }
                 if discard_asr_sentence {
                     // 收口后丢弃当前句剩余内容；句终后恢复正常处理（不补读被丢弃部分）。
                     if event.is_sentence_end {

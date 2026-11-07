@@ -578,6 +578,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - **翻译接口**：`POST https://{workspace_host}/compatible-mode/v1/chat/completions`，`model = qwen-mt-flash`；`messages` 单条 user 文本；`translation_options = { source_lang, target_lang }` **必填**（缺失时模型会退化成普通对话）。源/目标语言直接用 ISO 代码，`source_lang = "auto"` 可兜底；目标语言限 16 种 TTS 语言。
 - **worker**：独立 tokio 任务，单 in-flight 顺序处理（`TranslationJob`/`TranslationDone` 带 `generation` 与 `seq`），主循环不 await HTTP；打字输入会 bump `generation` 并丢弃旧句在途译文。
 - **句终屏障**：源文句终时若还有译文在途，等 `pending` 归零后再发「空文本 + 句终」收口 TTS task；打字输入立即收口当前 task 并丢弃未返回译文。译文全部失败时也照样补发句终事件，保证当前字幕行被收口（D26）。
+- **屏障期间的 ASR 缓存**：句终屏障未完成时，新到达的 ASR 事件先进 `asr_backlog`，等旧句句终 `Translation` 发出、状态复位后再按序补处理——否则下一句源文会先于旧句句终译文落到界面，出现「一句变两句、原文译文错位」（D28）。
 - **分块策略**：`clause`（默认）= 标点/句终切 + 安全尾；`sentence` = 只句终切（见第 9 节）。
 - **字幕/事件**：翻译模式下 `PipelineEvent::Asr` 只描述原文进度（`sent_bytes` = 已送翻译源文长度、`is_sentence_end` 恒 false、`language` = 源语言）；`PipelineEvent::Translation{text, sent_bytes, is_sentence_end, language, sentence_id}` 负责译文与句终（`language` 固定为目标语言）。`SubtitleState` 用 `apply_source` / `apply_translation` 维护双语当前行与历史，同一 `sentence_id` 去重（D26）。
 - **双语渲染**：实时页一条字幕 = 译文大字行（24pt）+ 原文小字弱色行（15pt），两行各有语言列、各自复制；`show_source = false` 只渲染译文行（D26）。
