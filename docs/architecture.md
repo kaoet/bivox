@@ -94,6 +94,7 @@ src/
 │   ├── toolbar.rs       顶栏：状态灯、VAD 指示器、开始/停止、版本号
 │   ├── realtime_tab.rs  实时页：字幕列表（底部嵌入打字输入行）
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
+│   ├── translate_tab.rs 翻译页：翻译模式开关、目标语言、粒度、显示原文
 │   ├── audio_tab.rs     音频页：输入/输出设备
 │   ├── tts_tab.rs       语音合成页：当前音色 + 自定义音色编辑器
 │   ├── settings_tab.rs  设置页：路径、API Key、配置概览
@@ -523,6 +524,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 | 页签 | 职责 | 关键行为 |
 |---|---|---|
 | 实时 | 字幕列表 + 打字输入 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16）；翻译模式下每条字幕为「译文大字行 + 原文小字行」，两行各自复制，`show_source=false` 只渲染译文行（D26）；底部多行输入框（默认 1 行、约 4 行封顶后内部滚动）Shift+Enter 换行、Enter/「朗读」排队朗读打字输入（D24），仅运行中可提交，上限 500 字符 |
+| 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
 | 音频 | 输入/输出设备 | 设备下拉保存完整设备名；改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告 |
 | 语音合成 | 当前音色 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色；Tab 级保存/放弃更改；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」） |
 | 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/模型/语言/音色；配置无效时显示错误链 |
@@ -536,7 +538,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **169** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **171** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -561,18 +563,18 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 打字输入句是**排队**语义：当前排队/播放的音频全部播完后才轮到它；界面在提交时就把该句加入字幕历史，可能与实际发声时间有延迟。
 - 若提交打字输入时 ASR 当前句尚未句终，该句剩余部分会被丢弃、不会补读（字幕只保留已送 TTS 的前缀，D24）；极端情况下用户持续说话期间打字输入会暂停该句后续合成。
 - 打字输入句上限 500 字符；TTS 连续启动失败 3 次时该句按现有机制丢弃（只写日志，不弹错误条）。
-- 翻译模式（M2）没有独立 GUI 翻译页：启用/改目标语言需手改 `config.toml` 后「重新加载配置」；字幕已支持双语（原文行 + 译文行，两行各自复制），`show_source = false` 时只显示译文（D25/D26）。
+- 翻译模式（M3）提供独立「翻译」页：开关、目标语言、粒度、显示原文都可图形化修改并热更新；`model` 仍只读（手改配置后「重新加载配置」生效）。字幕双语（原文行 + 译文行，两行各自复制），`show_source = false` 时只显示译文（D25/D26）。
 - 翻译是逐块 HTTP 请求：clause 模式的实际延迟、端到端 1s 目标、16 语种 TTS 自然度与碎句译文质量尚未做真实语料评估。
 - 已送 TTS 的译文不可撤回；翻译失败的片段不发声，只按 D8 显示错误条。
 - 没有 CI；UI 与真实音频链路的回归依赖人工验证。
 
 ---
 
-## 15. 翻译模式（M1/M2）
+## 15. 翻译模式（M1–M3）
 
 链路：现有 ASR/打字输入 → 本地语言判定与分块 → **翻译 worker**（`client/qwen_mt.rs` + `pipeline/translator.rs`）→ 译文 → 现有 TTS/播放与字幕。
 
-- **开关与目标语言**：`[translate] enabled/target/model/granularity/show_source`（D25）。M1/M2 只读配置；独立 GUI 翻译页在 M3。`enabled = false` 时整条链路与旧行为完全一致。
+- **开关与目标语言**：`[translate] enabled/target/model/granularity/show_source`（D25）。M3 起由「翻译」页图形化修改（`enabled/target/granularity/show_source` 可写，`model` 只读并展示）；`enabled = false` 时整条链路与旧行为完全一致。
 - **翻译接口**：`POST https://{workspace_host}/compatible-mode/v1/chat/completions`，`model = qwen-mt-flash`；`messages` 单条 user 文本；`translation_options = { source_lang, target_lang }` **必填**（缺失时模型会退化成普通对话）。源/目标语言直接用 ISO 代码，`source_lang = "auto"` 可兜底；目标语言限 16 种 TTS 语言。
 - **worker**：独立 tokio 任务，单 in-flight 顺序处理（`TranslationJob`/`TranslationDone` 带 `generation` 与 `seq`），主循环不 await HTTP；打字输入会 bump `generation` 并丢弃旧句在途译文。
 - **句终屏障**：源文句终时若还有译文在途，等 `pending` 归零后再发「空文本 + 句终」收口 TTS task；打字输入立即收口当前 task 并丢弃未返回译文。译文全部失败时也照样补发句终事件，保证当前字幕行被收口（D26）。
@@ -580,4 +582,4 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - **字幕/事件**：翻译模式下 `PipelineEvent::Asr` 只描述原文进度（`sent_bytes` = 已送翻译源文长度、`is_sentence_end` 恒 false、`language` = 源语言）；`PipelineEvent::Translation{text, sent_bytes, is_sentence_end, language, sentence_id}` 负责译文与句终（`language` 固定为目标语言）。`SubtitleState` 用 `apply_source` / `apply_translation` 维护双语当前行与历史，同一 `sentence_id` 去重（D26）。
 - **双语渲染**：实时页一条字幕 = 译文大字行（24pt）+ 原文小字弱色行（15pt），两行各有语言列、各自复制；`show_source = false` 只渲染译文行（D26）。
 - **失败处理**：翻译失败发 `PipelineEvent::Error`（D8），该片段不送 TTS，后续片段继续。
-- **验证**：`cargo test` 覆盖 qwen_mt 协议/重试/错误、chunker 安全尾、config 校验与语言表、字幕双语 reducer；运行期用真实接口 + 打字输入验证 zh→en / zh→ja 双语字幕与源/译文各自复制，`show_source` 热加载即时生效，ASR 语音路径用环境语音间接验证。
+- **验证**：`cargo test` 覆盖 qwen_mt 协议/重试/错误、chunker 安全尾、config 校验与语言表、字幕双语 reducer；运行期用真实接口 + 打字输入验证 zh→en / zh→ja 双语字幕与源/译文各自复制，`show_source` 热加载即时生效，ASR 语音路径用环境语音间接验证；M3 用「翻译」页验证开关/目标语言/粒度改动触发 D20 热重启、`show_source` 不重启、配置写回保留 `model`。

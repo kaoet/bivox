@@ -56,6 +56,7 @@
   2. `[audio] input_device` / `output_device`
   3. `[tts] voice`
   4. `[tts.custom_voices]` 整个结构
+  5. `[translate] enabled` / `target` / `granularity` / `show_source`（D25/D26；`model` 仍只读）
 - 其余字段（`[asr]`、`[tts] model`、`[tts] cache_file`、`[vad]`、`[chunking]`、`[api] workspace_host` 等）只读：设置页展示当前值，用户手改后点「重新加载配置」。
 - 写回流程：读原文本 → 用 `toml_edit` 定点修改 → 用 `AppConfig::from_toml_str` 校验整份新文本 → 备份 `config.toml.bak` → 写盘。没有实际改动时不写盘、不产生备份；校验失败不落盘。
 - API Key 以**明文**保存在 `config.toml`；界面与 README 都提示该文件含密钥、勿分享。
@@ -453,7 +454,7 @@
 
 - 翻译模式作为现有实时管线的**中间层**：源文分块后逐块调用 `qwen-mt-flash`（OpenAI 兼容 HTTP），译文再走现有 TTS、播放与字幕；不引入第二套实时语音协议，也不改播放层。
 - 目标语言限 **16 种** TTS 官方支持语言（`TRANSLATION_LANGUAGES = CLONING_LANGUAGES`），默认 `en`；翻译模型默认 `qwen-mt-flash`。请求必须带 `translation_options = { source_lang, target_lang }`（缺失会退化成普通对话模型）；源语言直接用 ISO 代码，无法判定时用 `auto`。
-- 配置放 `[translate]`（`enabled` / `target` / `model` / `granularity` / `show_source`）：M1 只读配置、字幕只显示译文（双语字幕由 D26 细化）；独立 GUI 翻译页是 M3。
+- 配置放 `[translate]`（`enabled` / `target` / `model` / `granularity` / `show_source`）：M1 只读配置、字幕只显示译文（双语字幕由 D26 细化）；独立 GUI 翻译页由 M3 提供（D27）。
 - 分块：默认 `clause` = 标点/句终切，且标点切点必须离开 ASR 尾部 ≥3 字符；可选 `sentence` = 只句终切。默认 `ChunkPolicy` 与现有 TTS 路径行为完全不变。
 - 翻译 worker 独立 tokio 任务、单 in-flight 保序；打字输入 bump `generation` 丢弃旧句在途译文；源文句终用「等 `pending` 归零再 finish-task」的屏障。
 - 源语言 == 目标语言时跳过 MT，直接送 TTS。
@@ -467,7 +468,7 @@
 
 **边界**
 
-- M1 无 GUI 开关；启用或改目标语言需手改 `config.toml` 后「重新加载配置」。M2 起字幕支持双语（D26），GUI 开关仍待 M3。
+- M1 无 GUI 开关；启用或改目标语言需手改 `config.toml` 后「重新加载配置」。M2 起字幕支持双语（D26）；M3 起有独立「翻译」页（D27）。
 - 已送 TTS 的译文不能撤回；`clause` 模式每个标点最多多等一次 ASR 更新（约 100–300ms）。
 - 自定义音色缺目标语言样本时按 D11 的样本回退规则处理，不额外提示。
 - 翻译逐块 HTTP，不做跨句上下文；长文连贯性依赖模型自身。
@@ -492,9 +493,31 @@
 
 **边界**
 
-- M2 仍没有独立 GUI 翻译页（M3）；启用或改目标语言仍需手改 `config.toml` 后「重新加载配置」。
+- M2 仍没有独立 GUI 翻译页（M3 已补，D27）；启用或改目标语言在 M2 需手改 `config.toml` 后「重新加载配置」。
 - 原文行是辅助信息：若整句译文全部失败，当前原文行在句终时被清空，不落历史（与"字幕 = 听到的内容"一致）。
 - 语言列宽固定 32pt，以容纳 `fil` 这类三字母代码。
+
+---
+
+## D27 翻译模式 M3：独立「翻译」页与配置写回范围
+
+**决定**
+
+- 新增独立「翻译」页（`Tab::Translate`，`src/gui/translate_tab.rs`），所有翻译选项集中于此；顶栏工具栏不新增翻译开关，保持现状。
+- GUI 可写 `[translate] enabled` / `target` / `granularity` / `show_source`（D3 白名单扩展），`model` 只读展示。写回统一走 `config_edit::set_translate` + 现有「校验 → `.bak` → 写盘」流程；未启用翻译时目标语言与粒度控件禁用，`show_source` 仍可改。
+- 改值即保存：`show_source` 不进配置指纹，重载后立即改变渲染、**不重启**；`enabled` / `target` / `granularity` / `model` 进指纹，运行中变更按 D20「停旧会话 → 用新配置自动重启」，当前句会丢失（页内注明）。
+- 空闲时改配置只影响下次开始；`reload_config` 在会话未运行时把 `SubtitleState::translation_mode` 同步为新配置，空状态提示与后续渲染一致。运行中则仍由 `start_session` 在重启后设置。
+
+**理由**
+
+- 用户不必手改 `config.toml` 即可完成开关与目标语言选择；独立页避免实时页被设置项占据。
+- 复用 D3 定点写回与 D20 热重启，没有引入新的配置或生命周期机制；`show_source` 只影响渲染，热加载不中断会话。
+
+**边界**
+
+- 目标语言下拉固定 16 种（`TRANSLATION_LANGUAGES`，与 TTS 音色语言一致）；不在列表内的代码即使手改配置，`enabled = true` 时也会被校验拒绝。
+- 更换 `model` 仍需手改配置并「重新加载配置」（只读展示）。
+- 热重启会丢当前句，与其它 GUI 配置改动一致。
 
 ---
 

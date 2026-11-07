@@ -8,7 +8,7 @@ pub struct TextChunker {
 /// 切分策略。
 ///
 /// 默认策略保持现有“TTS 边说边合成”的行为；翻译模式按粒度选择更保守的策略
-/// （见 docs/translation.md §6.1）。
+/// （见 docs/architecture.md 第 9 节 ChunkPolicy 与第 15 节翻译模式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPolicy {
     /// 是否允许按词数/字数兜底硬切。

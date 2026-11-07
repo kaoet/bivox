@@ -1,6 +1,6 @@
 //! 文本翻译客户端（`qwen-mt-flash`，百炼 OpenAI 兼容端点）。
 //!
-//! 协议实测见 `docs/translation.md` §5.1，关键约束：
+//! 协议实测与字段约束见 `docs/architecture.md` 第 15 节（翻译模式），关键约束：
 //! - `translation_options` 必须携带，否则模型会退化成普通对话模型；
 //! - 语言代码直接透传 ISO（`zh`/`en`/...），不需要映射成英文名；
 //! - 译文在 `choices[0].message.content`。

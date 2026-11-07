@@ -9,7 +9,7 @@ use log::{error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
-use crate::config::{AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE};
+use crate::config::{AppConfig, TranslateGranularity, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE};
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
@@ -36,7 +36,7 @@ pub const MAX_SUBTITLES: usize = 500;
 /// 一条已结束的字幕。
 ///
 /// 普通模式：`text` 是 ASR 文本，`source` / `source_language` 为空。
-/// 翻译模式：`text` 是译文、`language` 是目标语言；`source` 是原文、`source_language` 是源语言（D26）。
+/// 翻译模式：`text` 是译文、`language` 是目标语言；`source` 是原文、`source_language` 是源语言（D27）。
 #[derive(Debug, Clone)]
 pub struct SubtitleLine {
     pub language: String,
@@ -239,17 +239,25 @@ impl SubtitleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Realtime,
+    Translate,
     Audio,
     Tts,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Realtime, Tab::Audio, Tab::Tts, Tab::Settings];
+    pub const ALL: [Tab; 5] = [
+        Tab::Realtime,
+        Tab::Translate,
+        Tab::Audio,
+        Tab::Tts,
+        Tab::Settings,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Realtime => "实时",
+            Self::Translate => "翻译",
             Self::Audio => "音频",
             Self::Tts => "语音合成",
             Self::Settings => "设置",
@@ -397,6 +405,13 @@ impl KaolsApp {
             self.selected_voice = None;
         }
         info!("已重新加载配置：{}", self.paths.config_file.display());
+        // 空闲时让字幕模式立刻跟随配置（运行中的会话等 D20 重启后由 start_session 设置）。
+        if self.session.is_none() {
+            if let ConfigState::Loaded(config) = &self.config {
+                self.subtitles
+                    .set_translation_mode(config.translate.enabled);
+            }
+        }
         // 运行中改配置（Key/设备/音色等）→ 用新配置自动重启管线
         self.maybe_restart_session();
     }
@@ -590,6 +605,23 @@ impl KaolsApp {
         self.finish_config_write(result, "已保存音频设备");
     }
 
+    /// 更新翻译页负责的 `[translate]` 字段（D3/D27）。
+    ///
+    /// `show_source` 不进配置指纹，改后立即生效、不重启会话；
+    /// 其余字段变化会触发 D20 的「停旧会话 → 用新配置自动重启」。
+    pub fn update_translate_settings(
+        &mut self,
+        enabled: bool,
+        target: &str,
+        granularity: TranslateGranularity,
+        show_source: bool,
+    ) {
+        let result = self.write_config(|text| {
+            config_edit::set_translate(text, enabled, target, granularity, show_source)
+        });
+        self.finish_config_write(result, "已保存翻译设置");
+    }
+
     /// 读原文 → 定点修改 → 校验并写回。
     fn write_config(
         &mut self,
@@ -673,7 +705,7 @@ impl KaolsApp {
         self.pipeline_error = None;
         self.typed_input_error = None;
         self.vad_active = false;
-        // 本次会话是否翻译模式决定字幕如何解释 Asr/Translation 事件（D26）。
+        // 本次会话是否翻译模式决定字幕如何解释 Asr/Translation 事件（D27）。
         self.subtitles
             .set_translation_mode(config.translate.enabled);
         // 只清当前未完成的句子；历史字幕保留（用户要求停止管线后不清空历史）
@@ -825,7 +857,7 @@ impl KaolsApp {
                 language,
                 sentence_id,
             } => {
-                // 翻译模式下这里只刷新源文与「已送翻译」前缀，句终由 Translation 处理（D26）。
+                // 翻译模式下这里只刷新源文与「已送翻译」前缀，句终由 Translation 处理（D27）。
                 self.subtitles
                     .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id)
             }
@@ -931,6 +963,7 @@ impl KaolsApp {
 
         match self.tab {
             Tab::Realtime => gui::realtime_tab::show(self, ui),
+            Tab::Translate => gui::translate_tab::show(self, ui),
             Tab::Audio => gui::audio_tab::show(self, ui),
             Tab::Tts => gui::tts_tab::show(self, ui),
             Tab::Settings => gui::settings_tab::show(self, ui),

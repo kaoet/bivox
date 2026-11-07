@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
-use crate::config::CustomVoiceConfig;
+use crate::config::{CustomVoiceConfig, TranslateGranularity};
 
 /// 读取配置原文。
 pub fn read(path: &Path) -> Result<String> {
@@ -43,6 +43,28 @@ pub fn set_audio_devices(
 
     set_or_remove(audio, "input_device", input);
     set_or_remove(audio, "output_device", output);
+
+    render(&doc, original)
+}
+
+/// 设置 `[translate]` 中由翻译页负责的字段（D3/D27）。
+///
+/// `enabled` / `target` / `granularity` / `show_source` 可写；`model` 只读，
+/// 保持配置文件里的原值（手改后走「重新加载配置」生效）。
+pub fn set_translate(
+    original: &str,
+    enabled: bool,
+    target: &str,
+    granularity: TranslateGranularity,
+    show_source: bool,
+) -> Result<String> {
+    let mut doc = parse(original)?;
+    let translate = ensure_table(&mut doc, "translate")?;
+
+    translate["enabled"] = toml_edit::value(enabled);
+    translate["target"] = toml_edit::value(target.trim());
+    translate["granularity"] = toml_edit::value(granularity.label());
+    translate["show_source"] = toml_edit::value(show_source);
 
     render(&doc, original)
 }
@@ -362,5 +384,58 @@ languages = ["zh", "ja"]
         let config = AppConfig::from_toml_str(&updated).unwrap();
         assert_eq!(config.tts.voice, "Ethan");
         assert!(updated.contains("# 顶部注释"));
+    }
+
+    #[test]
+    fn set_translate_creates_table_and_writes_gui_fields() {
+        let updated = set_translate(
+            SAMPLE,
+            true,
+            " ja ",
+            crate::config::TranslateGranularity::Sentence,
+            false,
+        )
+        .unwrap();
+
+        // 原配置没有 [translate] 表，写回时新建；其它段与注释保留
+        assert!(updated.contains("[translate]"), "{updated}");
+        assert!(updated.contains("enabled = true"));
+        assert!(updated.contains(r#"target = "ja""#));
+        assert!(updated.contains(r#"granularity = "sentence""#));
+        assert!(updated.contains("show_source = false"));
+        assert!(updated.contains("# 顶部注释"));
+
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert!(config.translate.enabled);
+        assert_eq!(config.translate.target, "ja");
+        assert_eq!(
+            config.translate.granularity,
+            crate::config::TranslateGranularity::Sentence
+        );
+        assert!(!config.translate.show_source);
+        // model 不在 GUI 白名单里，保持模板默认值
+        assert_eq!(
+            config.translate.model,
+            crate::config::DEFAULT_TRANSLATE_MODEL
+        );
+    }
+
+    #[test]
+    fn set_translate_keeps_manual_model_value() {
+        let original = format!("{SAMPLE}\n[translate]\nmodel = \"qwen-mt-lite\"\n");
+        let updated = set_translate(
+            &original,
+            false,
+            "en",
+            crate::config::TranslateGranularity::Clause,
+            true,
+        )
+        .unwrap();
+
+        assert!(updated.contains(r#"model = "qwen-mt-lite""#), "{updated}");
+        assert!(updated.contains("enabled = false"));
+        assert!(updated.contains(r#"target = "en""#));
+        assert!(updated.contains(r#"granularity = "clause""#));
+        assert!(updated.contains("show_source = true"));
     }
 }

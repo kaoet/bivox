@@ -105,7 +105,7 @@
 
 [translate]
 # 翻译模式（默认关闭）：开启后输入先翻成目标语言，再合成目标语言语音，字幕显示「译文 + 原文」。
-# 当前版本只能手改本段后「重新加载配置」；后续 GUI「翻译」页可改 enabled/target/granularity/show_source，model 只读。
+# 可在 GUI「翻译」页修改 enabled/target/granularity/show_source；model 只读，需手改本段后「重新加载配置」。
 # enabled = false
 # 目标语言（TTS 支持的 16 种）：zh/en/fr/de/ja/ko/ru/pt/th/id/vi/es/it/ms/fil/ar
 # target = "en"
@@ -113,5 +113,5 @@
 # model = "qwen-mt-flash"
 # 翻译粒度：clause = 有标点/句终就翻（延迟低）；sentence = 整句结束再翻（质量优先）
 # granularity = "clause"
-# 字幕是否显示原文行；关掉只显示译文（改后「重新加载配置」即时生效，不重启会话）
+# 字幕是否显示原文行；关掉只显示译文（GUI 改后立即生效，不重启会话）
 # show_source = true
