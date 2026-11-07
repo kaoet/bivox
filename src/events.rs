@@ -43,10 +43,14 @@ pub enum PipelineEvent {
     },
     /// ASR 当前句（会持续修订；`is_sentence_end` 表示这句结束）。
     ///
-    /// `sent_bytes`：`text` 中已送入 TTS 的字节前缀长度（一定是字符边界），
+    /// `sent_bytes`：`text` 中已送入下一步的字节前缀长度（一定是字符边界），
     /// 界面据此把"已合成 / 尚未合成"两部分用不同颜色显示。
     /// `language`：本句已判定的语言代码（首个 chunk 送出前为 `None`）。
     /// `sentence_id`：服务端句子 id（重复下发同一句时相同，用于字幕去重）。
+    ///
+    /// 翻译模式下本事件只用于刷新源文与"已送翻译"前缀（`sent_bytes` 改为统计已送翻译的
+    /// 源文长度），`is_sentence_end` 恒为 `false`，句终由 [`PipelineEvent::Translation`]
+    /// 负责；`language` 是源语言而非目标语言（D26）。
     Asr {
         text: String,
         is_sentence_end: bool,

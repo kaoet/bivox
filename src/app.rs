@@ -33,34 +33,65 @@ pub enum VoiceMode {
 /// 字幕历史保留上限（D16）。
 pub const MAX_SUBTITLES: usize = 500;
 
-/// 一条已结束的字幕：本句语言代码 + 文本。
+/// 一条已结束的字幕。
+///
+/// 普通模式：`text` 是 ASR 文本，`source` / `source_language` 为空。
+/// 翻译模式：`text` 是译文、`language` 是目标语言；`source` 是原文、`source_language` 是源语言（D26）。
 #[derive(Debug, Clone)]
 pub struct SubtitleLine {
     pub language: String,
     pub text: String,
+    pub source: String,
+    pub source_language: String,
+    pub sentence_id: Option<u64>,
 }
 
 /// 实时字幕状态（当前句 + 历史）。
 #[derive(Debug, Default)]
 pub struct SubtitleState {
-    /// 当前句（ASR 持续修订）。
+    /// 当前会话是否处于翻译模式（启动会话时按配置设置）。
+    pub translation_mode: bool,
+    /// 当前句原文（普通模式 = ASR 文本；翻译模式 = 源文）。
     pub current: String,
-    /// 当前句已送入 TTS 的字节前缀长度。
+    /// 当前句原文已送入下一步（普通模式 = TTS；翻译模式 = 翻译）的字节前缀。
     pub sent_bytes: usize,
-    /// 当前句已判定的语言代码（首个 chunk 送出前为 `None`）。
+    /// 翻译模式：当前句累计译文。
+    pub current_translation: String,
+    /// 翻译模式：当前句译文已送入 TTS 的字节前缀。
+    pub translation_sent_bytes: usize,
+    /// 当前句语言（普通模式 = ASR 语言；翻译模式 = 目标语言）。
     pub language: Option<String>,
-    /// 已结束的句子（上限 `MAX_SUBTITLES`），带本句语言代码。
+    /// 翻译模式：当前句源语言。
+    pub source_language: Option<String>,
+    /// 已结束的句子（上限 `MAX_SUBTITLES`）。
     pub history: Vec<SubtitleLine>,
     /// 上一条已落历史的句子 id：只用于丢弃「同一句被服务端重复下发」的最终结果。
     pub last_finalized_sentence_id: Option<u64>,
 }
 
+/// 把「已送入前缀长度」夹到字符边界，避免切片 panic。
+fn clamp_prefix_len(text: &str, sent: usize) -> usize {
+    let mut sent = sent.min(text.len());
+    while sent > 0 && !text.is_char_boundary(sent) {
+        sent -= 1;
+    }
+    sent
+}
+
 impl SubtitleState {
+    /// 会话启动时设置当前模式（只影响本次会话；历史保留）。
+    pub fn set_translation_mode(&mut self, enabled: bool) {
+        self.translation_mode = enabled;
+    }
+
     /// 新会话开始时只清掉「当前句」，**保留历史**（停止/重启管线不清空已识别字幕）。
     pub fn reset_current(&mut self) {
         self.current.clear();
         self.sent_bytes = 0;
+        self.current_translation.clear();
+        self.translation_sent_bytes = 0;
         self.language = None;
+        self.source_language = None;
         self.last_finalized_sentence_id = None;
     }
 
@@ -69,7 +100,17 @@ impl SubtitleState {
         if text.is_empty() {
             return;
         }
-        self.history.push(SubtitleLine { language, text });
+        self.push_line(SubtitleLine {
+            language,
+            text,
+            source: String::new(),
+            source_language: String::new(),
+            sentence_id: None,
+        });
+    }
+
+    fn push_line(&mut self, line: SubtitleLine) {
+        self.history.push(line);
         if self.history.len() > MAX_SUBTITLES {
             self.history.remove(0);
         }
@@ -77,10 +118,14 @@ impl SubtitleState {
 
     /// 把一条 ASR 事件并入字幕状态（纯逻辑，便于单测）。
     ///
+    /// 普通模式：
     /// - 非空文本：刷新当前句，记录已送 TTS 的字节前缀与语言；
     /// - 空文本 + 句终：ASR 重置信号，清空当前句（同时忘掉上一句 id）；
     /// - 句终：当前句（连同语言代码）落进历史；**同一 `sentence_id` 重复下发只记一次**，
     ///   不同 id 的相同文本是两次真实发音，必须各自保留；超过 `MAX_SUBTITLES` 丢最旧的。
+    ///
+    /// 翻译模式：ASR 只负责刷新源文与「已送翻译」的源文前缀，句终由
+    /// [`Self::apply_translation`] 负责（D26）。
     fn apply_asr(
         &mut self,
         text: &str,
@@ -89,6 +134,11 @@ impl SubtitleState {
         language: Option<String>,
         sentence_id: Option<u64>,
     ) {
+        if self.translation_mode {
+            self.apply_source(text, sent, language);
+            return;
+        }
+
         if text.is_empty() {
             if is_sentence_end {
                 self.current.clear();
@@ -99,11 +149,7 @@ impl SubtitleState {
         } else {
             self.current.clear();
             self.current.push_str(text);
-            // 防御：只接受字符边界且不超过当前文本长度的前缀
-            self.sent_bytes = sent.min(self.current.len());
-            while self.sent_bytes > 0 && !self.current.is_char_boundary(self.sent_bytes) {
-                self.sent_bytes -= 1;
-            }
+            self.sent_bytes = clamp_prefix_len(&self.current, sent);
             // 语言在本句首个 chunk 送出前是未知的；一旦判定就沿用本句
             if language.is_some() {
                 self.language = language;
@@ -120,11 +166,71 @@ impl SubtitleState {
                 self.last_finalized_sentence_id = Some(id);
             }
             if !duplicated {
-                self.history.push(SubtitleLine { language, text });
-                if self.history.len() > MAX_SUBTITLES {
-                    self.history.remove(0);
-                }
+                self.push_line(SubtitleLine {
+                    language,
+                    text,
+                    source: String::new(),
+                    source_language: String::new(),
+                    sentence_id,
+                });
             }
+        }
+    }
+
+    /// 翻译模式：刷新当前句源文，`sent` 是已送翻译的源文字节前缀。
+    fn apply_source(&mut self, text: &str, sent: usize, language: Option<String>) {
+        if text.is_empty() {
+            return;
+        }
+        self.current.clear();
+        self.current.push_str(text);
+        self.sent_bytes = clamp_prefix_len(&self.current, sent);
+        if language.is_some() {
+            self.source_language = language;
+        }
+    }
+
+    /// 翻译模式：并入一条译文事件；`is_sentence_end` 时把当前句（原文 + 译文）落进历史。
+    ///
+    /// 去重、上限与普通模式一致；`language` 是目标语言，`source_language` 来自此前的源文事件。
+    fn apply_translation(
+        &mut self,
+        text: &str,
+        sent: usize,
+        is_sentence_end: bool,
+        language: String,
+        sentence_id: Option<u64>,
+    ) {
+        if !text.is_empty() {
+            self.current_translation.clear();
+            self.current_translation.push_str(text);
+            self.translation_sent_bytes = clamp_prefix_len(&self.current_translation, sent);
+            self.language = Some(language.clone());
+        }
+
+        if !is_sentence_end {
+            return;
+        }
+
+        let duplicated = sentence_id.is_some() && self.last_finalized_sentence_id == sentence_id;
+        if let Some(id) = sentence_id {
+            self.last_finalized_sentence_id = Some(id);
+        }
+        let translation = std::mem::take(&mut self.current_translation);
+        let source = std::mem::take(&mut self.current);
+        let source_language = self.source_language.take().unwrap_or_default();
+        let target_language = self.language.take().unwrap_or(language);
+        self.sent_bytes = 0;
+        self.translation_sent_bytes = 0;
+
+        if !duplicated && !translation.is_empty() {
+            self.push_line(SubtitleLine {
+                language: target_language,
+                text: translation,
+                source,
+                source_language,
+                sentence_id,
+            });
         }
     }
 }
@@ -532,6 +638,14 @@ impl KaolsApp {
 
     // ---- 实时管线（PipelineSession）----
 
+    /// 翻译模式字幕是否同时显示原文（只影响渲染，不参与配置指纹，D26）。
+    pub fn translate_show_source(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => config.translate.show_source,
+            ConfigState::Invalid { .. } => true,
+        }
+    }
+
     /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。
     pub fn start_session(&mut self, ctx: egui::Context) {
         if self.session.is_some() {
@@ -559,6 +673,9 @@ impl KaolsApp {
         self.pipeline_error = None;
         self.typed_input_error = None;
         self.vad_active = false;
+        // 本次会话是否翻译模式决定字幕如何解释 Asr/Translation 事件（D26）。
+        self.subtitles
+            .set_translation_mode(config.translate.enabled);
         // 只清当前未完成的句子；历史字幕保留（用户要求停止管线后不清空历史）
         self.subtitles.reset_current();
 
@@ -708,6 +825,7 @@ impl KaolsApp {
                 language,
                 sentence_id,
             } => {
+                // 翻译模式下这里只刷新源文与「已送翻译」前缀，句终由 Translation 处理（D26）。
                 self.subtitles
                     .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id)
             }
@@ -721,12 +839,12 @@ impl KaolsApp {
                 language,
                 sentence_id,
             } => {
-                // 翻译模式：字幕只显示译文，复用同一套「当前句 + 历史」状态机。
-                self.subtitles.apply_asr(
+                // 翻译模式：译文进大字行，源文来自此前的 Asr 事件；句终时把双语行落进历史。
+                self.subtitles.apply_translation(
                     &text,
-                    is_sentence_end,
                     sent_bytes,
-                    Some(language),
+                    is_sentence_end,
+                    language,
                     sentence_id,
                 );
             }
@@ -1186,6 +1304,109 @@ mod tests {
         apply_with_id(&mut state, "重复句。", true, Some("zh"), 1);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].text, "重复句。");
+    }
+
+    #[test]
+    fn translation_mode_builds_bilingual_line_on_sentence_end() {
+        let mut state = SubtitleState::default();
+        state.set_translation_mode(true);
+
+        // 源文事件：只刷新原文行与「已送翻译」前缀，不会落历史。
+        apply(&mut state, "今天下午", false, "今天".len(), Some("zh"));
+        assert_eq!(state.current, "今天下午");
+        assert_eq!(state.sent_bytes, "今天".len());
+        assert_eq!(state.source_language.as_deref(), Some("zh"));
+        assert!(state.history.is_empty());
+
+        // 译文分块到达：累积译文并按已送 TTS 前缀分色。
+        state.apply_translation(
+            "This afternoon",
+            "This".len(),
+            false,
+            "en".to_string(),
+            Some(7),
+        );
+        assert_eq!(state.current_translation, "This afternoon");
+        assert_eq!(state.translation_sent_bytes, "This".len());
+        assert_eq!(state.language.as_deref(), Some("en"));
+
+        // 句终：当前句以「原文 + 译文」双语落进历史。
+        state.apply_translation(
+            "This afternoon we go to the movies.",
+            999,
+            true,
+            "en".to_string(),
+            Some(7),
+        );
+        assert_eq!(state.history.len(), 1);
+        let line = &state.history[0];
+        assert_eq!(line.language, "en");
+        assert_eq!(line.text, "This afternoon we go to the movies.");
+        assert_eq!(line.source, "今天下午");
+        assert_eq!(line.source_language, "zh");
+        assert_eq!(line.sentence_id, Some(7));
+        assert!(state.current.is_empty());
+        assert!(state.current_translation.is_empty());
+        assert_eq!(state.language, None);
+        assert_eq!(state.source_language, None);
+    }
+
+    #[test]
+    fn translation_mode_same_sentence_id_is_not_pushed_twice() {
+        let mut state = SubtitleState::default();
+        state.set_translation_mode(true);
+        apply(&mut state, "重复句。", false, 0, Some("zh"));
+
+        state.apply_translation("Duplicate.", 0, true, "en".to_string(), Some(3));
+        state.apply_translation("Duplicate.", 0, true, "en".to_string(), Some(3));
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "Duplicate.");
+    }
+
+    #[test]
+    fn translation_mode_typed_source_is_kept_as_bilingual_line() {
+        let mut state = SubtitleState::default();
+        state.set_translation_mode(true);
+
+        // 打字翻译路径：先把整句源文交给界面（已全部送翻译），再等译文句终。
+        apply(
+            &mut state,
+            "你好，世界。",
+            false,
+            "你好，世界。".len(),
+            Some("zh"),
+        );
+        state.apply_translation("Hello, world.", 0, true, "en".to_string(), None);
+
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "Hello, world.");
+        assert_eq!(state.history[0].source, "你好，世界。");
+        assert_eq!(state.history[0].source_language, "zh");
+        assert_eq!(state.history[0].sentence_id, None);
+    }
+
+    #[test]
+    fn translation_mode_sentence_end_without_translation_clears_current() {
+        let mut state = SubtitleState::default();
+        state.set_translation_mode(true);
+        apply(&mut state, "翻译失败的句子。", false, 0, Some("zh"));
+
+        // 全部译文失败时只发一个空译文的句终事件：当前行清掉，不产生空历史行。
+        state.apply_translation("", 0, true, "en".to_string(), Some(9));
+        assert!(state.current.is_empty());
+        assert!(state.current_translation.is_empty());
+        assert!(state.history.is_empty());
+    }
+
+    #[test]
+    fn translation_mode_asr_sentence_end_does_not_finalize() {
+        let mut state = SubtitleState::default();
+        state.set_translation_mode(true);
+
+        // 即使 ASR 事件带了句终（正常路径不会），翻译模式也以 Translation 事件为准。
+        apply(&mut state, "先别收口。", true, 0, Some("zh"));
+        assert!(state.history.is_empty());
+        assert_eq!(state.current, "先别收口。");
     }
 
     #[test]

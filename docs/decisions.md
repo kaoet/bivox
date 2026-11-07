@@ -453,7 +453,7 @@
 
 - 翻译模式作为现有实时管线的**中间层**：源文分块后逐块调用 `qwen-mt-flash`（OpenAI 兼容 HTTP），译文再走现有 TTS、播放与字幕；不引入第二套实时语音协议，也不改播放层。
 - 目标语言限 **16 种** TTS 官方支持语言（`TRANSLATION_LANGUAGES = CLONING_LANGUAGES`），默认 `en`；翻译模型默认 `qwen-mt-flash`。请求必须带 `translation_options = { source_lang, target_lang }`（缺失会退化成普通对话模型）；源语言直接用 ISO 代码，无法判定时用 `auto`。
-- 配置放 `[translate]`（`enabled` / `target` / `model` / `granularity` / `show_source`）：M1 只读配置、字幕只显示译文；GUI 翻译页与双语字幕是后续里程碑。
+- 配置放 `[translate]`（`enabled` / `target` / `model` / `granularity` / `show_source`）：M1 只读配置、字幕只显示译文（双语字幕由 D26 细化）；独立 GUI 翻译页是 M3。
 - 分块：默认 `clause` = 标点/句终切，且标点切点必须离开 ASR 尾部 ≥3 字符；可选 `sentence` = 只句终切。默认 `ChunkPolicy` 与现有 TTS 路径行为完全不变。
 - 翻译 worker 独立 tokio 任务、单 in-flight 保序；打字输入 bump `generation` 丢弃旧句在途译文；源文句终用「等 `pending` 归零再 finish-task」的屏障。
 - 源语言 == 目标语言时跳过 MT，直接送 TTS。
@@ -467,10 +467,34 @@
 
 **边界**
 
-- M1 无 GUI 开关；启用或改目标语言需手改 `config.toml` 后「重新加载配置」。
+- M1 无 GUI 开关；启用或改目标语言需手改 `config.toml` 后「重新加载配置」。M2 起字幕支持双语（D26），GUI 开关仍待 M3。
 - 已送 TTS 的译文不能撤回；`clause` 模式每个标点最多多等一次 ASR 更新（约 100–300ms）。
 - 自定义音色缺目标语言样本时按 D11 的样本回退规则处理，不额外提示。
 - 翻译逐块 HTTP，不做跨句上下文；长文连贯性依赖模型自身。
+
+---
+
+## D26 翻译模式 M2：双语字幕与逐行复制
+
+**决定**
+
+- 翻译模式下一"条"字幕由两行组成：**译文大字行**（24pt）在上、**原文小字行**（15pt，弱色）在下；两行各自有语言列（译文行=目标语言，原文行=源语言）。`show_source = false` 时只渲染译文行，行为与 M1 相同。
+- 字幕 reducer（`app::SubtitleState`）在 `translation_mode` 下拆成两个纯函数：`apply_source`（只刷新原文与「已送翻译」前缀，不句终）与 `apply_translation`（累积译文；句终时把「原文 + 译文」作为一条历史记录落库；同一 `sentence_id` 去重；空译文句终只清当前行、不落历史）。
+- 事件契约：翻译模式下 `PipelineEvent::Asr` 的 `sent_bytes` = 已送翻译的**源文**字节长度、`is_sentence_end` 恒为 `false`、`language` = 源语言；句终与当前行收口由 `PipelineEvent::Translation` 负责（其 `sent_bytes` = 已送 TTS 的**译文**字节长度）。非翻译模式下 `Asr` 语义与行为不变。
+- 原文行与译文行**各自**可复制：悬停对应行时该行右端显示复制图标，复制的是该行完整文本（原文行复制源文、译文行复制译文）。
+- `show_source` **不进**配置指纹：修改后「重新加载配置」即时改变渲染，不重启会话；`enabled/target/model/granularity` 进指纹，运行中变更按 D20 热重启。
+
+**理由**
+
+- 双语字幕让用户同时对照源文与译文，而「听到什么」仍以译文行为准；逐行复制便于引用与校对，也避免整条一起复制导致两种语言混在一段文本里。
+- 复用同一套字幕状态机（而不是原文/译文两条并行历史），历史上限、去重、停止清空等既有语义保持一致。
+- `Asr` 事件在翻译模式下只承担「当前原文进度」，把句终交给 `Translation` 可以让"译文失败也要收口当前行"成为一条明确规则。
+
+**边界**
+
+- M2 仍没有独立 GUI 翻译页（M3）；启用或改目标语言仍需手改 `config.toml` 后「重新加载配置」。
+- 原文行是辅助信息：若整句译文全部失败，当前原文行在句终时被清空，不落历史（与"字幕 = 听到的内容"一致）。
+- 语言列宽固定 32pt，以容纳 `fil` 这类三字母代码。
 
 ---
 

@@ -357,7 +357,7 @@ pub async fn run(
                             }
                         }
                         // 旧句已有部分译文：先让界面把当前句归档，避免被下一句覆盖。
-                        if !runtime.translated.is_empty() && !runtime.end_event_sent {
+                        if !runtime.end_event_sent {
                             emit(PipelineEvent::Translation {
                                 text: runtime.translated.clone(),
                                 sent_bytes: runtime.translated.len(),
@@ -365,6 +365,7 @@ pub async fn run(
                                 language: runtime.target_language.clone(),
                                 sentence_id: runtime.sentence_id,
                             });
+                            runtime.end_event_sent = true;
                         }
                         runtime.bump_generation();
                         chunker.reset();
@@ -374,6 +375,14 @@ pub async fn run(
                         tts_task_language = None;
 
                         let source_language = language_state.typed_language(&text);
+                        // 先把源文交给界面：译文回来之前就能看到原文行，句终仍由 Translation 收口。
+                        emit(PipelineEvent::Asr {
+                            text: text.clone(),
+                            is_sentence_end: false,
+                            sent_bytes: text.len(),
+                            language: Some(source_language.clone()),
+                            sentence_id: None,
+                        });
                         let skip = canonical_language(&source_language)
                             == runtime.target_language.as_str();
                         runtime.pending = 1;
@@ -475,16 +484,19 @@ pub async fn run(
 
                 if let Some(runtime) = translation.as_mut() {
                     // 翻译模式：源文只做语言判定与分块，译文回传后才送 TTS 与字幕；
-                    // 源文本身不作为字幕输出，与译文严格一一对应。
+                    // 源文本身不作为主字幕输出，但会随 Asr 事件更新「原文行」（D26）。
                     language_state.on_event(&event.text, event.is_sentence_end);
+                    if runtime.sentence_id.is_none() {
+                        runtime.sentence_id = event.sentence_id;
+                    }
                     let chunks = chunker.process_stream(&event.text, event.is_sentence_end);
                     for chunk in chunks {
                         if handle.is_cancelled() {
                             break;
                         }
                         let source_language = language_state.language_for_chunk();
-                        if runtime.sentence_id.is_none() {
-                            runtime.sentence_id = event.sentence_id;
+                        if runtime.source_language.is_none() {
+                            runtime.source_language = Some(source_language.clone());
                         }
                         // 源语言与目标语言相同（含中文句子切到中文模式）：跳过 MT，直送 TTS。
                         let skip = canonical_language(&source_language)
@@ -504,6 +516,25 @@ pub async fn run(
                         }
                         language_state.on_chunk(chunk.is_sentence_end);
                     }
+
+                    // 把源文交给界面（Translation 事件只带译文）；句终时整句都已送翻译，
+                    // 前缀置满，避免原文行一直显示「未翻译」的弱色尾巴。
+                    let source_text = language_state.current_text().to_string();
+                    if !source_text.is_empty() {
+                        let sent = if event.is_sentence_end {
+                            source_text.len()
+                        } else {
+                            chunker.emitted_byte_len(&source_text)
+                        };
+                        emit(PipelineEvent::Asr {
+                            text: source_text,
+                            is_sentence_end: false,
+                            sent_bytes: sent,
+                            language: runtime.source_language.clone(),
+                            sentence_id: event.sentence_id.or(runtime.sentence_id),
+                        });
+                    }
+
                     // 句终：还有译文在途就等最后一条回来再收口 TTS task（句终屏障）；
                     // 没有在途译文则立即收口，避免 task 跨句。
                     if event.is_sentence_end {
@@ -522,16 +553,18 @@ pub async fn run(
                                     break;
                                 }
                                 runtime.tts_closed = true;
-                                if !runtime.end_event_sent {
-                                    emit(PipelineEvent::Translation {
-                                        text: runtime.translated.clone(),
-                                        sent_bytes: runtime.translated.len(),
-                                        is_sentence_end: true,
-                                        language: runtime.target_language.clone(),
-                                        sentence_id: runtime.sentence_id,
-                                    });
-                                    runtime.end_event_sent = true;
-                                }
+                            }
+                            if !runtime.end_event_sent {
+                                // 即使没有任何译文（例如全部翻译失败）也要收口当前句，
+                                // 否则界面上的源文行会一直挂着。
+                                emit(PipelineEvent::Translation {
+                                    text: runtime.translated.clone(),
+                                    sent_bytes: runtime.translated.len(),
+                                    is_sentence_end: true,
+                                    language: runtime.target_language.clone(),
+                                    sentence_id: runtime.sentence_id,
+                                });
+                                runtime.end_event_sent = true;
                             }
                             runtime.reset_sentence();
                         }
@@ -707,16 +740,16 @@ pub async fn run(
                             break;
                         }
                         runtime.tts_closed = true;
-                        if !runtime.end_event_sent {
-                            emit(PipelineEvent::Translation {
-                                text: runtime.translated.clone(),
-                                sent_bytes: runtime.translated.len(),
-                                is_sentence_end: true,
-                                language: runtime.target_language.clone(),
-                                sentence_id: runtime.sentence_id,
-                            });
-                            runtime.end_event_sent = true;
-                        }
+                    }
+                    if !runtime.end_event_sent {
+                        emit(PipelineEvent::Translation {
+                            text: runtime.translated.clone(),
+                            sent_bytes: runtime.translated.len(),
+                            is_sentence_end: true,
+                            language: runtime.target_language.clone(),
+                            sentence_id: runtime.sentence_id,
+                        });
+                        runtime.end_event_sent = true;
                     }
                     runtime.reset_sentence();
                 }
@@ -815,6 +848,8 @@ struct TranslationRuntime {
     tts_closed: bool,
     end_event_sent: bool,
     sentence_id: Option<u64>,
+    /// 本句源语言（首个翻译 chunk 判定后冻结；用于原文行语言列）。
+    source_language: Option<String>,
     /// 源文已句终，等最后一条译文回来再收口 TTS task。
     finish_pending: bool,
 }
@@ -839,6 +874,7 @@ impl TranslationRuntime {
             tts_closed: false,
             end_event_sent: false,
             sentence_id: None,
+            source_language: None,
             finish_pending: false,
         }
     }
@@ -857,6 +893,7 @@ impl TranslationRuntime {
         self.tts_closed = false;
         self.end_event_sent = false;
         self.sentence_id = None;
+        self.source_language = None;
         self.finish_pending = false;
     }
 }

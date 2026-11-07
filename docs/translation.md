@@ -331,6 +331,13 @@ PipelineEvent::TranslatedSentence {
 - 错误/空收口/停止重启等边界补齐。
 - **完成标准**：切换两种粒度均能稳定工作；历史行双语正确、去重正确；打字打断不再错序。
 
+**状态：已完成（2026-11-07）**
+
+- 已实现：`SubtitleLine` 增 `source / source_language / sentence_id`；`SubtitleState` 增 `translation_mode / current_translation / translation_sent_bytes / source_language` 与 `apply_source` / `apply_translation` 双语 reducer（句终落「原文 + 译文」、同 `sentence_id` 去重、空译文只清当前行）；翻译模式下 `Asr` 事件只表达原文进度（`is_sentence_end = false`），句终由 `Translation` 负责，译文全部失败也会补发句终收口；实时页改为「译文大字行 + 原文小字弱色行」，两行各自语言列与复制按钮，`show_source = false` 只渲染译文行；`show_source` 不进配置指纹，重新加载配置即时生效。
+- 测试：全量 **169 passed**（新增 5 项双语字幕 reducer 测试）；`cargo fmt --check`、`cargo build --bins`、`git diff --check` 通过。
+- 运行期验证：拼音输入 → 日文字幕（zh→ja，双语两行、语言列 zh/ja）；悬停原文行复制得到中文原文、悬停译文行复制得到日文译文；`show_source = false` 重新加载配置后原文行立即隐藏、会话不重启。
+- 未覆盖：`sentence` 粒度的真实语音端到端听感（打字输入本身是整句，未覆盖流式句终时序）；`clause` 模式长句的视觉分块效果仍需真实语料回归。
+
 ### M3 界面、文档与回归
 
 - 独立「翻译」Tab（开关/目标语言/粒度/显示原文）+ 热更新。
@@ -345,7 +352,7 @@ PipelineEvent::TranslatedSentence {
 | `config.example.toml` | 新增 `[translate]` 段及逐字段注释（权威字段表） |
 | `README.md` | 界面说明（翻译页：开关/目标语言/粒度/显示原文）、打字输入、配置摘要、16 种目标语言表、翻译模式使用与延迟预期 |
 | `docs/architecture.md` | 新模块与数据流（翻译阶段、worker、字幕双轴）、配置字段表、事件表、UI 说明；并修正“尾部保护”只作用于兜底切分的表述 |
-| `docs/decisions.md` | 新增 `D25`（翻译模式：ASR/打字 → MT → 现有 TTS，含分块与失败边界）；M2/M3 再补 `D26`（双语字幕与粒度语义） |
+| `docs/decisions.md` | 新增 `D25`（翻译模式：ASR/打字 → MT → 现有 TTS，含分块与失败边界）；已补 `D26`（双语字幕与逐行复制、事件语义、`show_source` 热加载） |
 | `docs/translation.md` | 本文件；功能完成后删除，长期内容已并入上述文档 |
 
 ## 14. 待实测/待确认
