@@ -29,6 +29,9 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .id_salt("asr_tab_scroll")
         .show(ui, |ui| {
+            // 语言列表靠拖动手柄排序：鼠标划过标签文字时不能进入“选中文字”状态，
+            // 否则拖动会把文字选成蓝色并干扰拖拽（输入框不受这个开关影响）。
+            ui.style_mut().interaction.selectable_labels = false;
             show_content(app, ui);
         });
 }
@@ -107,48 +110,101 @@ fn show_model(app: &mut KaolsApp, ui: &mut egui::Ui) {
     );
 }
 
-/// 「语言列表」：有序、首个为默认；支持上移/下移/删除与追加。
+/// 「语言列表」：有序、首个为默认；拖动左侧手柄排序，支持删除与追加。
 fn show_languages(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("语言列表（有序，首个为默认）").strong());
     let mut languages = app.asr_languages.clone();
+    let count = languages.len();
 
-    let mut move_up: Option<usize> = None;
-    let mut move_down: Option<usize> = None;
+    // 拖拽排序：与自定义音色样本编辑器一致——手柄按下时把下标存进 egui 临时数据，
+    // 松手时按指针位置插入；拖动过程中在目标插入位置画一条指示线。
+    let drag_id = ui.make_persistent_id("asr_language_drag");
+    let mut drag_from = ui.data(|data| data.get_temp::<usize>(drag_id));
+    let mut released = false;
+    let mut block_rects: Vec<egui::Rect> = Vec::with_capacity(count);
     let mut remove: Option<usize> = None;
+
     for (index, code) in languages.iter().enumerate() {
+        let mut block_rect: Option<egui::Rect> = None;
         ui.horizontal(|ui| {
-            ui.label(format!("{}.", index + 1));
-            ui.label(language_label(code));
-            // 首个不能上移、末个不能下移；只剩一种语言时禁止删除，避免空列表
-            if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
-                move_up = Some(index);
+            let row_left = ui.cursor().left();
+            // 先给手柄列留出宽度，内容排版后再把手柄放到内容块垂直中心
+            ui.add_space(18.0);
+            let right = ui.horizontal(|ui| {
+                ui.label(language_label(code));
+                if index == 0 {
+                    ui.label(egui::RichText::new("默认语言").weak());
+                }
+                // 只剩一种语言时禁止删除，避免空列表
+                if count > 1 && ui.button("删除").clicked() {
+                    remove = Some(index);
+                }
+            });
+            block_rect = Some(right.response.rect);
+
+            let handle_rect = egui::Rect::from_center_size(
+                egui::pos2(row_left + 8.0, right.response.rect.center().y),
+                egui::vec2(16.0, 20.0),
+            );
+            let handle = ui
+                .put(
+                    handle_rect,
+                    egui::Label::new(egui::RichText::new("≡").weak()).sense(egui::Sense::drag()),
+                )
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .on_hover_text("拖动调整语言顺序");
+            if handle.drag_started() {
+                drag_from = Some(index);
+                ui.data_mut(|data| data.insert_temp(drag_id, index));
             }
-            if ui
-                .add_enabled(index + 1 < languages.len(), egui::Button::new("↓"))
-                .clicked()
-            {
-                move_down = Some(index);
+            if handle.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
-            if ui
-                .add_enabled(languages.len() > 1, egui::Button::new("删除"))
-                .clicked()
-            {
-                remove = Some(index);
+            if handle.drag_stopped() {
+                released = true;
+                ui.data_mut(|data| data.remove_temp::<usize>(drag_id));
             }
         });
-    }
-    if let Some(index) = move_up {
-        if index > 0 {
-            languages.swap(index, index - 1);
+        if let Some(rect) = block_rect {
+            block_rects.push(rect);
         }
     }
-    if let Some(index) = move_down {
-        if index + 1 < languages.len() {
-            languages.swap(index, index + 1);
+
+    if let Some(from) = drag_from {
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            let insert_at = block_rects
+                .iter()
+                .position(|rect| pointer.y < rect.center().y)
+                .unwrap_or(block_rects.len());
+            let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+            let y = block_rects
+                .get(insert_at)
+                .map(|rect| rect.top())
+                .or_else(|| block_rects.last().map(|rect| rect.bottom()));
+            if let Some(y) = y {
+                let x = block_rects
+                    .first()
+                    .map(|rect| egui::Rangef::new(rect.left(), ui.max_rect().right()))
+                    .unwrap_or(egui::Rangef::new(0.0, ui.max_rect().right()));
+                ui.painter().hline(x, y, stroke);
+            }
+            if released {
+                let len = languages.len();
+                let mut to = insert_at;
+                if from < to {
+                    to -= 1;
+                }
+                let to = to.min(len.saturating_sub(1));
+                if from < len && from != to {
+                    let language = languages.remove(from);
+                    languages.insert(to, language);
+                }
+                ui.data_mut(|data| data.remove_temp::<usize>(drag_id));
+            }
         }
     }
     if let Some(index) = remove {
-        if languages.len() > 1 {
+        if languages.len() > 1 && index < languages.len() {
             languages.remove(index);
         }
     }
@@ -194,37 +250,25 @@ fn show_languages(app: &mut KaolsApp, ui: &mut egui::Ui) {
     app.asr_languages = languages;
 }
 
-/// 「预编译热词」：多行文本（一行一个）+ 归一化条数与上限提示。
+/// 「预编译热词」：多行文本（一行一个）；标题右侧显示归一化后的条数 / 上限。
 fn show_hotwords(app: &mut KaolsApp, ui: &mut egui::Ui) {
-    ui.label(egui::RichText::new("预编译热词").strong());
+    let lines: Vec<String> = app.asr_hotwords.lines().map(str::to_string).collect();
+    let count = normalize_hotwords(&lines).len();
+    let over_limit = count > MAX_ASR_HOTWORDS;
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("预编译热词").strong());
+        let counter = egui::RichText::new(format!("({count}/{MAX_ASR_HOTWORDS})")).small();
+        if over_limit {
+            ui.colored_label(RED, counter);
+        } else {
+            ui.label(counter.weak());
+        }
+    });
     ui.add(
         egui::TextEdit::multiline(&mut app.asr_hotwords)
             .desired_rows(6)
             .desired_width(f32::INFINITY)
             .hint_text("一行一个热词，例如：原神"),
-    );
-
-    let lines: Vec<String> = app.asr_hotwords.lines().map(str::to_string).collect();
-    let hotwords = normalize_hotwords(&lines);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!(
-                "归一化后 {} 条（空行与重复项自动忽略）",
-                hotwords.len()
-            ))
-            .weak(),
-        );
-        if hotwords.len() > MAX_ASR_HOTWORDS {
-            ui.colored_label(RED, format!("超过上限 {MAX_ASR_HOTWORDS} 条，保存会被拒绝"));
-        }
-    });
-    ui.label(
-        egui::RichText::new(
-            "热词权重固定为 50（百炼超级热词，实测召回更好）、不限定语种；仅主业务空间支持。\
-             因为每个词表最多 50 个超级热词，本页最多 50 条。单条限制：含非 ASCII 字符时\
-             最多 15 个字符（空格计入），纯 ASCII 时最多 7 个空格分隔片段。修改热词后\
-             建议间隔 ≥5 分钟再改（百炼限制）。",
-        )
-        .weak(),
     );
 }
