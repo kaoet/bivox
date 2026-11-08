@@ -67,8 +67,7 @@ fn show_content(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new(
             "本页改动点右上角「保存」一次写回 [asr] 的 model / languages / hotwords；\
-             运行中保存会自动重启实时管线并丢失当前句；预编译热词会在下次会话启动时\
-             自动创建/更新到百炼，首次创建可能需要几十秒。",
+             预编译热词会在下次会话启动时自动创建/更新到百炼，首次创建可能需要几十秒。",
         )
         .weak(),
     );
@@ -80,11 +79,6 @@ fn show_content(app: &mut KaolsApp, ui: &mut egui::Ui) {
             format!("配置无效，无法保存语音识别设置：{error}；请先到「设置」页修正配置。"),
         );
         return;
-    }
-
-    ui.add_space(6.0);
-    if app.session.is_some() {
-        ui.colored_label(AMBER, "⚠ 运行中保存会自动重启实时管线，当前句会丢失。");
     }
 
     ui.add_space(8.0);

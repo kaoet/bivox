@@ -92,23 +92,6 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     let restart_fields_changed = enabled != configured.enabled
         || target != configured.target
         || granularity != configured.granularity;
-    if app.session.is_some() {
-        ui.add_space(6.0);
-        if restart_fields_changed {
-            ui.colored_label(
-                egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
-                "⚠ 运行中修改会重启实时管线，当前句会丢失。",
-            );
-        } else {
-            ui.label(
-                egui::RichText::new(
-                    "运行中修改开关/目标语言/粒度会重启实时管线并丢失当前句；\
-                     「显示原文」只影响字幕渲染，改后立即生效、不重启。",
-                )
-                .weak(),
-            );
-        }
-    }
 
     if restart_fields_changed || show_source != configured.show_source {
         app.update_translate_settings(enabled, &target, granularity, show_source);

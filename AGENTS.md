@@ -1,8 +1,6 @@
 # AGENTS.md
 
 > 面向在本仓库工作的 AI 编码代理。**项目规范不写在这里**：构建门禁、代码/注释规范、测试、调试与发布流程全部以 [`CONTRIBUTING.md`](CONTRIBUTING.md) 为准。本文件只提供阅读顺序与文档导航。
->
-> **禁止读取或修改 [`TODO.md`](TODO.md)**：那是人类维护的任务与想法记录，只供人类使用。
 
 ## 开始任务前
 
@@ -24,7 +22,7 @@
 | [`docs/decisions.md`](docs/decisions.md) | 设计决定与理由（稳定编号 `D<n>`） |
 | [`docs/troubleshooting/windows-temp-low-integrity.md`](docs/troubleshooting/windows-temp-low-integrity.md) | Windows 上测试写 `%TEMP%` 报 os error 5 的排查、规避与修复（DSH Low 完整性标签残留） |
 | [`config.example.toml`](config.example.toml) | 配置字段与默认值的权威注释（编译期内嵌为首次启动模板） |
-| [`TODO.md`](TODO.md) | 人类维护的任务与想法记录；**AI 编码代理不得读取或修改** |
+| [`TODO.md`](TODO.md) | 人类维护的任务与想法记录；**AI 编码代理不得修改，也应忽略其中内容** |
 | `src/**/*.rs` 的 `//!` | 模块职责与关键约束 |
 
 ## 事实来源
@@ -37,6 +35,10 @@
 | 设计约束与理由 | [`docs/decisions.md`](docs/decisions.md) |
 | 配置字段 | [`config.example.toml`](config.example.toml) |
 | 语言代码集合 | `src/language.rs` |
+
+## 提交
+
+- **没有用户明确要求时，不要执行 `git commit`**。改动完成后保留在工作区并说明未提交状态，等用户明确说“提交 / commit”后再提交；也不要擅自 amend、push 或改写历史。
 
 ## 执行要求（全部引用，不在此重复）
 
