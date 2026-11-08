@@ -1,8 +1,9 @@
 //! 用 `toml_edit` 对 `config.toml` 做**定点修改**（决策 D3，见 docs/decisions.md）。
 //!
-//! 目标：只动 GUI 负责的那几个字段（`[api] key`、`[audio]` 设备……），
-//! 其余字段、注释、顺序原样保留；写盘前先用 `AppConfig::from_toml_str` 校验整份文本，
-//! 校验失败不落盘；写盘前把旧文件备份成 `config.toml.bak`。
+//! 目标：只动 GUI 负责的那几个字段（`[api] key`、`[audio]` 设备、`[tts] voice` /
+//! `dialect` / `custom_voices`、`[translate]` 的可写字段），其余字段、注释、顺序原样保留；
+//! 写盘前先用 `AppConfig::from_toml_str` 校验整份文本，校验失败不落盘；
+//! 写盘前把旧文件备份成 `config.toml.bak`。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,14 @@ pub fn set_active_voice(original: &str, voice: &str) -> Result<String> {
     let mut doc = parse(original)?;
     let tts = ensure_table(&mut doc, "tts")?;
     tts["voice"] = toml_edit::value(voice.trim());
+    render(&doc, original)
+}
+
+/// 设置中文方言 `[tts] dialect`（官方方言名，如 `东北话` / `普通话`）。
+pub fn set_tts_dialect(original: &str, dialect: &str) -> Result<String> {
+    let mut doc = parse(original)?;
+    let tts = ensure_table(&mut doc, "tts")?;
+    tts["dialect"] = toml_edit::value(dialect.trim());
     render(&doc, original)
 }
 
@@ -384,6 +393,42 @@ languages = ["zh", "ja"]
         let config = AppConfig::from_toml_str(&updated).unwrap();
         assert_eq!(config.tts.voice, "Ethan");
         assert!(updated.contains("# 顶部注释"));
+    }
+
+    #[test]
+    fn set_tts_dialect_creates_table_and_keeps_other_fields() {
+        // 原配置没有 [tts] 表，写回时新建；注释与其它段保留
+        let updated = set_tts_dialect(SAMPLE, " 东北话 ").unwrap();
+
+        assert!(updated.contains("[tts]"), "{updated}");
+        assert!(updated.contains(r#"dialect = "东北话""#), "{updated}");
+        assert!(updated.contains("# 顶部注释"));
+        assert!(updated.contains(r#"languages = ["zh", "ja"]"#));
+        assert_eq!(
+            AppConfig::from_toml_str(&updated).unwrap().tts.dialect,
+            "东北话"
+        );
+
+        // 改回默认值也照写（GUI 只在草稿与配置不同时才调用本函数）
+        let updated = set_tts_dialect(&updated, "普通话").unwrap();
+        assert_eq!(
+            AppConfig::from_toml_str(&updated).unwrap().tts.dialect,
+            "普通话"
+        );
+    }
+
+    #[test]
+    fn save_rejects_unsupported_dialect_without_touching_file() {
+        let path = temp_path("dialect");
+        fs::write(&path, SAMPLE).unwrap();
+
+        // 官方写法是「广东话」，不接受「粤语」别名
+        let updated = set_tts_dialect(SAMPLE, "粤语").unwrap();
+        let err = save(&path, SAMPLE, &updated).unwrap_err();
+        assert!(format!("{err:#}").contains("[tts] dialect"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

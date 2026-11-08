@@ -13,6 +13,7 @@ use crate::config::{AppConfig, TranslateGranularity, CUSTOM_VOICE_PREFIX, DEFAUL
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
+use crate::language;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::paths::AppPaths;
 use crate::pipeline::session::{PipelineSessionHandle, TypedInput, MAX_TYPED_INPUT_CHARS};
@@ -320,6 +321,8 @@ pub struct KaolsApp {
     pub voice_input: String,
     /// 「当前音色」→ 自定义音色的配置键名草稿。
     pub voice_custom_key: String,
+    /// 语音合成页「中文方言」草稿（保存前只改这里，`config` 不变）。
+    pub tts_dialect: String,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
     /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
@@ -377,6 +380,7 @@ impl KaolsApp {
             voice_mode: VoiceMode::Existing,
             voice_input: String::new(),
             voice_custom_key: String::new(),
+            tts_dialect: String::new(),
             pipeline_error: None,
             vad_active: false,
             config_created,
@@ -424,12 +428,14 @@ impl KaolsApp {
                 self.input_device = config.audio.input_device.clone();
                 self.output_device = config.audio.output_device.clone();
                 self.voice_drafts = editor::drafts_from_config(config);
+                self.tts_dialect = config.tts.dialect.clone();
             }
             ConfigState::Invalid { .. } => {
                 self.api_key_input.clear();
                 self.input_device = None;
                 self.output_device = None;
                 self.voice_drafts.clear();
+                self.tts_dialect = language::DEFAULT_CHINESE_DIALECT.to_string();
             }
         }
     }
@@ -486,11 +492,24 @@ impl KaolsApp {
         }
     }
 
-    /// 保存语音合成页的全部改动：`[tts.custom_voices]` 草稿 + 顶部「当前音色」。
+    /// 「中文方言」草稿是否与配置文件不同。
+    pub fn tts_dialect_dirty(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => self.tts_dialect.trim() != config.tts.dialect,
+            ConfigState::Invalid { .. } => true,
+        }
+    }
+
+    /// 语音合成页是否有未保存改动（音色草稿 + 当前音色 + 中文方言）。
+    pub fn tts_tab_dirty(&self) -> bool {
+        self.voice_drafts_dirty() || self.voice_input_dirty() || self.tts_dialect_dirty()
+    }
+
+    /// 保存语音合成页的全部改动：`[tts.custom_voices]` 草稿 + 顶部「当前音色」+ 中文方言。
     ///
-    /// 两者合并成一次原子写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启。
+    /// 三部分合并成一次原子写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启。
     pub fn save_tts_tab(&mut self) {
-        if !self.voice_drafts_dirty() && !self.voice_input_dirty() {
+        if !self.tts_tab_dirty() {
             return;
         }
         match self.try_save_tts_tab() {
@@ -510,6 +529,7 @@ impl KaolsApp {
     fn try_save_tts_tab(&self) -> anyhow::Result<()> {
         let drafts_dirty = self.voice_drafts_dirty();
         let voice_dirty = self.voice_input_dirty();
+        let dialect_dirty = self.tts_dialect_dirty();
         let wanted_voice = self.voice_draft_value();
         let ConfigState::Loaded(config) = &self.config else {
             anyhow::bail!("配置无效，无法保存语音合成设置");
@@ -550,6 +570,10 @@ impl KaolsApp {
                 anyhow::bail!("当前音色不能为空");
             }
             updated = config_edit::set_active_voice(&updated, &wanted_voice)?;
+        }
+
+        if dialect_dirty {
+            updated = config_edit::set_tts_dialect(&updated, &self.tts_dialect)?;
         }
 
         config_edit::save(&self.paths.config_file, &original, &updated)
@@ -1009,13 +1033,14 @@ fn config_signature(config: &AppConfig) -> String {
     let mut signature = String::new();
     let _ = write!(
         signature,
-        "key={:?}\nhost={}\nasr={}\nlangs={:?}\ntts={}\nvoice={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\ntranslate={}/{}/{}/{}\n",
+        "key={:?}\nhost={}\nasr={}\nlangs={:?}\ntts={}\nvoice={}\ndialect={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\ntranslate={}/{}/{}/{}\n",
         config.api.key,
         config.api.workspace_host,
         config.asr.model,
         config.asr.languages,
         config.tts.model,
         config.tts.voice,
+        config.tts.dialect,
         config.tts.cache_file,
         config.audio.input_device,
         config.audio.output_device,
@@ -1580,6 +1605,23 @@ show_source = true
         )
         .unwrap();
         assert_eq!(config_signature(&base), config_signature(&show_changed));
+    }
+
+    #[test]
+    fn config_signature_detects_dialect_changes() {
+        // 方言影响运行期合成参数，必须计入指纹（D20 热重启依据）。
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[tts]
+dialect = "普通话"
+"#;
+        let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let changed =
+            crate::config::AppConfig::from_toml_str(&toml.replace("普通话", "东北话")).unwrap();
+
+        assert_ne!(config_signature(&base), config_signature(&changed));
     }
 
     #[test]

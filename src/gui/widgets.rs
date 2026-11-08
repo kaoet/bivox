@@ -2,6 +2,8 @@
 
 use eframe::egui;
 
+use crate::language::CHINESE_DIALECTS;
+
 /// 顶部错误横幅（启动检查失败、崩溃信息都走这里）。
 pub fn banner(ui: &mut egui::Ui, title: &str, detail: &str, color: egui::Color32) {
     ui.group(|ui| {
@@ -48,6 +50,22 @@ pub fn device_combo(
             ui.selectable_value(value, None, default_label);
             for name in names {
                 ui.selectable_value(value, Some(name.clone()), name.as_str());
+            }
+        });
+}
+
+/// 中文方言下拉：选项来自 [`CHINESE_DIALECTS`]（首个为默认「普通话」）。
+///
+/// 与 [`device_combo`] 一样用 `from_id_salt` + 单独 label，避免 0.37 的
+/// `ComboBox::from_label` 把标签画在下拉框右侧。
+pub fn dialect_combo(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(label)
+        .selected_text(value.as_str())
+        .width(120.0)
+        .show_ui(ui, |ui| {
+            for dialect in CHINESE_DIALECTS {
+                ui.selectable_value(value, (*dialect).to_string(), *dialect);
             }
         });
 }

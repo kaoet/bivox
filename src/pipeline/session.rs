@@ -227,6 +227,7 @@ pub async fn run(
             api_key: api_key.clone(),
             tts_model: config.tts.model.clone(),
             ws_url: inference_ws_url,
+            dialect: config.tts.dialect.clone(),
         };
         let tts_playback = playback.clone();
         tasks.push(tokio::spawn(async move {

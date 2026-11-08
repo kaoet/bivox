@@ -1,6 +1,7 @@
 //! 语言相关工具：
 //!
 //! - 语言代码集合与 `instruction` 映射（百炼声音复刻 / 合成用）
+//! - 中文方言集合与合成 `instruction` 映射（`[tts] dialect`）
 //! - 对 ASR 文本做"脚本统计"，据此判断用户这一句在说什么语言
 //!
 //! 官方 ASR 接口只接受 `language_hints` 输入提示、**不返回识别到的语种**，
@@ -103,6 +104,81 @@ pub fn instruction_for(asr_code: &str) -> Option<&'static str> {
         _ => return None,
     };
     Some(instruction)
+}
+
+/// 百炼 Qwen-Audio-TTS 支持的中文方言（官方文档列表，首个为默认「普通话」）。
+///
+/// 官方 API 没有方言参数，方言只能通过合成请求的 `instruction` 表达：
+/// 复刻音色可用全表；系统音色是否支持取决于音色本身（见 README「中文方言」）。
+/// 只认下表中的官方名称，不接受「粤语」这类别名。
+pub const CHINESE_DIALECTS: &[&str] = &[
+    "普通话",
+    "广东话",
+    "重庆话",
+    "东北话",
+    "甘肃话",
+    "贵州话",
+    "浙江话",
+    "河北话",
+    "河南话",
+    "湖北话",
+    "湖南话",
+    "江西话",
+    "宁波话",
+    "宁夏话",
+    "青岛话",
+    "陕西话",
+    "山西话",
+    "山东话",
+    "上海话",
+    "四川话",
+    "云南话",
+];
+
+/// 中文方言默认值：普通话 = 不附加方言指令。
+pub const DEFAULT_CHINESE_DIALECT: &str = "普通话";
+
+/// 判断是否为受支持的中文方言名（忽略首尾空白）。
+pub fn is_chinese_dialect(name: &str) -> bool {
+    CHINESE_DIALECTS.contains(&name.trim())
+}
+
+/// 中文方言对应的合成指令；普通话（或未知值）返回 `None`（不附加 `instruction`）。
+pub fn chinese_dialect_instruction(dialect: &str) -> Option<&'static str> {
+    let instruction = match dialect.trim() {
+        "普通话" => return None,
+        "广东话" => "请讲广东话。",
+        "重庆话" => "请讲重庆话。",
+        "东北话" => "请讲东北话。",
+        "甘肃话" => "请讲甘肃话。",
+        "贵州话" => "请讲贵州话。",
+        "浙江话" => "请讲浙江话。",
+        "河北话" => "请讲河北话。",
+        "河南话" => "请讲河南话。",
+        "湖北话" => "请讲湖北话。",
+        "湖南话" => "请讲湖南话。",
+        "江西话" => "请讲江西话。",
+        "宁波话" => "请讲宁波话。",
+        "宁夏话" => "请讲宁夏话。",
+        "青岛话" => "请讲青岛话。",
+        "陕西话" => "请讲陕西话。",
+        "山西话" => "请讲山西话。",
+        "山东话" => "请讲山东话。",
+        "上海话" => "请讲上海话。",
+        "四川话" => "请讲四川话。",
+        "云南话" => "请讲云南话。",
+        _ => return None,
+    };
+    Some(instruction)
+}
+
+/// 本句合成请求应携带的 `instruction`：
+/// 中文用 `[tts] dialect`（普通话不附加），其余语种沿用内置语种指令。
+pub fn tts_instruction(language: &str, dialect: &str) -> Option<&'static str> {
+    if canonical_language(language) == "zh" {
+        return chinese_dialect_instruction(dialect);
+    }
+    instruction_for(language)
 }
 
 /// 一段文本里各类文字的数量统计（只统计"文字"，忽略空白/数字/标点）。
@@ -479,6 +555,44 @@ mod tests {
         assert_eq!(instruction_for("en"), None);
         assert_eq!(instruction_for("zh"), None);
         assert_eq!(instruction_for("no"), None);
+    }
+
+    #[test]
+    fn chinese_dialects_are_official_and_unique() {
+        assert_eq!(
+            CHINESE_DIALECTS.first().copied(),
+            Some(DEFAULT_CHINESE_DIALECT)
+        );
+        assert_eq!(CHINESE_DIALECTS.len(), 21, "普通话 + 官方 20 种方言");
+        let mut seen = std::collections::HashSet::new();
+        for dialect in CHINESE_DIALECTS {
+            assert!(seen.insert(*dialect), "方言重复: {dialect}");
+            assert!(is_chinese_dialect(dialect));
+        }
+        assert!(is_chinese_dialect("  东北话  "), "忽略首尾空白");
+        // 只认官方名称：官方写法是「广东话」，不接受「粤语」别名
+        assert!(!is_chinese_dialect("粤语"));
+        assert!(!is_chinese_dialect("东北"));
+    }
+
+    #[test]
+    fn chinese_dialect_instruction_mapping() {
+        assert_eq!(chinese_dialect_instruction("普通话"), None);
+        assert_eq!(chinese_dialect_instruction("东北话"), Some("请讲东北话。"));
+        assert_eq!(chinese_dialect_instruction("广东话"), Some("请讲广东话。"));
+        assert_eq!(chinese_dialect_instruction("上海话"), Some("请讲上海话。"));
+        assert_eq!(chinese_dialect_instruction("粤语"), None, "不支持别名");
+        assert_eq!(chinese_dialect_instruction("xx"), None);
+    }
+
+    #[test]
+    fn tts_instruction_uses_dialect_only_for_chinese() {
+        assert_eq!(tts_instruction("zh", "东北话"), Some("请讲东北话。"));
+        assert_eq!(tts_instruction("zh", "普通话"), None);
+        assert_eq!(tts_instruction("tl", "东北话"), Some("请讲菲律宾语。"));
+        assert_eq!(tts_instruction("ja", "东北话"), Some("请讲日语。"));
+        assert_eq!(tts_instruction("en", "东北话"), None);
+        assert_eq!(tts_instruction("no", "东北话"), None);
     }
 
     #[test]

@@ -140,6 +140,12 @@ pub struct TtsConfig {
     /// 系统音色名、复刻音色 voice_id，或 `custom:<配置名>`（引用 `[tts.custom_voices]`）。
     pub voice: String,
 
+    /// 中文方言（官方方言名，默认「普通话」= 不附加方言指令）。
+    ///
+    /// 只在本句语言判定为中文（`zh`）时通过合成请求的 `instruction` 生效；
+    /// 取值见 [`language::CHINESE_DIALECTS`]。
+    pub dialect: String,
+
     /// 自定义（复刻）音色表：键名用于在 `voice` 中以 `custom:<键名>` 引用。
     pub custom_voices: HashMap<String, CustomVoiceConfig>,
 
@@ -152,6 +158,7 @@ impl Default for TtsConfig {
         Self {
             model: DEFAULT_TTS_MODEL.to_string(),
             voice: DEFAULT_VOICE.to_string(),
+            dialect: language::DEFAULT_CHINESE_DIALECT.to_string(),
             custom_voices: HashMap::new(),
             cache_file: PathBuf::from(DEFAULT_VOICE_CACHE_FILE),
         }
@@ -377,6 +384,7 @@ impl AppConfig {
             .collect();
         self.tts.model = self.tts.model.trim().to_string();
         self.tts.voice = self.tts.voice.trim().to_string();
+        self.tts.dialect = self.tts.dialect.trim().to_string();
         self.translate.target =
             language::canonical_language(self.translate.target.trim().to_lowercase().as_str())
                 .to_string();
@@ -406,6 +414,13 @@ impl AppConfig {
         }
         if self.tts.voice.trim().is_empty() {
             bail!("配置项 [tts] voice 不能为空");
+        }
+        if !language::is_chinese_dialect(&self.tts.dialect) {
+            bail!(
+                "配置项 [tts] dialect {:?} 不受支持；可用值: {:?}",
+                self.tts.dialect,
+                language::CHINESE_DIALECTS
+            );
         }
         self.validate_custom_voices()?;
         self.validate_translate()?;
@@ -684,6 +699,11 @@ mod tests {
         assert_eq!(config.asr.languages, vec!["zh".to_string()]);
         assert_eq!(config.tts.model, DEFAULT_TTS_MODEL);
         assert_eq!(config.tts.voice, DEFAULT_VOICE);
+        assert_eq!(
+            config.tts.dialect,
+            language::DEFAULT_CHINESE_DIALECT,
+            "未配置方言时默认普通话"
+        );
         assert!(config.tts.custom_voices.is_empty());
         assert!(config.audio.input_device.is_none());
         assert!(config.audio.output_device.is_none());
@@ -722,6 +742,7 @@ languages = ["ja", "zh", "en"]
 [tts]
 model = "tts-test"
 voice = "voice-test"
+dialect = "四川话"
 
 [translate]
 enabled = true
@@ -757,6 +778,7 @@ words = 10
         );
         assert_eq!(config.tts.model, "tts-test");
         assert_eq!(config.tts.voice, "voice-test");
+        assert_eq!(config.tts.dialect, "四川话");
         assert!(config.translate.enabled);
         assert_eq!(config.translate.target, "ja");
         assert_eq!(config.translate.model, DEFAULT_TRANSLATE_MODEL);
@@ -836,6 +858,24 @@ words = 10
         )
         .unwrap();
         assert_eq!(config.asr.languages.len(), 5);
+    }
+
+    #[test]
+    fn tts_dialect_is_normalized_and_validated() {
+        let config =
+            AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[tts]\ndialect = \"  东北话  \"\n")
+                .unwrap();
+        assert_eq!(config.tts.dialect, "东北话", "方言名应去首尾空白");
+
+        // 只认官方名称：官方写法是「广东话」，不接受「粤语」等别名
+        for bad in ["粤语", "东北", "xx", ""] {
+            let text = format!("[api]\nkey = \"sk-test\"\n[tts]\ndialect = \"{bad}\"\n");
+            let err = AppConfig::from_toml_str(&text).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[tts] dialect"),
+                "dialect={bad:?} 应被拒绝: {err:#}"
+            );
+        }
     }
 
     #[test]

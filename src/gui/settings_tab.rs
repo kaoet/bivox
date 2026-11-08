@@ -18,6 +18,7 @@ struct ConfigSummary {
     languages: String,
     tts_model: String,
     tts_voice: String,
+    tts_dialect: String,
     custom_voices: usize,
 }
 
@@ -29,6 +30,7 @@ impl ConfigSummary {
             languages: config.asr.languages.join(", "),
             tts_model: config.tts.model.clone(),
             tts_voice: config.tts.voice.clone(),
+            tts_dialect: config.tts.dialect.clone(),
             custom_voices: config.tts.custom_voices.len(),
         }
     }
@@ -123,6 +125,7 @@ fn show_config_summary(ui: &mut egui::Ui, summary: &ConfigSummary) {
     widgets::kv_row(ui, "识别语言", &summary.languages);
     widgets::kv_row(ui, "合成模型", &summary.tts_model);
     widgets::kv_row(ui, "当前音色", &summary.tts_voice);
+    widgets::kv_row(ui, "中文方言", &summary.tts_dialect);
     widgets::kv_row(ui, "自定义音色", &format!("{} 个", summary.custom_voices));
     ui.add_space(4.0);
     ui.label(

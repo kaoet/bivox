@@ -1,14 +1,14 @@
-//! 语音合成页：页头（保存/放弃更改）、两栏布局编排与自定义音色草稿的增删保存（D11/D22，
-//! 见 docs/decisions.md）。
+//! 语音合成页：页头（保存/放弃更改）、中文方言选择、布局编排与自定义音色草稿的增删保存
+//! （D11/D22/D29，见 docs/decisions.md）。
 //!
 //! 页面按职责拆成三个文件：
-//! - 本文件：页头、两栏布局编排、自定义音色草稿列表的选中/新增/删除与保存；
+//! - 本文件：页头、中文方言、两栏布局编排、自定义音色草稿列表的选中/新增/删除与保存；
 //! - `tts_current_voice`：顶部「当前音色」选择（现有音色 / 自定义音色）；
 //! - `tts_voice_editor`：自定义音色的样本编辑、拖拽排序与语速滑条。
 //!
-//! 顶部选择「当前音色」：现有音色（输入框，填内置音色名或任意 voice_id）或
-//! 自定义音色（下拉，写 `custom:<键名>`），右上角「保存」同时写回 `[tts] voice`
-//! 与 `[tts.custom_voices]`。
+//! 顶部选择「当前音色」与中文方言：现有音色（输入框，填内置音色名或任意 voice_id）
+//! 或自定义音色（下拉，写 `custom:<键名>`），右上角「保存」同时写回 `[tts] voice`、
+//! `[tts] dialect` 与 `[tts.custom_voices]`。
 //! 下方左栏是自定义音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线、样例音频
 //! 与每个样本的语速。
 //! 草稿只在点「保存」后写回（`[tts.custom_voices]`，同时校验并备份）；
@@ -20,7 +20,7 @@ use eframe::egui;
 
 use crate::app::KaolsApp;
 use crate::config::DEFAULT_SAMPLE_RATE;
-use crate::gui::{tts_current_voice, tts_voice_editor};
+use crate::gui::{tts_current_voice, tts_voice_editor, widgets};
 use crate::language::CLONING_LANGUAGES;
 use crate::voice::editor::{SampleDraft, VoiceDraft};
 
@@ -34,7 +34,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.heading("语音合成");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let dirty = app.voice_drafts_dirty() || app.voice_input_dirty();
+            let dirty = app.tts_tab_dirty();
             if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
                 save = true;
             }
@@ -60,14 +60,24 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     }
     ui.label(
         egui::RichText::new(
-            "上方选择「当前音色」；下方编辑自定义音色。改动后点右上角「保存」一次写回 config.toml\
-             （运行中会自动重启实时管线），或点「放弃更改」还原。",
+            "上方选择「当前音色」与中文方言；下方编辑自定义音色。改动后点右上角「保存」一次写回 \
+             config.toml（运行中会自动重启实时管线），或点「放弃更改」还原。",
         )
         .weak(),
     );
     ui.add_space(6.0);
 
     tts_current_voice::show(app, ui);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        widgets::dialect_combo(ui, "中文方言", &mut app.tts_dialect);
+        ui.label(egui::RichText::new("仅中文句子生效；普通话不附加方言指令").weak())
+            .on_hover_text(
+                "复刻音色支持官方列出的 20 种方言；qwen-audio-3.1-tts-flash 的 4 个多语种/方言\
+                 系统音色仅支持上海、广东、东北、重庆、陕西、云南、宁波、甘肃 8 种，\
+                 其余系统音色可能只支持普通话。",
+            );
+    });
     ui.add_space(6.0);
 
     let exe_dir = app.paths.exe_dir.clone();

@@ -59,7 +59,7 @@ cargo test                # 全部单元测试
 
 ## 3. 测试
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，不放根目录 `tests/`；当前共 **146** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，不放根目录 `tests/`。
 - 测试使用本地 mock，**不访问真实百炼网络**：
   - WebSocket 协议：测试代码内起本地 `TcpListener`，手写握手/事件；
   - HTTP（音色接口）：`src/voice/mock_http.rs` 的手写 mock 服务。
@@ -195,7 +195,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 ### 配置与便携模式
 
-- `config.toml` 是唯一配置事实源；GUI 只能写：`[api] key`、`[audio]` 设备、`[tts] voice`、`[tts.custom_voices]`；
+- `config.toml` 是唯一配置事实源；GUI 只能写：`[api] key`、`[audio]` 设备、`[tts] voice` / `[tts] dialect` / `[tts.custom_voices]`；
 - 写回使用 `toml_edit` 定点修改：写前用 `AppConfig::from_toml_str` 校验、写前备份 `config.toml.bak`、无改动不写盘；
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
 - 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md`；

@@ -96,7 +96,7 @@ src/
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
 │   ├── translate_tab.rs 翻译页：翻译模式开关、目标语言、粒度、显示原文
 │   ├── audio_tab.rs     音频页：输入/输出设备
-│   ├── tts_tab.rs           语音合成页外壳：页头（保存/放弃）+ 布局与草稿增删
+│   ├── tts_tab.rs           语音合成页外壳：页头（保存/放弃）+ 中文方言 + 布局与草稿增删
 │   ├── tts_current_voice.rs 语音合成页：顶部「当前音色」选择
 │   ├── tts_voice_editor.rs  语音合成页：自定义音色样本编辑/排序/语速
 │   ├── settings_tab.rs  设置页：路径、API Key、配置概览
@@ -231,6 +231,7 @@ main()
 | | `languages` | `["zh"]` | 有序；首个为默认；整份列表作为 `language_hints`；本地判定也使用完整列表 |
 | `[tts]` | `model` | `qwen-audio-3.1-tts-flash` | 合成模型 |
 | | `voice` | `qiaoxiaojiao_v3.1` | 系统音色名 / 复刻 voice_id / `custom:<键名>` |
+| | `dialect` | `普通话` | 中文方言（官方 20 种 + 普通话）；仅中文任务经 `instruction` 生效（D29） |
 | | `cache_file` | `voice_cache.json` | 相对配置文件所在目录 |
 | | `custom_voices` | 空 | 键名 → { `name`, `samples[]`（每个样本含 `language` / `audio` / `rate`） } |
 | `[audio]` | `input_device` / `output_device` | 空 = 系统默认 | 完整设备名 |
@@ -272,6 +273,7 @@ rate = 1.0
 
 - `[api] key` 必填；`workspace_host` 必须是纯 host（无协议、路径、端口、空白，标签合法且长度符合 DNS 规则）；
 - ASR/TTS model、TTS voice 非空；
+- `[tts] dialect` 必须在 `CHINESE_DIALECTS` 内（官方方言名；归一化只去首尾空白，不接受「粤语」等别名）；
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
 - 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
 - `[chunking] words > 0`；`[vad] margin_db` 必须是有限数；
@@ -287,14 +289,14 @@ rate = 1.0
 
 `src/config_edit.rs` 提供定点修改函数：
 
-- `set_api_key`、`set_audio_devices`、`set_active_voice`、`set_custom_voices`；
+- `set_api_key`、`set_audio_devices`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`；
 - 统一入口 `save(path, original, updated)`：无改动直接返回；否则先用 `AppConfig::from_toml_str` 校验新文本，失败不落盘；成功后把原文件复制为 `config.toml.bak`，再写盘。
 
 `toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）。
 
 ### 4.4 配置指纹与热更新
 
-`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
+`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/方言/缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
 
 写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。
 
@@ -354,7 +356,7 @@ rate = 1.0
 ### 7.1 协议
 
 - **每句一个 run-task**：`task_group=audio`、`task=tts`、`function=SpeechSynthesizer`、配置的 TTS 模型。
-- 每句首 chunk 固定参数：`format=pcm`、`sample_rate=22050`、`voice`、`language_hints=[tts_language_hint(语言)]`、`volume=50`、`rate`（取本句所用样本的语速；内置音色/普通 voice_id 固定 `1.0`，回退默认样本时用该样本的 `rate`）、`pitch=1.0`；非中英语种附加内置 `instruction`。同一 task 的后续 chunk 复用这些参数。
+- 每句首 chunk 固定参数：`format=pcm`、`sample_rate=22050`、`voice`、`language_hints=[tts_language_hint(语言)]`、`volume=50`、`rate`（取本句所用样本的语速；内置音色/普通 voice_id 固定 `1.0`，回退默认样本时用该样本的 `rate`）、`pitch=1.0`；`instruction` 由 `language::tts_instruction(本句语言, [tts] dialect)` 决定：中文用方言指令（普通话不附加），其余语种用内置语种指令。同一 task 的后续 chunk 复用这些参数。
 - 文本通过 `continue-task` 逐段追加；句终发 `finish-task`；服务端返回二进制 PCM 帧，直接推入播放队列。
 - 单条 WS 连接跨句子长期复用（省 TLS/握手）；空闲与任务中都定期发 Ping 保活。
 
@@ -395,7 +397,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
   7. 判定结果不在 `allowed` 内 → 回退 `allowed[0]`。
 - 判定生命周期：**每个 TTS task 在首个 chunk 送出前判定一次并冻结**，同一 task 内后续 ASR 修订不再改语言；空文本 + 句终重置。
 - **打字输入句与 ASR 共用同一个 `LanguageTracker`**：判定时继承当前对话的粘性语言，并把结果回写 `current`，因此打字输入会影响后续句子的语言判定（D24）。收口当前 ASR 句时只清句文本/任务态，不重建 tracker。
-- 合成参数：`language_hints` 用 `tts_language_hint`（复刻语言集合内直接用，否则 `other`）；`instruction_for` 为 ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar 提供中文指令，zh/en 不附加。
+- 合成参数：`language_hints` 用 `tts_language_hint`（复刻语言集合内直接用，否则 `other`）；`tts_instruction(语言, dialect)` 为中文提供方言指令（`[tts] dialect`，普通话不附加），为 ja/ko/fr/de/ru/es/pt/it/th/vi/id/ms/fil/ar 提供内置语种指令，en 不附加（D29）。
 - 这套判定与复刻样本语种无关；样本缺失目标语言时回退第一个样本（连同其 `rate`，D11）。
 
 ---
@@ -528,11 +530,11 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 | 实时 | 字幕列表 + 打字输入 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16）；翻译模式下每条字幕为「译文大字行 + 原文小字行」，两行各自复制，`show_source=false` 只渲染译文行（D26）；底部多行输入框（默认 1 行、约 4 行封顶后内部滚动）Shift+Enter 换行、Enter/「朗读」排队朗读打字输入（D24），仅运行中可提交，上限 500 字符 |
 | 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
 | 音频 | 输入/输出设备 | 设备下拉保存完整设备名；改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告 |
-| 语音合成 | 当前音色 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色；Tab 级保存/放弃更改；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳与列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
-| 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/模型/语言/音色；配置无效时显示错误链 |
+| 语音合成 | 当前音色 + 中文方言 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色 + 中文方言下拉（选项来自 `CHINESE_DIALECTS`，默认普通话）；Tab 级保存/放弃更改（一次写回 `[tts] voice`/`dialect`/`custom_voices`）；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳/方言/列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
+| 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/模型/语言/音色/方言；配置无效时显示错误链 |
 
 - 错误展示：启动横幅（黄）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
-- 音色编辑草稿的“脏”状态 = 草稿与从配置重建的草稿不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
+- 语音合成页的“脏”状态 = 音色草稿 / 当前音色 / 中文方言任一与配置不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
 - 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `app::SubtitleState` 的纯函数维护（普通模式 `apply_asr` / `push_typed`；翻译模式 `apply_source` / `apply_translation`），并有单测覆盖。
 - 打字输入行在 `gui/typed_input.rs`：多行输入，Shift+Enter 换行、Enter 提交并保持焦点；Windows 的 IME 确认候选由 egui-winit 的 `VK_PROCESSKEY` 过滤，不会误提交。
 
@@ -540,7 +542,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **171** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **179** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -557,6 +559,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 设备热插拔不自动感知，只能点「刷新设备」；配置的设备名对不上时不会回退默认设备（D12）。
 - `voice_cache.json` 的孤儿条目（配置删了音色、缓存仍在）不主动清理；云端音色被删除时靠下次会话启动的校验自动重建（D11/D19）。
 - 跨机便携（拷贝整个目录到另一台机器）没有自动化测试，发布前需人工冒烟。
+- 中文方言的效果取决于音色是否支持方言指令：复刻音色支持官方 20 种方言，`qwen-audio-3.1-tts-flash` 的 4 个多语种/方言系统音色仅支持 8 种，其余系统音色可能只支持普通话。程序不做音色能力探测，不支持的组合可能仍按普通话合成（D29）。
 - `AudioPlaybackHandle::interrupt` 与 `AudioCapture::stop` 当前没有调用方（预留接口）；播放/采集的生命周期由 drop 控制。
 - 打字输入句是**排队**语义：当前排队/播放的音频全部播完后才轮到它；界面在提交时就把该句加入字幕历史，可能与实际发声时间有延迟。
 - 若提交打字输入时 ASR 当前句尚未句终，该句剩余部分会被丢弃、不会补读（字幕只保留已送 TTS 的前缀，D24）；极端情况下用户持续说话期间打字输入会暂停该句后续合成。

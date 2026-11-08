@@ -28,6 +28,9 @@ pub struct QwenTtsConfig {
     /// 业务空间专属域名的 run-task 端点，
     /// 形如 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`
     pub ws_url: String,
+    /// 中文方言（`[tts] dialect`，官方中文名）；只在本句语言判定为中文时经
+    /// `instruction` 生效（普通话不附加）。
+    pub dialect: String,
 }
 
 /// 一个待合成的文本切片；`voice` / `rate` / `language` 由上游按"本句语言"解析好。
@@ -39,7 +42,8 @@ pub struct TtsChunkRequest {
     pub voice: String,
     /// 本句的语速倍率（百炼 TTS `rate`，内置音色固定 1.0；复刻音色取所选样本的配置）。
     pub rate: f32,
-    /// 本句语言（ASR 语言代码），用于合成的 `language_hints` / `instruction`。
+    /// 本句语言（ASR 语言代码），用于合成的 `language_hints`；
+    /// `instruction` 还取决于本句语言与配置的中文方言。
     pub language: String,
 }
 
@@ -199,7 +203,9 @@ impl QwenTtsClient {
                 "rate": rate_json(first_chunk.rate),
                 "pitch": 1.0
             });
-            if let Some(instruction) = language::instruction_for(&first_chunk.language) {
+            if let Some(instruction) =
+                language::tts_instruction(&first_chunk.language, &state.config.dialect)
+            {
                 parameters["instruction"] = json!(instruction);
             }
 
@@ -509,6 +515,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             tts_model: "qwen-tts-test".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
+            dialect: "普通话".to_string(),
         };
 
         let client = tokio::spawn(QwenTtsClient::run_duplex(
@@ -608,6 +615,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             tts_model: "qwen-tts-test".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
+            dialect: "普通话".to_string(),
         };
         let client = tokio::spawn(QwenTtsClient::run_duplex(
             config,
@@ -718,6 +726,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             tts_model: "qwen-tts-test".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
+            dialect: "普通话".to_string(),
         };
 
         let client = tokio::spawn(QwenTtsClient::run_duplex(
@@ -757,17 +766,13 @@ mod tests {
         server.abort();
     }
 
-    /// 每个句子的 run-task 都应带本句解析出的 voice / language_hints / instruction。
-    #[tokio::test]
-    async fn sends_voice_and_language_params_per_task() {
-        use std::time::Duration;
-        use tokio::net::TcpListener;
-        use tokio::sync::oneshot;
-        use tokio_tungstenite::accept_async;
-
+    /// 起一个只处理单个任务的 mock 服务，返回本次 run-task 的完整报文。
+    ///
+    /// 用于断言每句首 chunk 固定的参数（voice / rate / language_hints / instruction）。
+    async fn capture_run_task(chunk: TtsChunkRequest, dialect: &str) -> Value {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
@@ -775,28 +780,29 @@ mod tests {
             let mut pending = None;
             let mut tx = Some(tx);
             while let Some(Ok(message)) = ws.next().await {
-                if let Message::Text(text) = message {
-                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    match value["header"]["action"].as_str() {
-                        Some("run-task") => {
-                            pending = Some(value);
-                            let started =
-                                json!({ "header": { "event": "task-started" }, "payload": {} });
-                            ws.send(Message::Text(started.to_string())).await.unwrap();
-                        }
-                        Some("finish-task") => {
-                            if let Some(value) = pending.take() {
-                                if let Some(tx) = tx.take() {
-                                    let _ = tx.send(value);
-                                }
-                            }
-                            ws.send(Message::Binary(vec![1, 0, 2, 0])).await.unwrap();
-                            let finished =
-                                json!({ "header": { "event": "task-finished" }, "payload": {} });
-                            ws.send(Message::Text(finished.to_string())).await.unwrap();
-                        }
-                        _ => {}
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                match value["header"]["action"].as_str() {
+                    Some("run-task") => {
+                        pending = Some(value);
+                        let started =
+                            json!({ "header": { "event": "task-started" }, "payload": {} });
+                        ws.send(Message::Text(started.to_string())).await.unwrap();
                     }
+                    Some("finish-task") => {
+                        if let (Some(value), Some(tx)) = (pending.take(), tx.take()) {
+                            let _ = tx.send(value);
+                        }
+                        ws.send(Message::Binary(vec![1, 0, 2, 0])).await.unwrap();
+                        let finished =
+                            json!({ "header": { "event": "task-finished" }, "payload": {} });
+                        ws.send(Message::Text(finished.to_string())).await.unwrap();
+                    }
+                    _ => {}
                 }
             }
         });
@@ -808,6 +814,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             tts_model: "qwen-tts-test".to_string(),
             ws_url: format!("ws://{addr}/api-ws/v1/inference"),
+            dialect: dialect.to_string(),
         };
 
         let client = tokio::spawn(QwenTtsClient::run_duplex(
@@ -816,30 +823,63 @@ mod tests {
             playback,
             is_running.clone(),
         ));
-
-        tx_chunks
-            .send(TtsChunkRequest {
-                text: "こんにちは。".to_string(),
-                is_sentence_end: true,
-                voice: "custom-ja-voice".to_string(),
-                rate: 1.35,
-                language: "ja".to_string(),
-            })
-            .await
-            .unwrap();
+        tx_chunks.send(chunk).await.unwrap();
 
         let value = tokio::time::timeout(Duration::from_secs(3), rx)
             .await
             .expect("应收到 run-task")
             .expect("run-task 解析失败");
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
+        value
+    }
+
+    /// 构造一条整句请求（句终），只关心参数断言时用。
+    fn chunk(text: &str, voice: &str, rate: f32, language: &str) -> TtsChunkRequest {
+        TtsChunkRequest {
+            text: text.to_string(),
+            is_sentence_end: true,
+            voice: voice.to_string(),
+            rate,
+            language: language.to_string(),
+        }
+    }
+
+    /// 每个句子的 run-task 都应带本句解析出的 voice / rate / language_hints；
+    /// 非中文语种只用内置语种指令，不受 `[tts] dialect` 影响。
+    #[tokio::test]
+    async fn sends_voice_and_language_params_per_task() {
+        let value = capture_run_task(
+            chunk("こんにちは。", "custom-ja-voice", 1.35, "ja"),
+            "东北话",
+        )
+        .await;
         let parameters = &value["payload"]["parameters"];
         assert_eq!(parameters["voice"], "custom-ja-voice");
         assert_eq!(parameters["language_hints"], json!(["ja"]));
         assert_eq!(parameters["instruction"], "请讲日语。");
         assert_eq!(parameters["rate"], json!(1.35), "应使用本句样本的语速");
+    }
 
-        is_running.store(false, Ordering::SeqCst);
-        client.abort();
-        server.abort();
+    /// 中文句子按 `[tts] dialect` 附加方言指令；普通话不附加。
+    #[tokio::test]
+    async fn sends_chinese_dialect_instruction() {
+        let value =
+            capture_run_task(chunk("今天天气真不错。", "test-voice", 1.0, "zh"), "东北话").await;
+        let parameters = &value["payload"]["parameters"];
+        assert_eq!(parameters["language_hints"], json!(["zh"]));
+        assert_eq!(
+            parameters["instruction"], "请讲东北话。",
+            "中文句应附加方言指令"
+        );
+
+        let value =
+            capture_run_task(chunk("今天天气真不错。", "test-voice", 1.0, "zh"), "普通话").await;
+        assert!(
+            value["payload"]["parameters"].get("instruction").is_none(),
+            "普通话不附加 instruction"
+        );
     }
 }
