@@ -22,6 +22,7 @@
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 开发与贡献者的唯一规范来源（环境、构建、测试、调试、提交门禁、发布） |
 | [`docs/architecture.md`](docs/architecture.md) | 当前实现的模块/算法设计 |
 | [`docs/decisions.md`](docs/decisions.md) | 设计决定与理由（稳定编号 `D<n>`） |
+| [`docs/troubleshooting/windows-temp-low-integrity.md`](docs/troubleshooting/windows-temp-low-integrity.md) | Windows 上测试写 `%TEMP%` 报 os error 5 的排查、规避与修复（DSH Low 完整性标签残留） |
 | [`config.example.toml`](config.example.toml) | 配置字段与默认值的权威注释（编译期内嵌为首次启动模板） |
 | [`TODO.md`](TODO.md) | 人类维护的任务与想法记录；**AI 编码代理不得读取或修改** |
 | `src/**/*.rs` 的 `//!` | 模块职责与关键约束 |
