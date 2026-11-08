@@ -43,8 +43,8 @@ pub const CUSTOM_VOICE_PREFIX: &str = "custom:";
 /// 本地缓存文件默认名（相对配置文件所在目录）：音色复刻记录 + ASR 预编译热词表。
 pub const DEFAULT_CACHE_FILE: &str = "cache.json";
 
-/// 预编译热词列表每账号上限（所有模型共享；官方限制）。
-pub const MAX_ASR_HOTWORDS: usize = 2000;
+/// 预编译热词列表上限：权重固定 50 属于「超级热词」，官方限制每个词表最多 50 个。
+pub const MAX_ASR_HOTWORDS: usize = 50;
 
 /// 含非 ASCII 字符的热词最大字符数（官方限制，空格计入）。
 pub const MAX_HOTWORD_CHARS: usize = 15;
@@ -134,8 +134,8 @@ pub struct AsrConfig {
     /// 预编译热词（ASR 专用）。
     ///
     /// 会话启动时自动上传到百炼并生成/复用预编译热词列表，识别时通过
-    /// `vocabulary_id` 引用；权重固定 4、不限定词条语种（D31）。
-    /// 空列表 = 不使用热词，不访问网络。
+    /// `vocabulary_id` 引用；权重固定 50（超级热词，每个词表最多 50 个）、
+    /// 不限定词条语种（D31）。空列表 = 不使用热词，不访问网络。
     pub hotwords: Vec<String>,
 }
 
@@ -654,12 +654,15 @@ pub fn normalize_hotwords(hotwords: &[String]) -> Vec<String> {
 
 /// 校验热词列表是否符合百炼预编译热词的限制（数量 + 单条长度）。
 ///
-/// 官方限制：每列表最多 2000 条；含非 ASCII 字符时整条 ≤15 字符（空格计入），
-/// 纯 ASCII 时按空格切分 ≤7 个片段。提前在本地报错，避免上传后才失败。
+/// 官方限制：普通热词每列表最多 2000 条，但本项目固定使用「超级热词」权重 50，
+/// 官方限制每个词表最多 50 个超级热词，因此上限取 50；
+/// 含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时按空格切分 ≤7 个片段。
+/// 提前在本地报错，避免上传后才失败。
 pub fn validate_hotwords(hotwords: &[String]) -> Result<()> {
     if hotwords.len() > MAX_ASR_HOTWORDS {
         bail!(
-            "配置项 [asr] hotwords 最多 {MAX_ASR_HOTWORDS} 条（当前 {} 条）",
+            "配置项 [asr] hotwords 最多 {MAX_ASR_HOTWORDS} 条（当前 {} 条）；\
+             热词固定使用超级热词权重 50，官方限制每个词表最多 {MAX_ASR_HOTWORDS} 个",
             hotwords.len()
         );
     }

@@ -11,6 +11,7 @@
 //!     "qwen-audio-3.1-asr-flash-streaming": {
 //!       "vocabulary_id": "vocab-kaols-...",
 //!       "hotwords": ["原神"],
+//!       "weight": 50,
 //!       "updated_at": 1730000000
 //!     }
 //!   }
@@ -74,6 +75,13 @@ pub struct HotwordCacheEntry {
     /// 该列表当前包含的热词快照（归一化后的顺序）；与配置不一致时需要更新。
     #[serde(default)]
     pub hotwords: Vec<String>,
+
+    /// 该列表创建/更新时使用的热词权重（本项目固定 50）。
+    ///
+    /// 记录它可以让「代码里的默认权重变化」也能触发一次列表更新；
+    /// 旧缓存没有该字段时按 0 读取，与当前权重不一致 → 下次会更新。
+    #[serde(default)]
+    pub weight: u32,
 
     /// 最后一次创建/更新的时间（Unix 秒）。
     ///
@@ -351,6 +359,7 @@ mod tests {
         HotwordCacheEntry {
             vocabulary_id: vocabulary_id.to_string(),
             hotwords: hotwords.iter().map(|word| (*word).to_string()).collect(),
+            weight: 50,
             updated_at: unix_now(),
         }
     }
@@ -436,8 +445,27 @@ mod tests {
             entry.hotwords,
             vec!["原神".to_string(), "Kaoet".to_string()]
         );
+        assert_eq!(entry.weight, 50);
         assert_eq!(reloaded.hotwords_len(), 1);
         assert!(reloaded.is_empty(), "只有热词缓存时音色缓存仍为空");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn old_hotword_entry_without_weight_reads_as_zero() {
+        // 兼容旧缓存格式（没有 weight 字段）：按 0 读取，运行期会据此触发一次更新。
+        let path = temp_cache_path("hotwords-old");
+        std::fs::write(
+            &path,
+            r#"{"asr_hotwords":{"qwen-audio-3.1-asr-flash-streaming":{"vocabulary_id":"v1","hotwords":["原神"],"updated_at":1}}}"#,
+        )
+        .unwrap();
+
+        let cache = AppCache::load(path.clone()).unwrap();
+        let entry = cache.hotword_entry(ASR_MODEL).unwrap();
+        assert_eq!(entry.weight, 0, "旧缓存缺少 weight 时按 0 读取");
+        assert_eq!(entry.vocabulary_id, "v1");
 
         std::fs::remove_file(&path).ok();
     }

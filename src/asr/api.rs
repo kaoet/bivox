@@ -12,7 +12,8 @@
 //! - `list_vocabulary`：分页列出账号下的列表（返回 `output.vocabulary_list`，
 //!   官方响应**没有总数**，只能靠「短页即末页」判断是否取全）。
 //!
-//! 词条格式为 `{"text": "...", "weight": 4}`：权重固定 4（官方推荐值，D31），
+//! 词条格式为 `{"text": "...", "weight": 50}`：权重固定 50（百炼「超级热词」档位，
+//! 官方普通权重为 1–5；超级热词每个词表最多 50 个，D31），
 //! 不传 `lang`——识别时同时带 `language_hints` 会导致只有语种匹配的词条生效，
 //! 本项目是多语种场景，省略 `lang` 让词条对所有语言生效。
 
@@ -30,8 +31,11 @@ pub const SPEECH_BIASING_MODEL: &str = "speech-biasing";
 /// 创建的预编译热词列表前缀（官方规则：小写字母/数字，≤10 字符）。
 pub const VOCABULARY_PREFIX: &str = "kaols";
 
-/// 热词权重：官方范围 1–5、推荐从 4 起调；本项目固定 4，不提供配置项（D31）。
-pub const HOTWORD_WEIGHT: u32 = 4;
+/// 热词权重：百炼「超级热词」权重 50（普通热词范围 1–5、常用 4）。
+///
+/// 本项目实测 50 的召回效果更好，固定 50、不提供配置项（D31）；
+/// 官方限制每个词表最多 50 个超级热词，因此 [`crate::config::MAX_ASR_HOTWORDS`] = 50。
+pub const HOTWORD_WEIGHT: u32 = 50;
 
 /// `list_vocabulary` 每页条数。
 const LIST_PAGE_SIZE: usize = 50;
@@ -121,7 +125,7 @@ impl BailianAsrApi {
         Ok(payload(&value).clone())
     }
 
-    /// 热词条目数组（权重固定 4、不传 `lang`）。
+    /// 热词条目数组（权重固定 50、不传 `lang`）。
     fn vocabulary_entries(words: &[String]) -> Value {
         Value::Array(
             words
@@ -369,8 +373,8 @@ mod tests {
         assert_eq!(body["input"]["prefix"], "kaols");
         assert_eq!(body["input"]["vocabulary"][0]["text"], "原神");
         assert_eq!(
-            body["input"]["vocabulary"][0]["weight"], 4,
-            "热词权重固定 4（D31）"
+            body["input"]["vocabulary"][0]["weight"], HOTWORD_WEIGHT,
+            "热词权重固定为超级热词 50（D31）"
         );
         assert!(
             body["input"]["vocabulary"][0].get("lang").is_none(),
@@ -393,7 +397,7 @@ mod tests {
     async fn query_vocabulary_parses_status_and_target_model() {
         let server = MockHttpServer::start(|_request| {
             MockResponse::json(
-                r#"{"output":{"status":"OK","target_model":"qwen-audio-3.1-asr-flash-streaming","vocabulary":[{"text":"原神","weight":4}]}}"#,
+                r#"{"output":{"status":"OK","target_model":"qwen-audio-3.1-asr-flash-streaming","vocabulary":[{"text":"原神","weight":50}]}}"#,
             )
         })
         .await;
@@ -423,7 +427,7 @@ mod tests {
         assert_eq!(body["input"]["action"], "update_vocabulary");
         assert_eq!(body["input"]["vocabulary_id"], "vocab-1");
         assert_eq!(body["input"]["vocabulary"][0]["text"], "新词");
-        assert_eq!(body["input"]["vocabulary"][0]["weight"], 4);
+        assert_eq!(body["input"]["vocabulary"][0]["weight"], HOTWORD_WEIGHT);
     }
 
     #[tokio::test]

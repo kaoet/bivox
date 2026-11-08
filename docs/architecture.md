@@ -244,7 +244,7 @@ main()
 | | `workspace_host` | `dashscope.aliyuncs.com` | 纯 host；业务空间专属域名可覆盖 |
 | `[asr]` | `model` | `qwen-audio-3.1-asr-flash-streaming` | 实时识别模型 |
 | | `languages` | `["zh"]` | 有序；首个为默认；整份列表作为 `language_hints`；本地判定也使用完整列表 |
-| | `hotwords` | 空 | 预编译热词（有序；去空白/去空/去重）；权重固定 4、不限定语种；会话启动时自动同步（D31） |
+| | `hotwords` | 空 | 预编译热词（有序；去空白/去空/去重）；权重固定 50（超级热词，最多 50 条）、不限定语种；会话启动时自动同步（D31） |
 | `[cache]` | `file` | `cache.json` | 本地共享缓存（音色 + ASR 热词）路径，相对配置文件所在目录 |
 | `[tts]` | `model` | `qwen-audio-3.1-tts-flash` | 合成模型 |
 | | `voice` | `qiaoxiaojiao_v3.1` | 系统音色名 / 复刻 voice_id / `custom:<键名>` |
@@ -291,7 +291,7 @@ rate = 1.0
 - ASR/TTS model、TTS voice 非空；
 - `[tts] dialect` 必须在 `CHINESE_DIALECTS` 内（官方方言名；归一化只去首尾空白，不接受「粤语」等别名）；
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
-- `[asr] hotwords`：最多 2000 条；含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时 ≤7 个空格分隔片段；归一化时去空白、丢空条目、按首次出现去重；
+- `[asr] hotwords`：最多 50 条（固定使用超级热词权重 50，官方限制每词表最多 50 个超级热词）；含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时 ≤7 个空格分隔片段；归一化时去空白、丢空条目、按首次出现去重；
 - 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
 - `[chunking] words > 0`；`[vad] margin_db` 必须是有限数；
 - `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`。
@@ -526,6 +526,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
     "qwen-audio-3.1-asr-flash-streaming": {
       "vocabulary_id": "vocab-kaols-...",
       "hotwords": ["原神"],
+      "weight": 50,
       "updated_at": 1730000000
     }
   }
@@ -533,13 +534,13 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 ```
 
 - `voices` 两层结构：TTS 模型 → 音频内容 SHA256 → 记录；同一音频在不同模型下分别缓存，切换模型不覆盖其它模型记录（D11）。
-- `asr_hotwords`：ASR 模型 → 预编译热词列表 ID + 词条快照 + 最后更新时间；用于下次会话复用、校验与 5 分钟更新限速（D31）。
+- `asr_hotwords`：ASR 模型 → 预编译热词列表 ID + 词条快照 + **权重快照** + 最后更新时间；用于下次会话复用、校验与 5 分钟更新限速（D31）。权重变化（例如默认值从 4 改成 50）也会触发一次列表更新。
 - 保存是“临时文件 + rename”的原子写；解析失败时把旧文件备份为 `cache.json.bak` 并以空缓存重建。
 - 本机状态，不提交、不参与同步；孤儿条目无害，v1 不提供清理入口（D11）。
 
 ### 11.5 `admin` 调试 CLI
 
-- 音色命令：`list`、`delete --voice-id <id>...`、`delete-all [-y]`；默认读工作目录 `./config.toml`，`-c` 可覆盖。
+- 音色命令：`voice list`、`voice delete --voice-id <id>...`、`voice delete-all [-y]`；默认读工作目录 `./config.toml`，`-c` 可覆盖。
 - 热词命令：`vocab list`、`vocab delete --vocabulary-id <id>... [-y]`。
 - 只做远程管理：不读写 `cache.json`、不 enroll、不创建/更新热词列表、不做 prefix 过滤。
 - 列表要求完整分页（否则报错，避免“半截列表”被误认为全部；热词列表官方响应没有 total，靠短页判断）；删除区分“已删除”与“本来就不存在”；批量删除给出成功/已不存在/失败三类汇总。
@@ -558,7 +559,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 |---|---|---|
 | 实时 | 字幕列表 + 打字输入 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16）；翻译模式下每条字幕为「译文大字行 + 原文小字行」，两行各自复制，`show_source=false` 只渲染译文行（D26）；底部多行输入框（默认 1 行、约 4 行封顶后内部滚动）Shift+Enter 换行、Enter/「朗读」排队朗读打字输入（D24），仅运行中可提交，上限 500 字符 |
 | 音频 | 输入/输出设备 | 设备下拉保存完整设备名；改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告 |
-| 语音识别 | 识别模型 + 有序语言列表 + 预编译热词 | 模型输入框（可恢复默认）；语言列表逐行上移/下移/删除 + 下拉追加（首个为默认，>4 种提示 `language_hints` 只用前 4 个）；热词多行文本框（一行一个，权重固定 4）；Tab 级保存/放弃更改（一次写回 `[asr] model/languages/hotwords`，D32）；运行中保存触发 D20 热重启；热词在下一次会话启动时自动同步到百炼（D31） |
+| 语音识别 | 识别模型 + 有序语言列表 + 预编译热词 | 模型输入框（可恢复默认）；语言列表逐行上移/下移/删除 + 下拉追加（首个为默认，>4 种提示 `language_hints` 只用前 4 个）；热词多行文本框（一行一个，权重固定 50 超级热词、最多 50 条）；Tab 级保存/放弃更改（一次写回 `[asr] model/languages/hotwords`，D32）；运行中保存触发 D20 热重启；热词在下一次会话启动时自动同步到百炼（D31） |
 | 语音合成 | 当前音色 + 中文方言 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色 + 中文方言下拉（选项来自 `CHINESE_DIALECTS`，默认普通话）；Tab 级保存/放弃更改（一次写回 `[tts] voice`/`dialect`/`custom_voices`）；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳/方言/列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
 | 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
 | 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/识别模型/识别语言/预编译热词条数/合成模型/音色/方言；配置无效时显示错误链 |
@@ -573,7 +574,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **215** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **217** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -590,7 +591,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 设备热插拔不自动感知，只能点「刷新设备」；配置的设备名对不上时不会回退默认设备（D12）。
 - `cache.json` 的孤儿条目不主动清理：配置删了音色/热词记录仍保留；云端音色被删除时靠下次会话启动的校验自动重建（D11/D19）；云端热词列表被删除时自动重建（D31）。
 - 预编译热词仅华北2（北京）/新加坡地域、**仅主业务空间**支持；子业务空间或其它地域会创建失败并降级为不带热词识别（黄色告警）。
-- 每账号最多 50 个预编译热词列表；换 ASR 模型会新建列表，旧列表需用 `admin vocab delete` 清理；每次列表创建/更新后生效时间受百炼部署延迟影响，更新还受「两次间隔 ≥5 分钟」限制（D31）。
+- 每账号最多 50 个预编译热词列表；固定使用超级热词权重 50，因此每个列表最多 50 条。换 ASR 模型会新建列表，旧列表需用 `admin vocab delete` 清理；每次列表创建/更新后生效时间受百炼部署延迟影响，更新还受「两次间隔 ≥5 分钟」限制（D31）。
 - 跨机便携（拷贝整个目录到另一台机器）没有自动化测试，发布前需人工冒烟。
 - 中文方言的效果取决于音色是否支持方言指令：复刻音色支持官方 20 种方言，`qwen-audio-3.1-tts-flash` 的 4 个多语种/方言系统音色仅支持 8 种，其余系统音色可能只支持普通话。程序不做音色能力探测，不支持的组合可能仍按普通话合成（D29）。
 - `AudioPlaybackHandle::interrupt` 与 `AudioCapture::stop` 当前没有调用方（预留接口）；播放/采集的生命周期由 drop 控制。
@@ -628,12 +629,12 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 1. 空列表 → 直接返回 `None`，不访问网络；
 2. 加载 `cache.json`，按 ASR 模型查 `asr_hotwords`；
 3. 命中缓存 → `query_vocabulary` 校验（资源不存在则重建；网络异常沿用缓存 ID）；
-4. 词表未变 → 复用；词表变化且距 `updated_at` ≥5 分钟 → `update_vocabulary` 全量替换并更新缓存；
+4. 词表与权重都没变 → 复用；任一项变化且距 `updated_at` ≥5 分钟 → `update_vocabulary` 全量替换并更新缓存（词条全部按权重 50 发送）；
 5. 无缓存 → `create_vocabulary`（`target_model` = `[asr] model`，prefix 固定 `kaols`），
-   **立即把 `vocabulary_id` 写入 `cache.json`**，再轮询 `query_vocabulary` 到 `status == "OK"`（最多 60s）；
+   **立即把 `vocabulary_id` 写入 `cache.json`**（同时记录词表与权重快照），再轮询 `query_vocabulary` 到 `status == "OK"`（最多 60s）；
 6. 结果交给 `pipeline::session`，注入 ASR run-task 的 `payload.parameters.vocabulary_id`。
 
-- 词条格式：`{"text": "...", "weight": 4}`；不传 `lang` —— 识别同时带 `language_hints` 时只有语种匹配的词条生效，省略后词条对所有语言生效。
+- 词条格式：`{"text": "...", "weight": 50}`（超级热词档位，每列表最多 50 条）；不传 `lang` —— 识别同时带 `language_hints` 时只有语种匹配的词条生效，省略后词条对所有语言生效。
 - 失败降级：任何一步失败都不阻断会话，发 `PipelineEvent::Warning`，本次识别不带最新热词；有旧 ID 时沿用旧词表。
 - 限速：官方建议两次更新间隔 ≥5 分钟；未满时保留旧快照并提示，下次启动自动重试，避免「缓存已更新、百炼未生效、之后不再重试」。
 - 管理 API 走 `https://{workspace_host}/api/v1/services/audio/asr/customization`，`model = speech-biasing`，由 `asr/api.rs` 实现；admin 调试 CLI 只做列表/删除（D19）。

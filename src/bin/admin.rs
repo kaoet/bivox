@@ -1,8 +1,9 @@
 //! `admin`：百炼调试工具（决策 D19/D31，见 docs/decisions.md）。
 //!
-//! 管理账号下的自定义音色与 ASR 预编译热词列表：
-//! - 音色：列出 / 删除（单条或全部）；
-//! - 热词列表：列出 / 按 vocabulary_id 删除（创建与更新由主程序在会话启动时自动完成）。
+//! 分两个子命令组：
+//! - `voice`：管理账号下的自定义音色（列出 / 删除单条或全部）；
+//! - `vocab`：管理 ASR 预编译热词列表（列出 / 按 vocabulary_id 删除；创建与更新由
+//!   主程序在会话启动时自动完成）。
 //!
 //! - **读 `config.toml`**：默认当前工作目录的 `./config.toml`，可用 `-c/--config` 指定；
 //!   只取 `[api] key` 与 `[api] workspace_host`（其余字段沿用同一套校验）。
@@ -27,7 +28,7 @@ use kaols::voice::api::{BailianVoiceApi, RemoteVoice};
 #[derive(Debug, Parser)]
 #[command(
     name = "admin",
-    about = "百炼调试工具：管理自定义音色与 ASR 预编译热词列表（不随主程序分发）"
+    about = "百炼调试工具：管理自定义音色（voice）与 ASR 预编译热词列表（vocab）（不随主程序分发）"
 )]
 struct Args {
     /// config.toml 路径（默认当前工作目录下的 config.toml）
@@ -46,6 +47,21 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 管理账号下的自定义音色（列出 / 删除）
+    Voice {
+        #[command(subcommand)]
+        command: VoiceCommand,
+    },
+
+    /// 管理 ASR 预编译热词列表
+    Vocab {
+        #[command(subcommand)]
+        command: VocabCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VoiceCommand {
     /// 列出账号下的全部自定义音色
     List,
 
@@ -65,12 +81,6 @@ enum Command {
         /// 跳过交互确认
         #[arg(short = 'y', long)]
         yes: bool,
-    },
-
-    /// 管理 ASR 预编译热词列表
-    Vocab {
-        #[command(subcommand)]
-        command: VocabCommand,
     },
 }
 
@@ -120,9 +130,11 @@ async fn run() -> Result<()> {
     );
 
     match args.command {
-        Command::List => list(&api).await,
-        Command::Delete { voice_ids, yes } => delete(&api, &voice_ids, yes).await,
-        Command::DeleteAll { yes } => delete_all(&api, yes).await,
+        Command::Voice { command } => match command {
+            VoiceCommand::List => list(&api).await,
+            VoiceCommand::Delete { voice_ids, yes } => delete(&api, &voice_ids, yes).await,
+            VoiceCommand::DeleteAll { yes } => delete_all(&api, yes).await,
+        },
         Command::Vocab { command } => {
             let asr_api = kaols::asr::api_from_config(&config)?;
             match command {

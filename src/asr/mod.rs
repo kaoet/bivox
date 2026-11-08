@@ -171,8 +171,9 @@ pub async fn ensure_vocabulary_with(
             return create_vocabulary(api, cache, target_model, &desired, now).await;
         }
         Err(err) => {
-            // 网络/服务端错误：无法确认远端状态，沿用缓存 id；词表若变了则提示未更新。
-            let warning = (existing.hotwords != desired).then(|| {
+            // 网络/服务端错误：无法确认远端状态，沿用缓存 id；词表或权重若变了则提示未更新。
+            let outdated = existing.hotwords != desired || existing.weight != api::HOTWORD_WEIGHT;
+            let warning = outdated.then(|| {
                 format!(
                     "无法校验/更新热词列表 {}（{err:#}），本次沿用旧词表继续识别",
                     existing.vocabulary_id
@@ -193,8 +194,8 @@ pub async fn ensure_vocabulary_with(
         }
     }
 
-    // 2) 词表没变：直接复用。
-    if existing.hotwords == desired {
+    // 2) 词表没变（且权重与当前代码一致）：直接复用。
+    if existing.hotwords == desired && existing.weight == api::HOTWORD_WEIGHT {
         log::info!(
             "🔥 预编译热词列表命中缓存: {}（{} 条）",
             existing.vocabulary_id,
@@ -205,8 +206,18 @@ pub async fn ensure_vocabulary_with(
 
     // 3) 官方建议两次更新间隔 ≥5 分钟：太频繁时先沿用旧词表，下次启动再重试。
     if now.saturating_sub(existing.updated_at) < MIN_UPDATE_INTERVAL_SECS {
+        let what = match (
+            existing.hotwords != desired,
+            existing.weight != api::HOTWORD_WEIGHT,
+        ) {
+            (true, true) => "热词词表与默认权重",
+            (true, false) => "热词词表",
+            (false, true) => "热词默认权重",
+            (false, false) => "热词列表",
+        };
         let warning = format!(
-            "热词列表修改过于频繁（官方建议间隔 ≥5 分钟），本次仍使用旧词表；稍后开始会话会自动重试"
+            "{what}有变化，但距上次列表更新不足 5 分钟（官方建议间隔 ≥5 分钟），\
+             本次仍使用旧词表；稍后开始会话会自动重试"
         );
         log::warn!("⚠️ {warning}");
         return Ok(VocabularyResolution {
@@ -312,6 +323,7 @@ fn save_hotword_entry(
         HotwordCacheEntry {
             vocabulary_id: vocabulary_id.to_string(),
             hotwords: hotwords.to_vec(),
+            weight: api::HOTWORD_WEIGHT,
             updated_at: now,
         },
     );
@@ -353,6 +365,7 @@ mod tests {
             HotwordCacheEntry {
                 vocabulary_id: "vocab-old".to_string(),
                 hotwords: hotwords.iter().map(|word| (*word).to_string()).collect(),
+                weight: api::HOTWORD_WEIGHT,
                 updated_at,
             },
         );
@@ -442,7 +455,10 @@ mod tests {
             "update_vocabulary" => {
                 let body: Value = serde_json::from_str(&request.body_text()).unwrap();
                 assert_eq!(body["input"]["vocabulary"][0]["text"], "新词");
-                assert_eq!(body["input"]["vocabulary"][0]["weight"], 4);
+                assert_eq!(
+                    body["input"]["vocabulary"][0]["weight"],
+                    api::HOTWORD_WEIGHT
+                );
                 MockResponse::json(r#"{"output":{}}"#)
             }
             other => MockResponse::json(format!(
@@ -464,6 +480,45 @@ mod tests {
         let entry = cache.hotword_entry(MODEL).unwrap();
         assert_eq!(entry.hotwords, words(&["新词"]));
         assert_eq!(entry.updated_at, 1600);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn weight_change_triggers_vocabulary_update() {
+        // 代码里的默认权重变化（例如 4 → 50）也要让已缓存的列表更新一次。
+        let server = MockHttpServer::start(|request| match action(request).as_str() {
+            "query_vocabulary" => MockResponse::json(r#"{"output":{"status":"OK"}}"#),
+            "update_vocabulary" => {
+                let body: Value = serde_json::from_str(&request.body_text()).unwrap();
+                assert_eq!(
+                    body["input"]["vocabulary"][0]["weight"],
+                    api::HOTWORD_WEIGHT
+                );
+                MockResponse::json(r#"{"output":{}}"#)
+            }
+            other => MockResponse::json(format!(
+                r#"{{"code":"Unexpected","message":"unexpected action {other}"}}"#
+            ))
+            .status(500),
+        })
+        .await;
+        let api = api(&server);
+        let (path, mut cache) = cache_with_entry("weight-change", &["原神"], 1000);
+        let mut old = cache.hotword_entry(MODEL).unwrap().clone();
+        old.weight = 4;
+        cache.set_hotword_entry(MODEL, old);
+
+        let resolution = ensure_vocabulary_with(&api, &mut cache, MODEL, &words(&["原神"]), 1600)
+            .await
+            .unwrap();
+
+        assert_eq!(resolution.vocabulary_id.as_deref(), Some("vocab-old"));
+        assert_eq!(
+            cache.hotword_entry(MODEL).unwrap().weight,
+            api::HOTWORD_WEIGHT,
+            "更新后缓存应记录当前权重"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -492,7 +547,7 @@ mod tests {
                 .warning
                 .as_deref()
                 .unwrap_or("")
-                .contains("过于频繁"),
+                .contains("不足 5 分钟"),
             "{resolution:?}"
         );
         assert_eq!(

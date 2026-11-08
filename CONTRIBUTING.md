@@ -34,7 +34,7 @@
 ```bash
 cargo build --bins        # 构建两个 bin：kaols（GUI）与 admin（调试 CLI）
 cargo run                 # 启动 GUI（默认 wgpu 后端，debug 版保留控制台）
-cargo run --bin admin -- list   # 音色与热词列表调试 CLI，见第 9 节
+cargo run --bin admin -- voice list   # 音色与热词列表调试 CLI，见第 9 节
 cargo test                # 全部单元测试
 ```
 
@@ -291,19 +291,18 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 `admin` 只用于本地管理百炼账号下**已有的**自定义音色与预编译热词列表，不随发布包分发。
 
 ```bash
-cargo run --bin admin -- list
-cargo run --bin admin -- delete --voice-id <id> [-y]
-cargo run --bin admin -- delete-all [-y]
+cargo run --bin admin -- voice list
+cargo run --bin admin -- voice delete --voice-id <id> [-y]
+cargo run --bin admin -- voice delete-all [-y]
 cargo run --bin admin -- vocab list
 cargo run --bin admin -- vocab delete --vocabulary-id <id> [--vocabulary-id <id2>] [-y]
-cargo run --bin admin -- -c <path-to-config.toml> list
+cargo run --bin admin -- -c <path-to-config.toml> voice list
 ```
 
 - 默认读**当前工作目录**的 `./config.toml`，`-c/--config` 可指定其它路径；沿用同一套配置校验，只实际使用 `[api] key` 与 `[api] workspace_host`；
 - 不读写 `cache.json`、不提供 enroll（上传/复刻）、不做任何 prefix 过滤，只按 voice_id / vocabulary_id 精确操作；
-- `list` 与 `vocab list` 要求完整枚举所有页，否则报错（避免半截列表被误认为全部）；
-- `delete` 区分“已删除”与“本来就不存在”；`delete-all` 汇总成功/已不存在/失败；`vocab delete` 同样区分“已删除”与“本来就不存在”；
-- `vocab delete` 只按 `--vocabulary-id` 删除、可重复传入，**没有 delete-all**（避免误删账号下其它应用创建的列表）；热词列表的创建与更新由主程序在会话启动时自动完成；
+- `voice` 子命令管理自定义音色：`voice list` 要求完整枚举所有页，否则报错（避免半截列表被误认为全部）；`voice delete` 区分“已删除”与“本来就不存在”；`voice delete-all` 汇总成功/已不存在/失败；
+- `vocab` 子命令管理预编译热词列表：`vocab list` 同样要求完整枚举（官方响应没有 total，靠短页判断）；`vocab delete` 只按 `--vocabulary-id` 删除、可重复传入，**没有 delete-all**（避免误删账号下其它应用创建的列表）；热词列表的创建与更新由主程序在会话启动时自动完成；
 - 逻辑在 `src/voice/admin.rs` 与 `src/asr/admin.rs`（可用 mock HTTP 测试），`src/bin/admin.rs` 只做参数解析与终端输出。
 
 如果删除的远程音色仍被 `cache.json` 引用：下次会话启动解析自定义音色时会通过 `query_voice` 校验并自动重新复刻；网络异常时会先沿用缓存（标记为未校验）。
