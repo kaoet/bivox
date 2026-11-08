@@ -9,6 +9,8 @@ pub mod realtime_tab;
 pub mod settings_tab;
 pub mod toolbar;
 pub mod translate_tab;
+pub mod tts_current_voice;
 pub mod tts_tab;
+pub mod tts_voice_editor;
 pub mod typed_input;
 pub mod widgets;

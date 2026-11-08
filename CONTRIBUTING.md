@@ -191,7 +191,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 - 绘制方法是 `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)`，不要写旧版 `update(ctx, frame)`；
 - UI 线程只做绘制和状态更新：禁止 `await`、阻塞 IO、网络请求；后台任务通过 `PipelineEvent` 回传并 `ctx.request_repaint()`；
 - `let _ =` 只用于“忽略失败是正确的”路径，且必须带原因注释（如 `// best-effort: ...`）；用户可感知的错误必须转成 `PipelineEvent::Error` / 错误横幅 / `log::error!`；
-- `gui/` 下单文件目标 ≤300 行；当前 `tts_tab.rs` 约 520 行是已知例外，待拆分（见架构文档“已知限制与技术债”），新增 GUI 逻辑应拆到独立文件。
+- `gui/` 下单文件目标 ≤300 行，新增 GUI 逻辑应拆到独立文件。
 
 ### 配置与便携模式
 
