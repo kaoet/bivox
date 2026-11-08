@@ -40,8 +40,17 @@ pub fn is_valid_sample_rate(rate: f32) -> bool {
 /// 自定义音色引用前缀：`[tts] voice = "custom:<配置名>"` 表示使用复刻音色。
 pub const CUSTOM_VOICE_PREFIX: &str = "custom:";
 
-/// 自定义音色缓存文件默认名（相对配置文件所在目录）。
-pub const DEFAULT_VOICE_CACHE_FILE: &str = "voice_cache.json";
+/// 本地缓存文件默认名（相对配置文件所在目录）：音色复刻记录 + ASR 预编译热词表。
+pub const DEFAULT_CACHE_FILE: &str = "cache.json";
+
+/// 预编译热词列表每账号上限（所有模型共享；官方限制）。
+pub const MAX_ASR_HOTWORDS: usize = 2000;
+
+/// 含非 ASCII 字符的热词最大字符数（官方限制，空格计入）。
+pub const MAX_HOTWORD_CHARS: usize = 15;
+
+/// 纯 ASCII 热词按空格切分后的最大片段数（官方限制）。
+pub const MAX_ASCII_HOTWORD_WORDS: usize = 7;
 
 /// 百炼音色前缀最大长度（官方：数字+英文字母，不超过 10 个字符）。
 pub const MAX_VOICE_PREFIX_LEN: usize = 10;
@@ -77,6 +86,7 @@ pub struct AppConfig {
     pub api: ApiConfig,
     pub asr: AsrConfig,
     pub tts: TtsConfig,
+    pub cache: CacheConfig,
     pub translate: TranslateConfig,
     pub audio: AudioConfig,
     pub vad: VadConfig,
@@ -120,6 +130,13 @@ pub struct AsrConfig {
     /// - 检测用户当前说哪种语言时，永远以完整列表为范围；
     /// - 整个列表会作为 ASR API 的 `language_hints` 传递（数量上限由服务端处理）。
     pub languages: Vec<String>,
+
+    /// 预编译热词（ASR 专用）。
+    ///
+    /// 会话启动时自动上传到百炼并生成/复用预编译热词列表，识别时通过
+    /// `vocabulary_id` 引用；权重固定 4、不限定词条语种（D31）。
+    /// 空列表 = 不使用热词，不访问网络。
+    pub hotwords: Vec<String>,
 }
 
 impl Default for AsrConfig {
@@ -127,6 +144,7 @@ impl Default for AsrConfig {
         Self {
             model: DEFAULT_ASR_MODEL.to_string(),
             languages: vec![DEFAULT_ASR_LANGUAGE.to_string()],
+            hotwords: Vec::new(),
         }
     }
 }
@@ -148,9 +166,6 @@ pub struct TtsConfig {
 
     /// 自定义（复刻）音色表：键名用于在 `voice` 中以 `custom:<键名>` 引用。
     pub custom_voices: HashMap<String, CustomVoiceConfig>,
-
-    /// 自定义音色缓存文件（相对配置文件所在目录），保存「模型 → 音频 → voice_id」。
-    pub cache_file: PathBuf,
 }
 
 impl Default for TtsConfig {
@@ -160,7 +175,22 @@ impl Default for TtsConfig {
             voice: DEFAULT_VOICE.to_string(),
             dialect: language::DEFAULT_CHINESE_DIALECT.to_string(),
             custom_voices: HashMap::new(),
-            cache_file: PathBuf::from(DEFAULT_VOICE_CACHE_FILE),
+        }
+    }
+}
+
+/// `[cache]`：本地缓存文件（音色复刻记录 + ASR 预编译热词 ID）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// 缓存文件（相对配置文件所在目录），保存「音色 → voice_id」与「ASR 模型 → vocabulary_id」。
+    pub file: PathBuf,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            file: PathBuf::from(DEFAULT_CACHE_FILE),
         }
     }
 }
@@ -382,6 +412,7 @@ impl AppConfig {
             .iter()
             .map(|language| language.trim().to_lowercase())
             .collect();
+        self.asr.hotwords = normalize_hotwords(&self.asr.hotwords);
         self.tts.model = self.tts.model.trim().to_string();
         self.tts.voice = self.tts.voice.trim().to_string();
         self.tts.dialect = self.tts.dialect.trim().to_string();
@@ -409,6 +440,7 @@ impl AppConfig {
             bail!("配置项 [asr] model 不能为空");
         }
         self.validate_asr_languages()?;
+        validate_hotwords(&self.asr.hotwords)?;
         if self.tts.model.trim().is_empty() {
             bail!("配置项 [tts] model 不能为空");
         }
@@ -550,9 +582,9 @@ impl AppConfig {
         }
     }
 
-    /// 自定义音色缓存文件路径。
-    pub fn voice_cache_path(&self) -> PathBuf {
-        self.resolve_path(&self.tts.cache_file)
+    /// 本地缓存文件路径（音色 + ASR 预编译热词共用）。
+    pub fn cache_path(&self) -> PathBuf {
+        self.resolve_path(&self.cache.file)
     }
 
     /// `[tts] voice` 中引用的自定义音色名（`custom:<name>` 的 `<name>`）。
@@ -603,6 +635,60 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// 归一化热词列表：去首尾空白、丢弃空条目、按首次出现去重并保留顺序。
+///
+/// 配置解析与 GUI 草稿都走这里，保证「草稿 → 配置 → 运行期」使用同一套归一化规则。
+pub fn normalize_hotwords(hotwords: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(hotwords.len());
+    for word in hotwords {
+        let word = word.trim();
+        if word.is_empty() || normalized.iter().any(|existing| existing == word) {
+            continue;
+        }
+        normalized.push(word.to_string());
+    }
+    normalized
+}
+
+/// 校验热词列表是否符合百炼预编译热词的限制（数量 + 单条长度）。
+///
+/// 官方限制：每列表最多 2000 条；含非 ASCII 字符时整条 ≤15 字符（空格计入），
+/// 纯 ASCII 时按空格切分 ≤7 个片段。提前在本地报错，避免上传后才失败。
+pub fn validate_hotwords(hotwords: &[String]) -> Result<()> {
+    if hotwords.len() > MAX_ASR_HOTWORDS {
+        bail!(
+            "配置项 [asr] hotwords 最多 {MAX_ASR_HOTWORDS} 条（当前 {} 条）",
+            hotwords.len()
+        );
+    }
+    for (index, word) in hotwords.iter().enumerate() {
+        let word = word.trim();
+        if word.is_empty() {
+            bail!("配置项 [asr] hotwords 第 {} 条不能为空", index + 1);
+        }
+        if word.chars().any(|c| !c.is_ascii()) {
+            let chars = word.chars().count();
+            if chars > MAX_HOTWORD_CHARS {
+                bail!(
+                    "配置项 [asr] hotwords 第 {} 条 {:?} 过长：含非 ASCII 字符时最多 {MAX_HOTWORD_CHARS} 个字符（当前 {chars} 个）",
+                    index + 1,
+                    word
+                );
+            }
+        } else {
+            let fragments = word.split_whitespace().count();
+            if fragments > MAX_ASCII_HOTWORD_WORDS {
+                bail!(
+                    "配置项 [asr] hotwords 第 {} 条 {:?} 过长：纯 ASCII 时最多 {MAX_ASCII_HOTWORD_WORDS} 个空格分隔片段（当前 {fragments} 个）",
+                    index + 1,
+                    word
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 校验 `[api] workspace_host` 是否已是规范化 host：
@@ -697,6 +783,7 @@ mod tests {
         );
         assert_eq!(config.asr.model, DEFAULT_ASR_MODEL);
         assert_eq!(config.asr.languages, vec!["zh".to_string()]);
+        assert!(config.asr.hotwords.is_empty(), "未配置热词时为空列表");
         assert_eq!(config.tts.model, DEFAULT_TTS_MODEL);
         assert_eq!(config.tts.voice, DEFAULT_VOICE);
         assert_eq!(
@@ -723,6 +810,11 @@ mod tests {
         );
         assert!(config.translate.show_source);
         assert_eq!(
+            config.cache_path(),
+            PathBuf::from("cache.json"),
+            "默认缓存文件相对配置文件目录"
+        );
+        assert_eq!(
             config.inference_ws_url(),
             "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
         );
@@ -738,11 +830,15 @@ workspace_host = "ws-test.cn-beijing.maas.aliyuncs.com"
 [asr]
 model = "asr-test"
 languages = ["ja", "zh", "en"]
+hotwords = ["原神", "崩坏：星穹铁道", "Kaoet"]
 
 [tts]
 model = "tts-test"
 voice = "voice-test"
 dialect = "四川话"
+
+[cache]
+file = "cache/kaols.json"
 
 [translate]
 enabled = true
@@ -775,6 +871,22 @@ words = 10
         assert_eq!(
             config.asr.languages,
             vec!["ja".to_string(), "zh".to_string(), "en".to_string()]
+        );
+        assert_eq!(
+            config.asr.hotwords,
+            vec![
+                "原神".to_string(),
+                "崩坏：星穹铁道".to_string(),
+                "Kaoet".to_string()
+            ]
+        );
+        assert_eq!(
+            config
+                .cache_path()
+                .parent()
+                .map(|p| p.to_string_lossy().to_string()),
+            Some("cache".to_string()),
+            "自定义缓存路径相对配置文件目录"
         );
         assert_eq!(config.tts.model, "tts-test");
         assert_eq!(config.tts.voice, "voice-test");
@@ -851,13 +963,62 @@ words = 10
     }
 
     #[test]
-    fn asr_languages_more_than_four_are_kept_for_detection() {
-        // 配置层不限制语言数量；ASR language_hints 原样传递
+    fn asr_hotwords_are_normalized_and_parsed() {
         let config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[asr]\nlanguages = [\"zh\",\"ja\",\"en\",\"ko\",\"fr\"]\n",
+            "[api]\nkey = \"sk-test\"\n[asr]\nhotwords = [\"  原神  \", \"\", \"原神\", \"Kaoet\"]\n",
         )
         .unwrap();
-        assert_eq!(config.asr.languages.len(), 5);
+        assert_eq!(
+            config.asr.hotwords,
+            vec!["原神".to_string(), "Kaoet".to_string()],
+            "热词应去首尾空白、丢弃空条目并按首次出现去重"
+        );
+
+        let empty =
+            AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[asr]\nhotwords = []\n").unwrap();
+        assert!(empty.asr.hotwords.is_empty());
+    }
+
+    #[test]
+    fn asr_hotword_length_limits_are_validated() {
+        // 含非 ASCII：整条最多 15 个字符（空格计入）
+        let ok = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[asr]\nhotwords = [\"一二三四五六七八九十一二三四五\"]\n",
+        );
+        assert!(ok.is_ok(), "15 个汉字应合法: {ok:?}");
+
+        let too_long = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[asr]\nhotwords = [\"一二三四五六七八九十一二三四五六\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{too_long:#}").contains("过长"),
+            "超过 15 个字符应报错: {too_long:#}"
+        );
+
+        // 纯 ASCII：按空格切分最多 7 个片段
+        let ascii_ok = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[asr]\nhotwords = [\"Human immunodeficiency virus type 1\"]\n",
+        );
+        assert!(ascii_ok.is_ok(), "5 个片段应合法: {ascii_ok:?}");
+
+        let ascii_too_long = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[asr]\nhotwords = [\"a b c d e f g h\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{ascii_too_long:#}").contains("纯 ASCII"),
+            "超过 7 个片段应报错: {ascii_too_long:#}"
+        );
+    }
+
+    #[test]
+    fn asr_hotword_count_limit_is_validated() {
+        let words: Vec<String> = (0..=MAX_ASR_HOTWORDS)
+            .map(|index| format!("w{index}"))
+            .collect();
+        let err = validate_hotwords(&words).unwrap_err();
+        assert!(format!("{err:#}").contains("最多"), "{err:#}");
     }
 
     #[test]
@@ -919,8 +1080,8 @@ audio = "samples/edgar-ja.wav"
         assert_eq!(custom.samples[0].language, "zh", "第一个样本是默认声线");
         assert_eq!(custom.sample_for_language("ja").unwrap().language, "ja");
         assert_eq!(
-            config.voice_cache_path(),
-            PathBuf::from("voice_cache.json"),
+            config.cache_path(),
+            PathBuf::from("cache.json"),
             "默认缓存文件相对配置文件目录"
         );
     }
@@ -1038,13 +1199,13 @@ rate = 1.25
     #[test]
     fn paths_resolve_relative_to_config_dir() {
         let mut config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[tts]\ncache_file = \"cache/voices.json\"\n",
+            "[api]\nkey = \"sk-test\"\n[cache]\nfile = \"cache/voices.json\"\n",
         )
         .unwrap();
         config.base_dir = PathBuf::from("C:/configs");
 
         assert_eq!(
-            config.voice_cache_path(),
+            config.cache_path(),
             PathBuf::from("C:/configs/cache/voices.json")
         );
         assert_eq!(

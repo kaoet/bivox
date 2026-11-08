@@ -1,10 +1,12 @@
-//! `admin`：百炼自定义音色调试工具（决策 D19，见 docs/decisions.md）。
+//! `admin`：百炼调试工具（决策 D19/D31，见 docs/decisions.md）。
 //!
-//! 只做两件事：列出账号下的自定义音色、删除音色（单条或全部）。
+//! 管理账号下的自定义音色与 ASR 预编译热词列表：
+//! - 音色：列出 / 删除（单条或全部）；
+//! - 热词列表：列出 / 按 vocabulary_id 删除（创建与更新由主程序在会话启动时自动完成）。
 //!
 //! - **读 `config.toml`**：默认当前工作目录的 `./config.toml`，可用 `-c/--config` 指定；
 //!   只取 `[api] key` 与 `[api] workspace_host`（其余字段沿用同一套校验）。
-//! - **不读写 `voice_cache.json`、不提供 enroll、不做任何 prefix 过滤**。
+//! - **不读写 `cache.json`、不提供 enroll、不做任何 prefix 过滤**。
 //! - 该工具不随发布包分发，只用于本地调试。
 
 use std::io::{IsTerminal, Write};
@@ -15,6 +17,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
+use kaols::asr::admin as asr_admin;
+use kaols::asr::admin::DeleteOutcome as VocabDeleteOutcome;
+use kaols::asr::api::RemoteVocabulary;
 use kaols::config::AppConfig;
 use kaols::voice::admin::{self, DeleteOutcome};
 use kaols::voice::api::{BailianVoiceApi, RemoteVoice};
@@ -22,7 +27,7 @@ use kaols::voice::api::{BailianVoiceApi, RemoteVoice};
 #[derive(Debug, Parser)]
 #[command(
     name = "admin",
-    about = "百炼自定义音色调试工具：列出 / 删除账号下的自定义音色（不随主程序分发）"
+    about = "百炼调试工具：管理自定义音色与 ASR 预编译热词列表（不随主程序分发）"
 )]
 struct Args {
     /// config.toml 路径（默认当前工作目录下的 config.toml）
@@ -61,6 +66,29 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+
+    /// 管理 ASR 预编译热词列表
+    Vocab {
+        #[command(subcommand)]
+        command: VocabCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VocabCommand {
+    /// 列出账号下的预编译热词列表
+    List,
+
+    /// 按 vocabulary_id 删除预编译热词列表（可重复传入）
+    Delete {
+        /// 百炼返回的 vocabulary_id，可重复传入
+        #[arg(long = "vocabulary-id", value_name = "id", required = true)]
+        vocabulary_ids: Vec<String>,
+
+        /// 跳过交互确认
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -95,6 +123,16 @@ async fn run() -> Result<()> {
         Command::List => list(&api).await,
         Command::Delete { voice_ids, yes } => delete(&api, &voice_ids, yes).await,
         Command::DeleteAll { yes } => delete_all(&api, yes).await,
+        Command::Vocab { command } => {
+            let asr_api = kaols::asr::api_from_config(&config)?;
+            match command {
+                VocabCommand::List => list_vocabularies(&asr_api).await,
+                VocabCommand::Delete {
+                    vocabulary_ids,
+                    yes,
+                } => delete_vocabularies(&asr_api, &vocabulary_ids, yes).await,
+            }
+        }
     }
 }
 
@@ -187,6 +225,94 @@ async fn delete_all(api: &BailianVoiceApi, yes: bool) -> Result<()> {
         bail!("{} 个音色删除失败，详见上方输出", report.failed.len());
     }
     Ok(())
+}
+
+async fn list_vocabularies(api: &kaols::asr::api::BailianAsrApi) -> Result<()> {
+    let vocabularies = asr_admin::list_remote_vocabularies(api).await?;
+    if vocabularies.is_empty() {
+        println!("📭 账号下没有预编译热词列表。");
+        return Ok(());
+    }
+
+    print_vocabularies(&vocabularies);
+    println!("\n共 {} 个预编译热词列表。", vocabularies.len());
+    Ok(())
+}
+
+async fn delete_vocabularies(
+    api: &kaols::asr::api::BailianAsrApi,
+    vocabulary_ids: &[String],
+    yes: bool,
+) -> Result<()> {
+    let ids: Vec<&str> = vocabulary_ids
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        bail!("--vocabulary-id 不能为空");
+    }
+
+    if !yes {
+        let prompt = format!(
+            "即将删除 {} 个预编译热词列表：{}",
+            ids.len(),
+            ids.join(", ")
+        );
+        if !confirm(&prompt)? {
+            println!("{}", "已取消。".yellow());
+            return Ok(());
+        }
+    }
+
+    let mut failed = Vec::new();
+    for vocabulary_id in ids {
+        match asr_admin::delete_remote_vocabulary(api, vocabulary_id).await {
+            Ok(VocabDeleteOutcome::Deleted) => {
+                println!("{} 已删除热词列表 {vocabulary_id}", "✅".green())
+            }
+            Ok(VocabDeleteOutcome::AlreadyMissing) => {
+                println!("{} {vocabulary_id} 在百炼中已不存在", "⚠️".yellow())
+            }
+            Err(err) => {
+                println!("{} 删除热词列表 {vocabulary_id} 失败：{err:#}", "❌".red());
+                failed.push(vocabulary_id.to_string());
+            }
+        }
+    }
+
+    if !failed.is_empty() {
+        bail!("{} 个热词列表删除失败，详见上方输出", failed.len());
+    }
+    Ok(())
+}
+
+/// 打印预编译热词列表表格（官方列表响应没有 target_model，只展示 id/状态/更新时间）。
+fn print_vocabularies(vocabularies: &[RemoteVocabulary]) {
+    let id_width = vocabularies
+        .iter()
+        .map(|vocabulary| vocabulary.vocabulary_id.chars().count())
+        .max()
+        .unwrap_or(12)
+        .max("vocabulary_id".len());
+
+    println!(
+        "\n{}  {}  {}",
+        format!("{:<id_width$}", "vocabulary_id").bold(),
+        format!("{:<10}", "status").bold(),
+        "最后更新".bold(),
+    );
+    println!("{}", "-".repeat(id_width + 32).dimmed());
+
+    for vocabulary in vocabularies {
+        println!(
+            "{}  {:<10}  {}",
+            format!("{:<id_width$}", vocabulary.vocabulary_id).cyan(),
+            vocabulary.status,
+            vocabulary.updated_time,
+        );
+    }
 }
 
 /// 打印音色表格（只展示云端字段，不涉及本地缓存）。

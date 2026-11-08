@@ -8,7 +8,6 @@
 
 pub mod admin;
 pub mod api;
-pub mod cache;
 pub mod editor;
 
 #[cfg(test)]
@@ -21,12 +20,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::cache::{self, AppCache, VoiceCacheEntry};
 use crate::config::{
     AppConfig, CustomVoiceConfig, CustomVoiceSample, DEFAULT_SAMPLE_RATE, MAX_VOICE_PREFIX_LEN,
 };
 use crate::language;
 use api::BailianVoiceApi;
-use cache::{VoiceCache, VoiceCacheEntry};
 
 /// 创建音色后等待百炼部署就绪的最长时间。
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -126,9 +125,9 @@ pub fn api_from_config(config: &AppConfig) -> Result<BailianVoiceApi> {
     BailianVoiceApi::new(api_key, config.http_api_base())
 }
 
-/// 读取配置对应的自定义音色缓存。
-pub fn cache_from_config(config: &AppConfig) -> Result<VoiceCache> {
-    VoiceCache::load(config.voice_cache_path())
+/// 读取配置对应的本地缓存。
+pub fn cache_from_config(config: &AppConfig) -> Result<AppCache> {
+    AppCache::load(config.cache_path())
 }
 
 /// 解析当前生效的音色。
@@ -154,7 +153,7 @@ pub async fn resolve_active_voice(config: &AppConfig) -> Result<ActiveVoice> {
 pub async fn resolve_custom_voice(
     config: &AppConfig,
     api: &BailianVoiceApi,
-    cache: &mut VoiceCache,
+    cache: &mut AppCache,
     name: &str,
     custom: &CustomVoiceConfig,
     only_language: Option<&str>,
@@ -382,7 +381,7 @@ enum PreparedSource {
 
 async fn prepare_sample(
     config: &AppConfig,
-    cache: &VoiceCache,
+    cache: &AppCache,
     config_name: &str,
     display_name: &str,
     sample: &CustomVoiceSample,
@@ -714,7 +713,7 @@ mod tests {
         std::fs::write(&zh, wav_bytes(1)).unwrap();
         std::fs::write(&ja, wav_bytes(2)).unwrap();
         let text = format!(
-            "[api]\nkey = \"sk-test\"\n[tts]\nvoice = \"custom:edgar\"\ncache_file = \"{}\"\n\
+            "[api]\nkey = \"sk-test\"\n[tts]\nvoice = \"custom:edgar\"\n[cache]\nfile = \"{}\"\n\
              [tts.custom_voices.edgar]\nname = \"埃德嘉\"\n\
              [[tts.custom_voices.edgar.samples]]\nlanguage = \"zh\"\naudio = \"{}\"\nrate = 1.25\n\
              [[tts.custom_voices.edgar.samples]]\nlanguage = \"ja\"\naudio = \"{}\"\n",
@@ -728,12 +727,12 @@ mod tests {
     #[tokio::test]
     async fn resolves_multiple_language_samples_and_caches_them() {
         let dir = temp_dir("multi-lang");
-        let cache_path = dir.join("voice_cache.json");
+        let cache_path = dir.join("cache.json");
         let config = config_with_two_languages(&dir, &cache_path);
         let mock = mock_enrollment().await;
         let api =
             BailianVoiceApi::new("sk-test", format!("{}/api/v1", mock.server.base_url())).unwrap();
-        let mut cache = VoiceCache::load(&cache_path).unwrap();
+        let mut cache = AppCache::load(&cache_path).unwrap();
         let (name, custom) = config.active_custom_voice().unwrap();
 
         let resolved = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)
@@ -771,7 +770,7 @@ mod tests {
         );
 
         // 再跑一次（重新读取缓存）：应全部命中，不再创建
-        let mut cache = VoiceCache::load(&cache_path).unwrap();
+        let mut cache = AppCache::load(&cache_path).unwrap();
         let resolved_again = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)
             .await
             .unwrap();
@@ -788,12 +787,12 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_cache_when_one_sample_file_is_missing() {
         let dir = temp_dir("missing-one-lang");
-        let cache_path = dir.join("voice_cache.json");
+        let cache_path = dir.join("cache.json");
         let config = config_with_two_languages(&dir, &cache_path);
         let mock = mock_enrollment().await;
         let api =
             BailianVoiceApi::new("sk-test", format!("{}/api/v1", mock.server.base_url())).unwrap();
-        let mut cache = VoiceCache::load(&cache_path).unwrap();
+        let mut cache = AppCache::load(&cache_path).unwrap();
         let (name, custom) = config.active_custom_voice().unwrap();
         let first = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)
             .await
@@ -801,7 +800,7 @@ mod tests {
 
         // 删掉中文样本文件后，应该靠缓存里的 audio_path 兜底继续使用
         std::fs::remove_file(dir.join("edgar-zh.wav")).ok();
-        let mut cache = VoiceCache::load(&cache_path).unwrap();
+        let mut cache = AppCache::load(&cache_path).unwrap();
         let second = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)
             .await
             .unwrap();
@@ -890,11 +889,11 @@ mod tests {
     #[tokio::test]
     async fn oversized_audio_is_rejected_before_reading() {
         let dir = temp_dir("oversized");
-        let cache_path = dir.join("voice_cache.json");
+        let cache_path = dir.join("cache.json");
         let audio = dir.join("huge.wav");
         std::fs::write(&audio, vec![0u8; MAX_AUDIO_BYTES + 1]).unwrap();
         let text = format!(
-            "[api]\nkey = \"sk-test\"\n[tts]\nvoice = \"custom:big\"\ncache_file = \"{}\"\n\
+            "[api]\nkey = \"sk-test\"\n[tts]\nvoice = \"custom:big\"\n[cache]\nfile = \"{}\"\n\
              [tts.custom_voices.big]\n[[tts.custom_voices.big.samples]]\nlanguage = \"zh\"\naudio = \"{}\"\n",
             cache_path.display().to_string().replace('\\', "\\\\"),
             audio.display().to_string().replace('\\', "\\\\"),
@@ -903,7 +902,7 @@ mod tests {
         let mock = mock_enrollment().await;
         let api =
             BailianVoiceApi::new("sk-test", format!("{}/api/v1", mock.server.base_url())).unwrap();
-        let mut cache = VoiceCache::load(&cache_path).unwrap();
+        let mut cache = AppCache::load(&cache_path).unwrap();
         let (name, custom) = config.active_custom_voice().unwrap();
 
         let err = resolve_custom_voice(&config, &api, &mut cache, name, custom, None)

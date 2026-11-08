@@ -8,8 +8,8 @@
 # 便携模式运行产物：日志与崩溃记录（若把 exe 放在仓库根）
 /logs/
 /crash.log
-# 自定义音色缓存（音频指纹 -> 百炼 voice_id），本机状态，不提交；
+# 本地共享缓存（音色指纹 -> voice_id、ASR 模型 -> vocabulary_id），本机状态，不提交；
 # 不带前导斜杠以匹配任意目录下的缓存文件（含 .tmp/.bak）
-voice_cache.json
-voice_cache.json.tmp
-voice_cache.json.bak
+cache.json
+cache.json.tmp
+cache.json.bak

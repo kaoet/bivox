@@ -1,7 +1,8 @@
 //! 用 `toml_edit` 对 `config.toml` 做**定点修改**（决策 D3，见 docs/decisions.md）。
 //!
-//! 目标：只动 GUI 负责的那几个字段（`[api] key`、`[audio]` 设备、`[tts] voice` /
-//! `dialect` / `custom_voices`、`[translate]` 的可写字段），其余字段、注释、顺序原样保留；
+//! 目标：只动 GUI 负责的那几个字段（`[api] key`、`[audio]` 设备、`[asr]`
+//! model/languages/hotwords、`[tts] voice` / `dialect` / `custom_voices`、`[translate]`
+//! 的可写字段），其余字段、注释、顺序原样保留；
 //! 写盘前先用 `AppConfig::from_toml_str` 校验整份文本，校验失败不落盘；
 //! 写盘前把旧文件备份成 `config.toml.bak`。
 
@@ -9,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use crate::config::{CustomVoiceConfig, TranslateGranularity};
 
@@ -68,6 +69,39 @@ pub fn set_translate(
     translate["show_source"] = toml_edit::value(show_source);
 
     render(&doc, original)
+}
+
+/// 设置 `[asr]` 中由「语音识别」页负责的字段：`model` / `languages` / `hotwords`（D32）。
+///
+/// `languages` 顺序即配置顺序（首个是默认语言）；`hotwords` 为空时删除该键，
+/// 保持 TOML 简洁。写回后交给整份配置校验（语言代码、热词限制等）。
+pub fn set_asr(
+    original: &str,
+    model: &str,
+    languages: &[String],
+    hotwords: &[String],
+) -> Result<String> {
+    let mut doc = parse(original)?;
+    let asr = ensure_table(&mut doc, "asr")?;
+
+    asr["model"] = toml_edit::value(model.trim());
+    asr["languages"] = string_array(languages.iter().map(String::as_str));
+    if hotwords.is_empty() {
+        asr.remove("hotwords");
+    } else {
+        asr["hotwords"] = string_array(hotwords.iter().map(String::as_str));
+    }
+
+    render(&doc, original)
+}
+
+/// 字符串数组 → `toml_edit::Item`（保留调用方给的顺序）。
+fn string_array<'a>(values: impl IntoIterator<Item = &'a str>) -> Item {
+    let mut array = Array::new();
+    for value in values {
+        array.push(value.trim());
+    }
+    Item::Value(Value::Array(array))
 }
 
 /// 整体替换 `[tts.custom_voices]` 表（键名 → 音色），其余字段与注释保留。
@@ -383,6 +417,62 @@ languages = ["zh", "ja"]
                 .to_string_lossy(),
             "voices/b-en.wav"
         );
+    }
+
+    #[test]
+    fn set_asr_writes_model_languages_and_hotwords_preserving_other_fields() {
+        let updated = set_asr(
+            SAMPLE,
+            " qwen-audio-3.1-asr-flash-streaming ",
+            &["ja".to_string(), "zh".to_string()],
+            &["原神".to_string(), "Kaoet".to_string()],
+        )
+        .unwrap();
+
+        assert!(updated.contains("# 顶部注释"));
+        assert!(updated.contains("workspace_host"));
+        assert!(
+            updated.contains(r#"[asr]"#),
+            "原配置已有 [asr] 时不应重复创建: {updated}"
+        );
+        assert_eq!(updated.matches("[asr]").count(), 1, "{updated}");
+
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert_eq!(config.asr.model, "qwen-audio-3.1-asr-flash-streaming");
+        assert_eq!(
+            config.asr.languages,
+            vec!["ja".to_string(), "zh".to_string()],
+            "语言顺序应原样写回"
+        );
+        assert_eq!(
+            config.asr.hotwords,
+            vec!["原神".to_string(), "Kaoet".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_asr_removes_hotwords_key_when_empty() {
+        // SAMPLE 以 [asr] 段结尾，追加的 hotwords 行属于 [asr]
+        let original = format!("{SAMPLE}hotwords = [\"旧词\"]\n");
+        assert!(AppConfig::from_toml_str(&original).is_ok());
+
+        let updated = set_asr(&original, "asr-model", &["zh".to_string()], &[]).unwrap();
+        assert!(
+            !updated.contains("hotwords"),
+            "热词为空时应删除 hotwords 键: {updated}"
+        );
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert!(config.asr.hotwords.is_empty());
+    }
+
+    #[test]
+    fn set_asr_creates_missing_asr_table() {
+        let original = "[api]\nkey = \"sk-test\"\n";
+        let updated = set_asr(original, "asr-model", &["zh".to_string()], &[]).unwrap();
+        assert!(updated.contains("[asr]"), "{updated}");
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert_eq!(config.asr.model, "asr-model");
+        assert_eq!(config.asr.languages, vec!["zh".to_string()]);
     }
 
     #[test]

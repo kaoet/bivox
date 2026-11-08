@@ -136,6 +136,23 @@ pub async fn run(
         return Ok(());
     }
 
+    // 预编译热词（D31）：首次创建/词表变化时会上传并等待部署，失败只降级不阻断会话。
+    let hotwords = crate::asr::resolve_vocabulary(&config).await;
+    if let Some(warning) = &hotwords.warning {
+        log::warn!("⚠️ 预编译热词：{warning}");
+        emit(PipelineEvent::Warning {
+            context: "预编译热词未生效".to_string(),
+            detail: warning.clone(),
+        });
+    }
+    if let Some(vocabulary_id) = &hotwords.vocabulary_id {
+        log::info!("🔥 本次识别使用预编译热词列表: {vocabulary_id}");
+    }
+    if handle.is_cancelled() {
+        emit(PipelineEvent::StateChanged(SessionState::Idle));
+        return Ok(());
+    }
+
     // 设备：按完整名精确匹配（D12），失败直接终止会话。
     let device_mgr = AudioDeviceManager::new();
     let in_dev = device_mgr.get_input_device(config.audio.input_device.as_deref())?;
@@ -190,12 +207,14 @@ pub async fn run(
         let model = config.asr.model.clone();
         let ws_url = inference_ws_url.clone();
         let language_hints = config.asr.languages.clone();
+        let vocabulary_id = hotwords.vocabulary_id.clone();
         tasks.push(tokio::spawn(async move {
             if let Err(err) = QwenAsrClient::run_duplex(
                 api_key,
                 model,
                 ws_url,
                 language_hints,
+                vocabulary_id,
                 asr_gate,
                 rx_mic,
                 tx_asr,

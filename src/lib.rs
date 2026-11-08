@@ -10,12 +10,15 @@
 compile_error!("必须启用 renderer-wgpu 或 renderer-glow 之一（见 Cargo.toml [features]）");
 
 pub mod app;
+pub mod asr;
 pub mod audio;
+pub mod cache;
 pub mod client;
 pub mod config;
 pub mod config_edit;
 pub mod events;
 pub mod gui;
+pub mod http;
 pub mod language;
 pub mod log_sink;
 pub mod paths;

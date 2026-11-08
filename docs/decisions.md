@@ -34,7 +34,7 @@
 **决定**
 
 - 发布物只有一个 `kaols.exe`；zip 只含 `kaols.exe` + `README.md`。
-- **不**打包 `config.toml`、`config.example.toml`、`voice_cache.json`、日志、调试工具。
+- **不**打包 `config.toml`、`config.example.toml`、`cache.json`、日志、调试工具。
 - 升级方式：覆盖 exe 与 README，旁边的配置/缓存/日志保持不动。
 - release 构建不弹控制台（`windows_subsystem = "windows"`），debug 保留控制台便于排错。
 - exe 文件图标由 `build.rs` + `assets/kaols.ico` 嵌入；窗口图标在 `src/app.rs` 程序化生成（不引入图片解码依赖）。
@@ -58,7 +58,8 @@
   4. `[tts.custom_voices]` 整个结构
   5. `[translate] enabled` / `target` / `granularity` / `show_source`（D25/D26；`model` 仍只读）
   6. `[tts] dialect`（D29）
-- 其余字段（`[asr]`、`[tts] model`、`[tts] cache_file`、`[vad]`、`[chunking]`、`[api] workspace_host` 等）只读：设置页展示当前值，用户手改后点「重新加载配置」。
+  7. `[asr] model` / `languages` / `hotwords`（D32；`[vad]`/`[chunking]` 仍只读）
+- 其余字段（`[tts] model`、`[cache] file`、`[vad]`、`[chunking]`、`[api] workspace_host` 等）只读：设置页展示当前值，用户手改后点「重新加载配置」。
 - 写回流程：读原文本 → 用 `toml_edit` 定点修改 → 用 `AppConfig::from_toml_str` 校验整份新文本 → 备份 `config.toml.bak` → 写盘。没有实际改动时不写盘、不产生备份；校验失败不落盘。
 - API Key 以**明文**保存在 `config.toml`；界面与 README 都提示该文件含密钥、勿分享。
 
@@ -83,7 +84,7 @@
   kaols.exe
   config.toml            # 首次启动生成
   config.toml.bak        # GUI 每次写回前备份
-  voice_cache.json       # 自定义音色缓存（默认相对 config.toml 所在目录）
+  cache.json             # 本地共享缓存（自定义音色 + ASR 预编译热词，路径可由 [cache] file 改）
   logs/kaols-YYYY-MM-DD.log
   crash.log
   ```
@@ -91,7 +92,7 @@
 - 主程序**不读** `%APPDATA%`、注册表、当前工作目录，也不通过环境变量改变配置/路径。
 - 配置里的相对路径（缓存文件、样例音频）以 **`config.toml` 所在目录**为基准。
 - 唯一的环境变量例外：`EGUI_INSPECTION=1` 仅开启调试 inspection 端口，不改变任何配置或路径语义。
-- 开发期 `cargo run` 的 exe 在 `target\<profile>\`，用 `scripts/dev-run.ps1` 把仓库根 `config.toml` 复制过去，并把副本的 `[tts] cache_file` 指向仓库根 `voice_cache.json`；不使用 symlink（Windows symlink 需额外权限，且缓存的“临时文件 + rename”原子写会替换链接本身）。
+- 开发期 `cargo run` 的 exe 在 `target\<profile>\`，用 `scripts/dev-run.ps1` 把仓库根 `config.toml` 复制过去，并把副本的 `[cache] file` 指向仓库根 `cache.json`；不使用 symlink（Windows symlink 需额外权限，且缓存的“临时文件 + rename”原子写会替换链接本身）。
 - 仅支持 Windows 10/11 x64。
 
 **理由**
@@ -121,7 +122,7 @@
 
 - 后台 → 界面统一走 `tokio::sync::mpsc::unbounded_channel::<PipelineEvent>()`；后台每次发事件后调用 `ctx.request_repaint()`，界面每帧 `try_recv()` 排空。
 - 事件里不出现 egui 类型，保持可测试；字段以 `src/events.rs` 为唯一事实源：
-  `StateChanged`、`Devices`、`VoiceInfo`、`Asr { text, is_sentence_end, sent_bytes, language, sentence_id }`、`TypedSentence`、`VadActive`、`Error`。
+  `StateChanged`、`Devices`、`VoiceInfo`、`Asr { text, is_sentence_end, sent_bytes, language, sentence_id }`、`TypedSentence`、`VadActive`、`Warning`、`Error`。
 - 反向命令（GUI → 会话）同样走通道：`PipelineSessionHandle` 持有打字输入的无界 `Sender`，会话调度循环用 `biased` select 优先处理它（D24）。
 - 管线内部（音频、ASR 事件、TTS 输入）使用有界 channel（容量 100）；音频回调用 `try_send`，满即丢包。
 
@@ -159,6 +160,7 @@
 **决定**
 
 - 用户可感知的错误不得静默：转成 `PipelineEvent::Error`，在界面顶部显示红色错误条（可手动清除），同时 `log::error!`。
+- 不影响会话继续的降级/告警走 `PipelineEvent::Warning`，在界面顶部显示黄色备注条（可手动清除），同时 `log::warn!`；典型例子是预编译热词注册失败后本次识别降级为不带热词（D31）。
 - 配置写回失败在对应页面内显示；配置无效时在设置页展示错误链并禁止启动实时会话。
 - 写默认配置、日志初始化等基础设施失败属于启动阶段的非致命错误：显示启动横幅 `startup_error`，界面照常打开。
 - 用户主动停止/关窗不弹错误；后台 ASR/TTS 服务非用户主动退出时才上报“服务异常退出”。
@@ -207,11 +209,11 @@
 
 **决定**
 
-- GUI「语音合成」页只编辑 `config.toml` 中的 `[tts] voice` 与 `[tts.custom_voices]`：**不发任何网络请求、不读写 `voice_cache.json`**。
+- GUI「语音合成」页只编辑 `config.toml` 中的 `[tts] voice` 与 `[tts.custom_voices]`：**不发任何网络请求、不读写 `cache.json`**。
 - 真正生效发生在会话启动时：`voice::resolve_active_voice` 解析 `[tts] voice`：
   - 内置音色 / 任意 voice_id：原样使用，不访问网络；
   - `custom:<键名>`：逐样本读取音频 → 计算 SHA256 → 查本地缓存 → 校验云端是否仍存在 → 未命中或已失效则上传样例音频、创建复刻音色、轮询到就绪 → 写回缓存。
-- `voice_cache.json` 由运行期维护；GUI 删除音色配置后留下的孤儿缓存条目无害，不提供清理入口。
+- `cache.json` 的 `voices` 区段由运行期维护；GUI 删除音色配置后留下的孤儿缓存条目无害，不提供清理入口。
 - 远程音色的列出/删除只走 `admin` 调试 CLI（D19）。
 - 自定义音色样本是**有序数组**，`samples[0]` 是默认声线；合成时按本句语言选样本，缺该语言回退第一个样本。
 
@@ -331,15 +333,16 @@
 
 **决定**
 
-- 独立二进制 `admin`，只做三件事：列出账号下的自定义音色、删除指定 voice_id、删除全部音色。
+- 独立二进制 `admin`，只做两类**本地调试**操作：管理账号下的自定义音色（列出/删除指定 voice_id/删除全部），以及管理 ASR 预编译热词列表（列出/删除指定 vocabulary_id）。
 - 凭据来源：默认读**当前工作目录**的 `./config.toml`，可用 `-c/--config <path>` 指定；沿用同一套配置校验，只实际使用 `[api] key` 与 `[api] workspace_host`。
-- **不读写 `voice_cache.json`、不提供 enroll（上传/复刻）、不做任何 prefix 过滤**；只按 voice_id 精确操作。
-- 逻辑放在 `src/voice/admin.rs`（可用 mock HTTP 单测），bin 只做参数解析与终端输出。
+- **不读写 `cache.json`、不提供 enroll（上传/复刻）或热词创建/更新、不做任何 prefix 过滤**；只按 voice_id / vocabulary_id 精确操作。
+- 热词列表不提供 delete-all：列表接口无 total 且无法区分是否为其它应用创建，避免误删账号下其它数据（D31）。
+- 逻辑放在 `src/voice/admin.rs` 与 `src/asr/admin.rs`（可用 mock HTTP 单测），bin 只做参数解析与终端输出。
 - 不随发布包分发。
 
 **缓存与远程删除的关系**
 
-- 若远程 voice_id 被删除，下次会话启动解析自定义音色时，`query_voice` 会将其判定为不存在并自动重新复刻；网络错误时则先沿用缓存（标记为未校验）。一般无需手工删除 `voice_cache.json`。
+- 若远程 voice_id 被删除，下次会话启动解析自定义音色时，`query_voice` 会将其判定为不存在并自动重新复刻；网络错误时则先沿用缓存（标记为未校验）。一般无需手工删除 `cache.json`。
 
 **理由**
 
@@ -570,7 +573,7 @@
 **决定**
 
 - 创建复刻音色（`voice-enrollment` / `create_voice`）时显式传 `input.max_prompt_audio_length = 20.0`，即 `src/voice/mod.rs` 的 `MAX_PROMPT_AUDIO_LENGTH`；官方默认值 `10.0`，取值范围 `[3.0, 30.0]`。
-- 该值**不做配置项**：它只影响一次性复刻结果，没有运行时调节需求；一旦可配，就必须并入 `voice_cache.json` 的缓存键（现为「模型 + 音频 SHA256」）与 D20 配置指纹，否则改值不生效，代价大于收益。
+- 该值**不做配置项**：它只影响一次性复刻结果，没有运行时调节需求；一旦可配，就必须并入 `cache.json` 的缓存键（现为「模型 + 音频 SHA256」）与 D20 配置指纹，否则改值不生效，代价大于收益。
 - 本地预检仍按官方音频要求：WAV <5 秒报错、>60 秒警告；样例 >20 秒时日志提示只有前 20 秒参与复刻。
 
 **理由**
@@ -580,9 +583,73 @@
 
 **边界**
 
-- 已缓存的音色不会自动按新值重做（缓存命中即跳过复刻）；要让某个音色重新复刻，需删掉 `voice_cache.json` 中对应条目（或整个文件）。
+- 已缓存的音色不会自动按新值重做（缓存命中即跳过复刻）；要让某个音色重新复刻，需删掉 `cache.json` 中对应条目（或整个文件）。
 - 官方文档标注该参数适用于 qwen-audio-3.0/3.1-tts、qwen-audio-3.x-realtime、cosyvoice-v3.5/v3；其它模型是否接受未验证（与 `language_hints` 同为无条件发送的既有做法）。
 - `enable_preprocess` / `enable_volume_normalization` 保持服务端默认（false），不在本决定范围内。
+
+---
+
+## D31 ASR 预编译热词：配置、缓存与运行期注册
+
+**决定**
+
+- `[asr]` 增加 `hotwords: Vec<String>`（默认空）。词条按「去首尾空白、丢空、按首次出现去重、保留顺序」归一化；**权重固定 4**（官方范围 1–5、推荐从 4 起调），**不写 `lang`**，不提供每词权重/语种配置。
+- 中文或英文热词都走百炼**预编译热词列表**（不是即时热词）：会话启动时由后台自动同步，识别时通过 run-task 的 `payload.parameters.vocabulary_id` 引用。
+- 本地缓存文件统一为 `cache.json`（配置 `[cache] file`，默认相对配置文件目录），包含两个互不影响的区段：
+  - `voices`：TTS 模型 → 音频 SHA256 → `voice_id`（沿用 D11 的两层结构与原子写/损坏备份重建）；
+  - `asr_hotwords`：ASR 模型 → `{ vocabulary_id, hotwords, updated_at }`。
+- 运行期流程（`asr::resolve_vocabulary`，仅在 `pipeline::session` 启动时调用）：
+  1. `hotwords` 为空 → 不访问网络、不带 `vocabulary_id`；
+  2. 缓存命中 → `query_vocabulary` 校验云端是否存在/就绪（网络异常时沿用缓存 id）；`ResourceNotExist` → 重新创建；模型不一致 → 重新创建；
+  3. 词表未变 → 直接复用；
+  4. 词表变化 → `update_vocabulary` 全量替换；按缓存 `updated_at` 做 **≥5 分钟**的客户端限速（官方建议），未满 5 分钟时本次沿用旧词表并提示，下次启动再试；
+  5. 无缓存 → `create_vocabulary`（prefix 固定 `kaols`），**拿到 `vocabulary_id` 立即写入 `cache.json`**，再轮询到 `status == "OK"`（最多 60s）。
+- 失败降级：以上任何一步失败都**不阻断实时会话**；本次识别不带最新热词继续跑，通过 `PipelineEvent::Warning` 显示黄色告警并写日志（D8）。创建/更新失败时若有旧 id，则沿用旧词表。
+- `[asr] hotwords` 计入配置指纹（D20）：运行中保存会热重启，下一次会话启动才同步词表。
+- GUI 不访问百炼、不读写 `cache.json`；远程热词列表的列出/删除只走 `admin` 调试 CLI（D19）。
+- 校验在本地提前做：最多 2000 条；含非 ASCII 字符时整条 ≤15 字符（空格计入）、纯 ASCII 时 ≤7 个空格分隔片段。词条必须是非空字符串。
+
+**理由**
+
+- 预编译热词只在列表变化时上传，识别请求只带 id，避免每次会话内联大量词条；本地缓存 id 避免重复创建，符合「第一次创建就保存」的用户预期。
+- 省略 `lang`：识别同时带 `language_hints` 时，只有语种匹配的词条生效；kaols 是多语种场景，不限定语种才能让同一份词表在所有语言下都参与。
+- 5 分钟限速是官方约束：若立即把新词表写进缓存快照，而百炼因过于频繁没有实际生效，之后就会一直“以为已更新”而不再重试；限速 + 保留旧快照可以让后续会话自动重试。
+- 降级而不阻断：热词只是准确率增强，子业务空间/地域/网络等外部限制不应该让整个语音识别不可用；用黄色告警保证用户可感知（D8）。
+
+**边界**
+
+- 仅华北2（北京）与新加坡地域支持，且**仅主业务空间**；子业务空间/其它地域会创建失败并降级。
+- 每账号最多 50 个列表（所有模型共享）；换 ASR 模型会为新模型新建列表，旧条目留在缓存/云端，需用 `admin vocab delete` 清理。
+- 每列表最多 2000 条；修改后生效时间受百炼部署与 5 分钟更新限制影响，首次创建可能让会话「启动中」持续数十秒。
+- 首次创建失败时 `cache.json` 可能没有该模型的记录；下次启动会重试创建。
+
+---
+
+## D32 「语音识别」页与 `[asr]` 图形化写回
+
+**决定**
+
+- 页签顺序固定为：**实时 / 音频 / 语音识别 / 语音合成 / 翻译 / 设置**；「语音识别」页放在「语音合成」左侧。
+- 新页只编辑 `[asr] model` / `[asr] languages` / `[asr] hotwords`（D3 白名单扩展）；`[vad]`、`[chunking]`、`[tts] model`、`[cache] file` 等仍只读，手改配置后「设置 → 重新加载配置」。
+- 交互沿用 D22 的 **Tab 级「保存 / 放弃更改」**：
+  - 「保存」把三组草稿合并成一次 `toml_edit` 写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启；
+  - 「放弃更改」恢复为配置文件里的值；
+  - 只在确实有改动时可用，脏状态显示「● 未保存」；按归一化后的热词列表比较（空行/重复项不算改动）。
+- 语言列表是**有序**编辑：每行可上移/下移/删除，末尾下拉从 `ASR_LANGUAGES` 追加未加入的语言；首个是默认语言。超过 4 种时提示「ASR 接口只使用前 4 个作为 `language_hints`，本地语言判定仍使用完整列表」。
+- 识别模型是单行输入框（可恢复默认），不做模型列表探测；`[asr] hotwords` 是多行文本框（一行一个），保存前本地做 D31 的数量/长度校验。
+- 页内注明：运行中保存会重启实时管线、丢失当前句；热词同步发生在**下一次会话启动**，首次创建可能需要几十秒。
+
+**理由**
+
+- ASR 的模型/语言/热词目前只能手改配置，且模型与语言原本只在「设置」页只读展示；集中到一个页与「语音合成」页的编辑习惯一致，避免用户在多个页面间来回。
+- 一次原子写回避免「模型已写、语言没写」的半套配置；复用 D20 热重启，不引入新的生命周期机制。
+- 有序列表必须支持重排：首个语言是默认语言，本地语言判定与回退都依赖顺序。
+
+**边界**
+
+- 模型是自由文本，手误输入不支持的热词模型时，热词创建可能失败并降级（黄色告警），但 ASR 仍按该模型尝试启动。
+- 热词词条语种不可配置（D31）：同一份词表对所有 `language_hints` 生效。
+- 热词上传产生的 `vocabulary_id` 不在 GUI 中展示；用 `admin vocab list` 查看、`admin vocab delete` 删除。
 
 ---
 

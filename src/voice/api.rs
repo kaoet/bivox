@@ -15,55 +15,19 @@
 
 use anyhow::{bail, Context, Result};
 use reqwest::multipart::{Form, Part};
-use reqwest::{Client, RequestBuilder, Response};
+use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::http::{parse_response, payload};
+
+// 保持 `voice::api::ApiError` / `voice::api::is_resource_missing_error` 这些既有路径可用，
+// 具体定义在 `crate::http`（ASR 热词接口也共用同一套错误判定）。
+pub use crate::http::{is_resource_missing_error, ApiError};
+
 /// 音色复刻服务使用的固定模型名（不是 TTS 模型）。
 pub const VOICE_ENROLLMENT_MODEL: &str = "voice-enrollment";
-
-/// 百炼 HTTP 接口返回的业务错误（保留状态码与错误码，便于按类型判断）。
-#[derive(Debug)]
-pub struct ApiError {
-    pub action: String,
-    pub status: u16,
-    pub code: String,
-    pub message: String,
-}
-
-impl ApiError {
-    /// 资源不存在：音色/文件被删除或从未创建。
-    ///
-    /// 实测对不存在的 voice_id 调 `query_voice` / `delete_voice` 返回
-    /// HTTP 400 + `BadRequest.ResourceNotExist`，可据此判定缓存失效。
-    pub fn is_resource_missing(&self) -> bool {
-        self.status == 404
-            || self.code == "BadRequest.ResourceNotExist"
-            || self.message.to_ascii_lowercase().contains("not exist")
-    }
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "百炼「{}」失败（HTTP {} {}): {}",
-            self.action, self.status, self.code, self.message
-        )
-    }
-}
-
-impl std::error::Error for ApiError {}
-
-/// 判断错误链中是否包含「资源不存在」的百炼业务错误。
-pub fn is_resource_missing_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<ApiError>())
-        .map(ApiError::is_resource_missing)
-        .unwrap_or(false)
-}
 
 /// 列表接口每页条数。
 const LIST_PAGE_SIZE: usize = 50;
@@ -445,46 +409,7 @@ pub fn is_failed_status(status: &str) -> bool {
     )
 }
 
-/// 兼容 `output`（服务接口）与 `data`（文件接口）两种响应包裹。
-fn payload(value: &Value) -> &Value {
-    value
-        .get("output")
-        .filter(|node| node.is_object())
-        .or_else(|| value.get("data").filter(|node| node.is_object()))
-        .unwrap_or(value)
-}
-
-/// 解析响应：非 2xx 时返回带状态码/错误码的 [`ApiError`]。
-async fn parse_response(response: Response, action: &str) -> Result<Value> {
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .with_context(|| format!("读取百炼「{action}」响应失败"))?;
-
-    let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-
-    if !status.is_success() {
-        let code = value
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("UnknownError");
-        let message = value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| body.trim());
-        return Err(ApiError {
-            action: action.to_string(),
-            status: status.as_u16(),
-            code: code.to_string(),
-            message: message.to_string(),
-        }
-        .into());
-    }
-
-    Ok(value)
-}
-
+/// 解析 `list_voice` 返回的一条音色记录（字段名兼容几种写法）。
 fn parse_remote_voice(item: &Value) -> RemoteVoice {
     let text = |keys: &[&str]| -> String {
         keys.iter()
@@ -892,15 +817,6 @@ mod tests {
         assert!(!is_ready_status("DEPLOYING"));
         assert!(!is_failed_status("DEPLOYING"));
         assert!(!is_ready_status(""));
-    }
-
-    #[test]
-    fn payload_accepts_output_and_data_wrappers() {
-        assert_eq!(payload(&json!({"output":{"a":1}}))["a"], 1);
-        assert_eq!(payload(&json!({"data":{"b":2}}))["b"], 2);
-        assert_eq!(payload(&json!({"c":3}))["c"], 3);
-        // output 为 null 时应回退到原始响应
-        assert_eq!(payload(&json!({"output": null, "c": 3}))["c"], 3);
     }
 
     #[test]

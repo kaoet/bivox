@@ -79,6 +79,13 @@ pub enum PipelineEvent {
     },
     /// 本地 VAD 是否处于语音段（顶栏指示器用）。
     VadActive(bool),
+    /// 用户可感知、但不影响会话继续运行的告警（黄色横幅）。
+    ///
+    /// 典型场景：配置了预编译热词但注册/更新失败，本次识别降级为不带热词继续跑（D31）。
+    Warning {
+        context: String,
+        detail: String,
+    },
     Error {
         context: String,
         detail: String,

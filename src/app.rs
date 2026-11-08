@@ -9,7 +9,10 @@ use log::{error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
-use crate::config::{AppConfig, TranslateGranularity, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE};
+use crate::config::{
+    AppConfig, TranslateGranularity, CUSTOM_VOICE_PREFIX, DEFAULT_ASR_LANGUAGE, DEFAULT_ASR_MODEL,
+    DEFAULT_VOICE,
+};
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
@@ -240,27 +243,30 @@ impl SubtitleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Realtime,
-    Translate,
     Audio,
+    Asr,
     Tts,
+    Translate,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Realtime,
-        Tab::Translate,
         Tab::Audio,
+        Tab::Asr,
         Tab::Tts,
+        Tab::Translate,
         Tab::Settings,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Realtime => "实时",
-            Self::Translate => "翻译",
             Self::Audio => "音频",
+            Self::Asr => "语音识别",
             Self::Tts => "语音合成",
+            Self::Translate => "翻译",
             Self::Settings => "设置",
         }
     }
@@ -323,6 +329,16 @@ pub struct KaolsApp {
     pub voice_custom_key: String,
     /// 语音合成页「中文方言」草稿（保存前只改这里，`config` 不变）。
     pub tts_dialect: String,
+    /// 语音识别页的 ASR 模型草稿。
+    pub asr_model: String,
+    /// 语音识别页的有序语言列表草稿。
+    pub asr_languages: Vec<String>,
+    /// 语音识别页的热词草稿（多行文本，一行一个）。
+    pub asr_hotwords: String,
+    /// 语音识别页保存/校验错误（红色显示）。
+    pub asr_edit_error: Option<String>,
+    /// 运行期告警（顶部黄色横幅显示，可手动清除）。
+    pub pipeline_warning: Option<String>,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
     /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
@@ -381,6 +397,11 @@ impl KaolsApp {
             voice_input: String::new(),
             voice_custom_key: String::new(),
             tts_dialect: String::new(),
+            asr_model: String::new(),
+            asr_languages: Vec::new(),
+            asr_hotwords: String::new(),
+            asr_edit_error: None,
+            pipeline_warning: None,
             pipeline_error: None,
             vad_active: false,
             config_created,
@@ -391,6 +412,7 @@ impl KaolsApp {
         };
         app.sync_from_config();
         app.sync_voice_inputs();
+        app.sync_asr_inputs();
         app.refresh_devices();
         app
     }
@@ -400,6 +422,7 @@ impl KaolsApp {
         self.config = load_config(&self.paths.config_file);
         self.sync_from_config();
         self.sync_voice_inputs();
+        self.sync_asr_inputs();
         // 选中的音色若仍存在就保留（保存后不丢选择），否则清空
         let selected_exists = self
             .selected_voice
@@ -467,6 +490,23 @@ impl KaolsApp {
                     .unwrap_or_default();
             }
         }
+    }
+
+    /// 从配置同步「语音识别」页的草稿值（模型 / 语言列表 / 热词）。
+    pub fn sync_asr_inputs(&mut self) {
+        match &self.config {
+            ConfigState::Loaded(config) => {
+                self.asr_model = config.asr.model.clone();
+                self.asr_languages = config.asr.languages.clone();
+                self.asr_hotwords = config.asr.hotwords.join("\n");
+            }
+            ConfigState::Invalid { .. } => {
+                self.asr_model = DEFAULT_ASR_MODEL.to_string();
+                self.asr_languages = vec![DEFAULT_ASR_LANGUAGE.to_string()];
+                self.asr_hotwords.clear();
+            }
+        }
+        self.asr_edit_error = None;
     }
 
     /// 顶部「当前音色」的草稿值（`[tts] voice` 形态）。
@@ -594,6 +634,90 @@ impl KaolsApp {
                 self.selected_voice = Some(draft.key.clone());
             }
         }
+    }
+
+    // ---- 语音识别页 ----
+
+    /// 把多行热词草稿解析为归一化列表（一行一个；空行忽略）。
+    pub fn hotwords_draft_list(&self) -> Vec<String> {
+        let lines: Vec<String> = self.asr_hotwords.lines().map(str::to_string).collect();
+        crate::config::normalize_hotwords(&lines)
+    }
+
+    /// 语音识别页的模型是否有改动。
+    pub fn asr_model_dirty(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => self.asr_model.trim() != config.asr.model,
+            ConfigState::Invalid { .. } => true,
+        }
+    }
+
+    /// 语音识别页的语言列表是否有改动。
+    pub fn asr_languages_dirty(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => self.asr_languages != config.asr.languages,
+            ConfigState::Invalid { .. } => true,
+        }
+    }
+
+    /// 语音识别页的热词是否有改动（按归一化后的列表比较，空白行不算改动）。
+    pub fn asr_hotwords_dirty(&self) -> bool {
+        match &self.config {
+            ConfigState::Loaded(config) => self.hotwords_draft_list() != config.asr.hotwords,
+            ConfigState::Invalid { .. } => true,
+        }
+    }
+
+    /// 语音识别页是否有未保存改动。
+    pub fn asr_tab_dirty(&self) -> bool {
+        self.asr_model_dirty() || self.asr_languages_dirty() || self.asr_hotwords_dirty()
+    }
+
+    /// 保存语音识别页的全部改动（模型 + 语言列表 + 热词，一次原子写回）。
+    ///
+    /// 成功后重载配置；运行中会按 D20 自动重启实时管线，下次会话启动时自动
+    /// 创建/更新百炼预编译热词列表（D31）。
+    pub fn save_asr_tab(&mut self) {
+        if !self.asr_tab_dirty() {
+            return;
+        }
+        match self.try_save_asr_tab() {
+            Ok(()) => {
+                self.asr_edit_error = None;
+                self.reload_config();
+                info!("已保存语音识别设置（{}）", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.asr_edit_error = Some(message.clone());
+                warn!("保存语音识别设置失败：{message}");
+            }
+        }
+    }
+
+    fn try_save_asr_tab(&self) -> anyhow::Result<()> {
+        if !matches!(self.config, ConfigState::Loaded(_)) {
+            anyhow::bail!("配置无效，无法保存语音识别设置");
+        }
+        let model = self.asr_model.trim();
+        if model.is_empty() {
+            anyhow::bail!("识别模型不能为空");
+        }
+        if self.asr_languages.is_empty() {
+            anyhow::bail!("语言列表不能为空（至少保留一种语言）");
+        }
+        let hotwords = self.hotwords_draft_list();
+        crate::config::validate_hotwords(&hotwords)?;
+
+        let original = config_edit::read(&self.paths.config_file)?;
+        let updated = config_edit::set_asr(&original, model, &self.asr_languages, &hotwords)?;
+        config_edit::save(&self.paths.config_file, &original, &updated)?;
+        Ok(())
+    }
+
+    /// 放弃语音识别页的全部改动，恢复为配置文件里的值。
+    pub fn reset_asr_tab(&mut self) {
+        self.sync_asr_inputs();
     }
 
     /// 重新枚举音频设备（启动时与「刷新设备」按钮调用）。
@@ -727,6 +851,7 @@ impl KaolsApp {
         self.events_rx = Some(rx);
         self.state = SessionState::Starting;
         self.pipeline_error = None;
+        self.pipeline_warning = None;
         self.typed_input_error = None;
         self.vad_active = false;
         // 本次会话是否翻译模式决定字幕如何解释 Asr/Translation 事件（D27）。
@@ -905,6 +1030,11 @@ impl KaolsApp {
                 );
             }
             PipelineEvent::VadActive(active) => self.vad_active = active,
+            PipelineEvent::Warning { context, detail } => {
+                // 不影响会话继续的告警（如预编译热词降级，D31）：黄色横幅，可手动清除。
+                self.pipeline_warning = Some(format!("{context}：{detail}"));
+                warn!("{context}：{detail}");
+            }
             PipelineEvent::Error { context, detail } => {
                 self.pipeline_error = Some(format!("{context}：{detail}"));
                 error!("{context}：{detail}");
@@ -964,6 +1094,17 @@ impl KaolsApp {
                 egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
             );
         }
+        if let Some(detail) = self.pipeline_warning.clone() {
+            gui::widgets::banner(
+                ui,
+                "运行告警",
+                &detail,
+                egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
+            );
+            if ui.button("清除告警").clicked() {
+                self.pipeline_warning = None;
+            }
+        }
         if let Some(detail) = self.pipeline_error.clone() {
             gui::widgets::banner(
                 ui,
@@ -987,9 +1128,10 @@ impl KaolsApp {
 
         match self.tab {
             Tab::Realtime => gui::realtime_tab::show(self, ui),
-            Tab::Translate => gui::translate_tab::show(self, ui),
             Tab::Audio => gui::audio_tab::show(self, ui),
+            Tab::Asr => gui::asr_tab::show(self, ui),
             Tab::Tts => gui::tts_tab::show(self, ui),
+            Tab::Translate => gui::translate_tab::show(self, ui),
             Tab::Settings => gui::settings_tab::show(self, ui),
         }
     }
@@ -1033,15 +1175,16 @@ fn config_signature(config: &AppConfig) -> String {
     let mut signature = String::new();
     let _ = write!(
         signature,
-        "key={:?}\nhost={}\nasr={}\nlangs={:?}\ntts={}\nvoice={}\ndialect={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\ntranslate={}/{}/{}/{}\n",
+        "key={:?}\nhost={}\nasr={}\nlangs={:?}\nhotwords={:?}\ntts={}\nvoice={}\ndialect={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\ntranslate={}/{}/{}/{}\n",
         config.api.key,
         config.api.workspace_host,
         config.asr.model,
         config.asr.languages,
+        config.asr.hotwords,
         config.tts.model,
         config.tts.voice,
         config.tts.dialect,
-        config.tts.cache_file,
+        config.cache.file,
         config.audio.input_device,
         config.audio.output_device,
         config.vad.enabled,
@@ -1622,6 +1765,39 @@ dialect = "普通话"
             crate::config::AppConfig::from_toml_str(&toml.replace("普通话", "东北话")).unwrap();
 
         assert_ne!(config_signature(&base), config_signature(&changed));
+    }
+
+    #[test]
+    fn config_signature_detects_hotword_changes() {
+        // 热词影响运行期 ASR 参数（vocabulary_id），必须计入指纹（D20/D31）。
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[asr]
+hotwords = ["原神"]
+"#;
+        let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let changed = crate::config::AppConfig::from_toml_str(
+            &toml.replace(r#"["原神"]"#, r#"["原神", "Kaoet"]"#),
+        )
+        .unwrap();
+
+        assert_ne!(config_signature(&base), config_signature(&changed));
+    }
+
+    #[test]
+    fn hotword_draft_is_normalized_like_config() {
+        // 草稿按行拆分后走与配置相同的归一化：空行/重复项不算改动。
+        let parse = |text: &str| {
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            crate::config::normalize_hotwords(&lines)
+        };
+        assert_eq!(
+            parse(" 原神 \n\n原神\nKaoet\n"),
+            vec!["原神".to_string(), "Kaoet".to_string()]
+        );
+        assert!(parse("  \n\n").is_empty());
     }
 
     #[test]

@@ -16,6 +16,7 @@ struct ConfigSummary {
     workspace_host: String,
     asr_model: String,
     languages: String,
+    asr_hotwords: usize,
     tts_model: String,
     tts_voice: String,
     tts_dialect: String,
@@ -28,6 +29,7 @@ impl ConfigSummary {
             workspace_host: config.api.workspace_host.clone(),
             asr_model: config.asr.model.clone(),
             languages: config.asr.languages.join(", "),
+            asr_hotwords: config.asr.hotwords.len(),
             tts_model: config.tts.model.clone(),
             tts_voice: config.tts.voice.clone(),
             tts_dialect: config.tts.dialect.clone(),
@@ -123,12 +125,17 @@ fn show_config_summary(ui: &mut egui::Ui, summary: &ConfigSummary) {
     widgets::kv_row(ui, "接入域名", &summary.workspace_host);
     widgets::kv_row(ui, "识别模型", &summary.asr_model);
     widgets::kv_row(ui, "识别语言", &summary.languages);
+    widgets::kv_row(ui, "预编译热词", &format!("{} 条", summary.asr_hotwords));
     widgets::kv_row(ui, "合成模型", &summary.tts_model);
     widgets::kv_row(ui, "当前音色", &summary.tts_voice);
     widgets::kv_row(ui, "中文方言", &summary.tts_dialect);
     widgets::kv_row(ui, "自定义音色", &format!("{} 个", summary.custom_voices));
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new("音频设备在「音频」页设置；自定义音色在「语音合成」页查看。").weak(),
+        egui::RichText::new(
+            "音频设备在「音频」页设置；识别模型/语言/热词在「语音识别」页设置；\
+             自定义音色在「语音合成」页查看。",
+        )
+        .weak(),
     );
 }

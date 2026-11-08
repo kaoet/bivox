@@ -61,7 +61,7 @@ pub fn tts_language_hint(asr_code: &str) -> &str {
     }
 }
 
-/// 语言代码的中文显示名（翻译目标语言下拉框用；未知代码原样返回）。
+/// 语言代码的中文显示名（翻译目标语言下拉框、语音识别页语言列表用；未知代码原样返回）。
 pub fn language_display_name(code: &str) -> &str {
     match canonical_language(code) {
         "zh" => "中文",
@@ -80,6 +80,20 @@ pub fn language_display_name(code: &str) -> &str {
         "ms" => "马来语",
         "fil" => "菲律宾语",
         "ar" => "阿拉伯语",
+        "hi" => "印地语",
+        "nl" => "荷兰语",
+        "sv" => "瑞典语",
+        "da" => "丹麦语",
+        "fi" => "芬兰语",
+        "no" => "挪威语",
+        "el" => "希腊语",
+        "pl" => "波兰语",
+        "cs" => "捷克语",
+        "hu" => "匈牙利语",
+        "ro" => "罗马尼亚语",
+        "bg" => "保加利亚语",
+        "hr" => "克罗地亚语",
+        "sk" => "斯洛伐克语",
         other => other,
     }
 }

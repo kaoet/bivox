@@ -61,6 +61,8 @@ pub(crate) struct AsrRuntime {
     model: String,
     ws_url: String,
     language_hints: Vec<String>,
+    /// 预编译热词列表 ID（D31）；`None` = 本次识别不使用热词。
+    vocabulary_id: Option<String>,
     io: AudioStreamState,
     /// 本地 VAD 发送门控；None 表示关闭（全量上传）
     gate: Option<SpeechGate>,
@@ -88,12 +90,15 @@ impl QwenAsrClient {
     ///
     /// `ws_url` 为百炼业务空间专属域名的 run-task 端点，
     /// 形如 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`。
+    ///
+    /// `vocabulary_id` 为百炼预编译热词列表 ID（D31）；`None` 表示不带热词。
     #[allow(clippy::too_many_arguments)]
     pub async fn run_duplex(
         api_key: String,
         model: String,
         ws_url: String,
         language_hints: Vec<String>,
+        vocabulary_id: Option<String>,
         gate: Option<SpeechGate>,
         rx_audio: Receiver<Vec<u8>>,
         tx_events: Sender<AsrEvent>,
@@ -104,6 +109,7 @@ impl QwenAsrClient {
             model,
             ws_url,
             language_hints,
+            vocabulary_id,
             io: AudioStreamState {
                 rx_audio,
                 tx_events,
@@ -119,6 +125,7 @@ impl QwenAsrClient {
         model: &str,
         ws_url: &str,
         language_hints: &[String],
+        vocabulary_id: Option<&str>,
     ) -> Result<(WsStream, String)> {
         let task_id = Uuid::new_v4().simple().to_string();
         let mut stream = ws::connect_authenticated(api_key, ws_url).await?;
@@ -132,6 +139,10 @@ impl QwenAsrClient {
         });
         if !language_hints.is_empty() {
             parameters["language_hints"] = json!(language_hints);
+        }
+        if let Some(vocabulary_id) = vocabulary_id.filter(|id| !id.is_empty()) {
+            // D31：预编译热词列表 ID；必须放在 payload.parameters 里。
+            parameters["vocabulary_id"] = json!(vocabulary_id);
         }
 
         let run_task_payload = json!({
@@ -314,6 +325,7 @@ impl ReconnectingSession for QwenAsrClient {
                 &state.model,
                 &state.ws_url,
                 &state.language_hints,
+                state.vocabulary_id.as_deref(),
             )
             .await?;
             Ok(Self::pump_session(ws_stream, &task_id, state, is_running).await)
@@ -420,6 +432,7 @@ mod tests {
             ws_url,
             vec!["zh".to_string()],
             None,
+            None,
             rx_audio,
             tx_events,
             is_running.clone(),
@@ -493,6 +506,7 @@ mod tests {
             "qwen-audio-3.1-asr-flash-streaming".to_string(),
             ws_url,
             vec!["zh".to_string()],
+            None,
             Some(gate),
             rx_audio,
             tx_events,
@@ -572,6 +586,7 @@ mod tests {
                 "fr".to_string(),
             ],
             None,
+            None,
             rx_audio,
             tx_events,
             is_running.clone(),
@@ -585,6 +600,68 @@ mod tests {
             value["payload"]["parameters"]["language_hints"],
             json!(["zh", "ja", "en", "ko", "fr"]),
             "language_hints 应原样传给服务端"
+        );
+        assert!(
+            value["payload"]["parameters"]
+                .get("vocabulary_id")
+                .is_none(),
+            "未配置热词时不应出现 vocabulary_id"
+        );
+
+        is_running.store(false, Ordering::SeqCst);
+        client.abort();
+        server.abort();
+    }
+
+    /// 配置了预编译热词时，run-task 应在 payload.parameters 里带 vocabulary_id（D31）。
+    #[tokio::test]
+    async fn sends_vocabulary_id_when_configured() {
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let _ = tx.send(value);
+            }
+            let _ = ws.next().await;
+        });
+
+        let (_tx_audio, rx_audio) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_events, _rx_events) = tokio::sync::mpsc::channel(8);
+        let is_running = Arc::new(AtomicBool::new(true));
+        let client = tokio::spawn(QwenAsrClient::run_duplex(
+            "sk-test".to_string(),
+            "qwen-audio-3.1-asr-flash-streaming".to_string(),
+            format!("ws://{addr}/api-ws/v1/inference"),
+            vec!["zh".to_string()],
+            Some("vocab-kaols-1".to_string()),
+            None,
+            rx_audio,
+            tx_events,
+            is_running.clone(),
+        ));
+
+        let value = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("应收到 run-task")
+            .expect("run-task 解析失败");
+        assert_eq!(
+            value["payload"]["parameters"]["vocabulary_id"], "vocab-kaols-1",
+            "vocabulary_id 必须放在 payload.parameters 里（D31）"
+        );
+        assert_eq!(
+            value["payload"]["parameters"]["language_hints"],
+            json!(["zh"]),
+            "vocabulary_id 与 language_hints 可以同时使用"
         );
 
         is_running.store(false, Ordering::SeqCst);

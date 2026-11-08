@@ -14,8 +14,8 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 
 - 纯 GUI（egui/eframe），便携模式：配置、缓存、日志都在 exe 同目录（D4）；
 - 内部全异步：tokio runtime 跑后台任务，eframe 占主线程（D5）；
-- 两个二进制：`kaols.exe`（GUI 主程序）与 `admin.exe`（百炼音色调试 CLI，不随发布包分发，D19）；
-- 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口，以及声音复刻 HTTP 接口；
+- 两个二进制：`kaols.exe`（GUI 主程序）与 `admin.exe`（百炼音色/热词调试 CLI，不随发布包分发，D19）；
+- 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口、声音复刻 HTTP 接口，以及 ASR 预编译热词管理 HTTP 接口（D31）；
 - 翻译模式（`[translate] enabled`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成，字幕以「译文 + 原文」双语呈现（M2，D26；独立 GUI 翻译页是 M3）；
 - 没有本地语音模型，运行必须联网并配置 API Key。
 
@@ -38,6 +38,10 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 
 实时页打字输入 ──(TypedInput 命令通道)──▶ 会话调度循环
   └─ 作为独立 TTS task 排到队尾（不打断播放；必要时先收口 ASR 当前句的 task，D24）
+
+会话启动（D31）：
+  配置 [asr] hotwords → 查 cache.json → create/update/query 百炼预编译热词列表
+    └─ vocabulary_id 写入 cache.json → 作为 ASR run-task 的 parameters.vocabulary_id
 
 翻译模式（`[translate] enabled = true`，D25）：
   ASR/打字文本 → 翻译模式分块（clause：标点离开尾部才切；sentence：只句终）
@@ -67,7 +71,13 @@ src/
 ├── single_instance.rs   Windows 命名 Mutex 单实例 + 激活已有窗口
 ├── config.rs            config.toml 解析、默认值、归一化、校验、URL/路径派生
 ├── config_edit.rs       toml_edit 定点写回（校验 + .bak）
+├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
+├── http.rs              百炼 HTTP JSON 接口的公共错误类型与响应解析
 ├── language.rs          语言代码集合、脚本统计、LanguageTracker、instruction 映射
+├── asr/
+│   ├── mod.rs           预编译热词运行期注册（创建/校验/更新/轮询/降级）
+│   ├── api.rs           百炼热词管理 HTTP API（speech-biasing 的 5 个 action）
+│   └── admin.rs         调试 CLI 的热词列表列出/删除纯逻辑
 ├── audio/
 │   ├── device.rs        设备枚举与完整名精确匹配
 │   ├── capture.rs       cpal 采集 → 单声道 16k PCM16 → 100ms chunk
@@ -86,7 +96,6 @@ src/
 ├── voice/
 │   ├── mod.rs           生效音色解析、样本复刻/缓存注册、语言→(voice_id, 语速) 映射
 │   ├── api.rs           百炼声音复刻 HTTP API（不依赖 SDK）
-│   ├── cache.rs         voice_cache.json（模型 → 音频 SHA256 → voice_id）
 │   ├── editor.rs        音色编辑草稿（config ↔ 草稿 ↔ 写回数据，纯函数）
 │   ├── admin.rs         调试 CLI 的纯逻辑（远程音色列出/删除）
 │   └── mock_http.rs     单元测试用的手写 HTTP mock
@@ -94,11 +103,12 @@ src/
 │   ├── toolbar.rs       顶栏：状态灯、VAD 指示器、开始/停止、版本号
 │   ├── realtime_tab.rs  实时页：字幕列表（底部嵌入打字输入行）
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
-│   ├── translate_tab.rs 翻译页：翻译模式开关、目标语言、粒度、显示原文
 │   ├── audio_tab.rs     音频页：输入/输出设备
+│   ├── asr_tab.rs       语音识别页：识别模型、有序语言列表、预编译热词
 │   ├── tts_tab.rs           语音合成页外壳：页头（保存/放弃）+ 中文方言 + 布局与草稿增删
 │   ├── tts_current_voice.rs 语音合成页：顶部「当前音色」选择
 │   ├── tts_voice_editor.rs  语音合成页：自定义音色样本编辑/排序/语速
+│   ├── translate_tab.rs 翻译页：翻译模式开关、目标语言、粒度、显示原文
 │   ├── settings_tab.rs  设置页：路径、API Key、配置概览
 │   ├── log_panel.rs     底部日志面板
 │   ├── widgets.rs       通用小部件（错误横幅、键值行、设备下拉）
@@ -112,14 +122,15 @@ src/
 |---|---|---|
 | `app` | 应用状态与所有 GUI 操作的编排；唯一同时接触 UI 与后台任务的地方 | 依赖几乎全部下层模块 |
 | `gui` | 只负责绘制和把用户操作转成 `KaolsApp` 方法调用 | 依赖 `app` 状态 |
-| `pipeline::session` | 一次实时会话的完整生命周期与调度 | 依赖 audio/client/language/chunker/voice |
+| `pipeline::session` | 一次实时会话的完整生命周期与调度 | 依赖 audio/client/language/chunker/voice/asr |
 | `client` | 协议实现；不感知 GUI，通过 channel 上报 | 依赖 `ws` 骨架与 `language` |
 | `audio` | 采集/播放/VAD；不感知 GUI | 独立 |
-| `voice` | 配置 → 音色解析/注册/缓存 | 依赖 config + 自身 HTTP 客户端 |
+| `voice` | 配置 → 音色解析/注册/缓存 | 依赖 config + `cache` + 自身 HTTP 客户端 |
+| `asr` | 预编译热词注册与管理 API；不感知 GUI | 依赖 config + `cache` + `http` |
 | `config`/`config_edit` | 配置模型与安全写回 | 独立（config_edit 依赖 config 校验） |
 | `events` | 跨线程数据结构 | 被 app 与 pipeline 共用 |
 
-两条 bin 共用同一个 lib；`admin` 只使用 `config` 与 `voice::{api, admin}`，不启动 GUI、不读写缓存。
+两条 bin 共用同一个 lib；`admin` 只使用 `config`、`voice::{api, admin}`、`asr::{api, admin}`，不启动 GUI、不读写缓存。
 
 ---
 
@@ -152,7 +163,8 @@ main()
 - 配置：`config: ConfigState`（`Loaded` / `Invalid`）、`api_key_input`、设备列表与当前设备；
 - 打字输入：`typed_input`（输入框内容）、`typed_input_error`（行内错误）；提交通过 `PipelineSessionHandle::speak_typed` 走命令通道；
 - 音色编辑：`voice_drafts`（未保存草稿）、`selected_voice`、`voice_mode` / `voice_input` / `voice_custom_key`；
-- 展示：`subtitles`、`log`、`vad_active`、错误横幅（`startup_error` / `pipeline_error` / `config_write_error` / `crash`）；
+- 语音识别编辑：`asr_model` / `asr_languages` / `asr_hotwords`（未保存草稿）、`asr_edit_error`；
+- 展示：`subtitles`、`log`、`vad_active`、错误/告警横幅（`startup_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
 - 生命周期：`closing`。
 
 `ConfigState::Invalid` 时程序仍可打开：设置页显示错误链，实时会话无法启动。
@@ -167,7 +179,7 @@ main()
 4. `request_close()`：处理关窗（见 3.5）；
 5. 绘制顶栏、底部日志面板（可拖拽高度）、CentralPanel 中的页签。
 
-页签顺序固定为：实时 / 音频 / 语音合成 / 设置。
+页签顺序固定为：实时 / 音频 / 语音识别 / 语音合成 / 翻译 / 设置。
 
 ### 3.4 会话启动
 
@@ -182,12 +194,14 @@ main()
 
 1. 检查 API Key；
 2. `voice::resolve_active_voice`（自定义音色可能上传/复刻，耗时不定），发 `VoiceInfo`；
-3. 按完整设备名打开输入/输出设备（失败直接结束会话），发 `Devices`；
-4. 创建播放引擎（TTS 输出 22050Hz）、启动采集（16kHz）；
-5. 启动 ASR、TTS 两个后台任务；
-6. 状态置 `Running`；
-7. 进入调度循环，直到停止或出错；
-8. 收尾（见 3.5）。
+3. `asr::resolve_vocabulary`（D31）：按 `[asr] hotwords` 创建/校验/更新百炼预编译热词列表，
+   写回 `vocabulary_id`；失败只发 `Warning` 并降级为不带热词；
+4. 按完整设备名打开输入/输出设备（失败直接结束会话），发 `Devices`；
+5. 创建播放引擎（TTS 输出 22050Hz）、启动采集（16kHz）；
+6. 启动 ASR、TTS 两个后台任务（ASR 带 `vocabulary_id`）；
+7. 状态置 `Running`；
+8. 进入调度循环，直到停止或出错；
+9. 收尾（见 3.5）。
 
 ### 3.5 停止、失败与关闭
 
@@ -212,7 +226,8 @@ main()
 ├── kaols.exe
 ├── config.toml          # 缺失时由内嵌模板生成
 ├── config.toml.bak      # 每次 GUI 写回前的完整备份
-├── voice_cache.json     # 路径可由 [tts] cache_file 改，默认同目录
+├── cache.json           # 本地共享缓存：音色 voice_id + ASR 预编译热词 vocabulary_id
+│                        # 路径可由 [cache] file 改，默认同目录
 ├── logs/kaols-YYYY-MM-DD.log
 └── crash.log            # panic 时生成
 ```
@@ -229,10 +244,11 @@ main()
 | | `workspace_host` | `dashscope.aliyuncs.com` | 纯 host；业务空间专属域名可覆盖 |
 | `[asr]` | `model` | `qwen-audio-3.1-asr-flash-streaming` | 实时识别模型 |
 | | `languages` | `["zh"]` | 有序；首个为默认；整份列表作为 `language_hints`；本地判定也使用完整列表 |
+| | `hotwords` | 空 | 预编译热词（有序；去空白/去空/去重）；权重固定 4、不限定语种；会话启动时自动同步（D31） |
+| `[cache]` | `file` | `cache.json` | 本地共享缓存（音色 + ASR 热词）路径，相对配置文件所在目录 |
 | `[tts]` | `model` | `qwen-audio-3.1-tts-flash` | 合成模型 |
 | | `voice` | `qiaoxiaojiao_v3.1` | 系统音色名 / 复刻 voice_id / `custom:<键名>` |
 | | `dialect` | `普通话` | 中文方言（官方 20 种 + 普通话）；仅中文任务经 `instruction` 生效（D29） |
-| | `cache_file` | `voice_cache.json` | 相对配置文件所在目录 |
 | | `custom_voices` | 空 | 键名 → { `name`, `samples[]`（每个样本含 `language` / `audio` / `rate`） } |
 | `[audio]` | `input_device` / `output_device` | 空 = 系统默认 | 完整设备名 |
 | `[vad]` | `enabled` | `true` | 关闭后全量上传 |
@@ -275,6 +291,7 @@ rate = 1.0
 - ASR/TTS model、TTS voice 非空；
 - `[tts] dialect` 必须在 `CHINESE_DIALECTS` 内（官方方言名；归一化只去首尾空白，不接受「粤语」等别名）；
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
+- `[asr] hotwords`：最多 2000 条；含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时 ≤7 个空格分隔片段；归一化时去空白、丢空条目、按首次出现去重；
 - 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
 - `[chunking] words > 0`；`[vad] margin_db` 必须是有限数；
 - `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`。
@@ -282,21 +299,21 @@ rate = 1.0
 **派生 URL**：
 
 - WebSocket（ASR/TTS 共用）：`wss://{workspace_host}/api-ws/v1/inference`
-- HTTP（声音复刻）：`https://{workspace_host}/api/v1`
+- HTTP（声音复刻 / ASR 热词管理共用基址）：`https://{workspace_host}/api/v1`
 - HTTP（翻译，OpenAI 兼容）：`https://{workspace_host}/compatible-mode/v1/chat/completions`
 
 ### 4.3 配置写回
 
 `src/config_edit.rs` 提供定点修改函数：
 
-- `set_api_key`、`set_audio_devices`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`；
+- `set_api_key`、`set_audio_devices`、`set_asr`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`；
 - 统一入口 `save(path, original, updated)`：无改动直接返回；否则先用 `AppConfig::from_toml_str` 校验新文本，失败不落盘；成功后把原文件复制为 `config.toml.bak`，再写盘。
 
-`toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）。
+`toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）；`set_asr` 的 `hotwords` 为空时删除该键。
 
 ### 4.4 配置指纹与热更新
 
-`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言、TTS 模型/音色/方言/缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
+`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言/热词、TTS 模型/音色/方言、缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
 
 写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。
 
@@ -321,6 +338,7 @@ rate = 1.0
 ```
 
 - `PipelineEvent` 字段以 `src/events.rs` 为唯一事实源；事件不携带 egui 类型。
+- `Warning`：用户可感知但不影响会话继续的降级（例如预编译热词注册失败，D31），界面显示黄色「运行告警」条，可手动清除。
 - `TypedSentence`：会话接受一句打字输入、已交给 TTS 排队后发给界面（进字幕历史）。
 - `Translation`：翻译模式下的译文（可能随 ASR 修订多次到达），`language` 固定为目标语言；界面用它累积译文行，句终时与原文行一起进历史（M2，D26）。
 - 翻译模式下 `Asr` 事件语义：`sent_bytes` = 已送翻译的源文长度、`is_sentence_end` 恒为 `false`、`language` = 源语言；句终与当前行收口一律由 `Translation` 负责（D26）。
@@ -342,7 +360,7 @@ rate = 1.0
 
 ### 6.2 ASR 协议
 
-- 建连后发 `run-task`：`task_group=audio`、`task=asr`、`function=recognition`、配置的模型；参数 `format=pcm`、`sample_rate=16000`、`vad_model=near_meeting_16k`、`heartbeat=true`、`language_hints=<完整 [asr] languages>`。
+- 建连后发 `run-task`：`task_group=audio`、`task=asr`、`function=recognition`、配置的模型；参数 `format=pcm`、`sample_rate=16000`、`vad_model=near_meeting_16k`、`heartbeat=true`、`language_hints=<完整 [asr] languages>`；配置了预编译热词时再加 `vocabulary_id=<D31 解析出的列表 ID>`。
 - 等待 `task-started`；`task-failed` 视为握手失败并触发重连。
 - 双向流式：一边把（可经 VAD 门控的）PCM 二进制帧发上去，一边读 JSON 事件。
 - `result-generated` 中取 `payload.output.sentence`：忽略 `heartbeat=true` 与空文本，其余转成 `AsrEvent { text, is_sentence_end, sentence_id }` 送入会话调度。
@@ -469,6 +487,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 - `drafts_from_config`：配置 → `VoiceDraft`（键名、显示名、有序样本，样本含语言、音频路径与 `rate`），按显示名/键名排序；
 - 界面只改草稿，直到点「保存」才写回；每个样本一行「语速」滑条（0.5–2.0，步长 0.05）与「重置」；
+- 语音识别页的草稿与保存规则见 D32；热词不是草稿的一部分，保存后由下一次会话启动同步（D31）。
 - `drafts_to_entries` 校验：键名非空且唯一、每个音色至少一个样本、语言合法且归一后唯一、音频路径非空、`rate` 为有限数且在 0.5–2.0 内；
 - 音频路径策略：选中的文件在 exe 目录内 → 存相对路径；目录外 → 存绝对路径并在界面提示可能破坏便携性；
 - 保存前还会检查每个样本音频文件存在；写回走 `config_edit::set_custom_voices`（整体替换该表）。
@@ -488,7 +507,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 百炼音色前缀由配置键名自动生成：仅保留 ASCII 字母/数字、转小写，最多 10 字符；多语言样本追加语言后缀（如 `edgarzh`）。
 
-### 11.4 `voice_cache.json`
+### 11.4 `cache.json`
 
 ```json
 {
@@ -502,20 +521,30 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
         "created_at": 1730000000
       }
     }
+  },
+  "asr_hotwords": {
+    "qwen-audio-3.1-asr-flash-streaming": {
+      "vocabulary_id": "vocab-kaols-...",
+      "hotwords": ["原神"],
+      "updated_at": 1730000000
+    }
   }
 }
 ```
 
-- 两层结构：TTS 模型 → 音频内容 SHA256 → 记录；同一音频在不同模型下分别缓存，切换模型不覆盖其它模型记录。
-- 保存是“临时文件 + rename”的原子写；解析失败时把旧文件备份为 `voice_cache.json.bak` 并以空缓存重建。
+- `voices` 两层结构：TTS 模型 → 音频内容 SHA256 → 记录；同一音频在不同模型下分别缓存，切换模型不覆盖其它模型记录（D11）。
+- `asr_hotwords`：ASR 模型 → 预编译热词列表 ID + 词条快照 + 最后更新时间；用于下次会话复用、校验与 5 分钟更新限速（D31）。
+- 保存是“临时文件 + rename”的原子写；解析失败时把旧文件备份为 `cache.json.bak` 并以空缓存重建。
 - 本机状态，不提交、不参与同步；孤儿条目无害，v1 不提供清理入口（D11）。
 
 ### 11.5 `admin` 调试 CLI
 
-- 命令：`list`、`delete --voice-id <id>...`、`delete-all [-y]`；默认读工作目录 `./config.toml`，`-c` 可覆盖。
-- 只做远程音色管理：不读写 `voice_cache.json`、不 enroll、不做 prefix 过滤。
-- 列表要求完整分页（否则报错，避免“半截列表”被误认为全部）；删除区分“已删除”与“本来就不存在”；批量删除给出成功/已不存在/失败三类汇总。
-- 逻辑在 `voice/admin.rs`，用 mock HTTP 单测；bin 只负责参数与终端输出。
+- 音色命令：`list`、`delete --voice-id <id>...`、`delete-all [-y]`；默认读工作目录 `./config.toml`，`-c` 可覆盖。
+- 热词命令：`vocab list`、`vocab delete --vocabulary-id <id>... [-y]`。
+- 只做远程管理：不读写 `cache.json`、不 enroll、不创建/更新热词列表、不做 prefix 过滤。
+- 列表要求完整分页（否则报错，避免“半截列表”被误认为全部；热词列表官方响应没有 total，靠短页判断）；删除区分“已删除”与“本来就不存在”；批量删除给出成功/已不存在/失败三类汇总。
+- 热词不提供 delete-all：无法区分是否为其它应用创建的列表，避免误删（D31）。
+- 逻辑在 `voice/admin.rs` 与 `asr/admin.rs`，用 mock HTTP 单测；bin 只负责参数与终端输出。
 
 ---
 
@@ -528,13 +557,15 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 | 页签 | 职责 | 关键行为 |
 |---|---|---|
 | 实时 | 字幕列表 + 打字输入 | 当前句在最上、历史句新→旧；语言列 + 进度分色 + 单句复制（D16）；翻译模式下每条字幕为「译文大字行 + 原文小字行」，两行各自复制，`show_source=false` 只渲染译文行（D26）；底部多行输入框（默认 1 行、约 4 行封顶后内部滚动）Shift+Enter 换行、Enter/「朗读」排队朗读打字输入（D24），仅运行中可提交，上限 500 字符 |
-| 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
 | 音频 | 输入/输出设备 | 设备下拉保存完整设备名；改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告 |
+| 语音识别 | 识别模型 + 有序语言列表 + 预编译热词 | 模型输入框（可恢复默认）；语言列表逐行上移/下移/删除 + 下拉追加（首个为默认，>4 种提示 `language_hints` 只用前 4 个）；热词多行文本框（一行一个，权重固定 4）；Tab 级保存/放弃更改（一次写回 `[asr] model/languages/hotwords`，D32）；运行中保存触发 D20 热重启；热词在下一次会话启动时自动同步到百炼（D31） |
 | 语音合成 | 当前音色 + 中文方言 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色 + 中文方言下拉（选项来自 `CHINESE_DIALECTS`，默认普通话）；Tab 级保存/放弃更改（一次写回 `[tts] voice`/`dialect`/`custom_voices`）；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳/方言/列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
-| 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/模型/语言/音色/方言；配置无效时显示错误链 |
+| 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
+| 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/识别模型/识别语言/预编译热词条数/合成模型/音色/方言；配置无效时显示错误链 |
 
-- 错误展示：启动横幅（黄）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
+- 错误展示：启动横幅（黄）、运行告警（黄，可清除，D8/D31）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
 - 语音合成页的“脏”状态 = 音色草稿 / 当前音色 / 中文方言任一与配置不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
+- 语音识别页的“脏”状态 = 模型 / 语言列表 / 归一化后的热词列表任一与配置不一致（空行/重复项不算改动）。
 - 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `app::SubtitleState` 的纯函数维护（普通模式 `apply_asr` / `push_typed`；翻译模式 `apply_source` / `apply_translation`），并有单测覆盖。
 - 打字输入行在 `gui/typed_input.rs`：多行输入，Shift+Enter 换行、Enter 提交并保持焦点；Windows 的 IME 确认候选由 egui-winit 的 `VK_PROCESSKEY` 过滤，不会误提交。
 
@@ -542,8 +573,8 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **179** 个（以 `cargo test` 输出为准）。
-- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、VAD、单实例命名等纯逻辑。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **215** 个（以 `cargo test` 输出为准）。
+- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
 - 静态截图：glow 变体 + `EFRAME_SCREENSHOT_TO`（wgpu 不支持该调试特性）。
@@ -557,7 +588,9 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - **仅 Windows 10/11 x64**；无跨平台、无安装器、无自动更新。
 - `[tts.custom_voices]` 整体重写会丢失该表内部注释（表外保留，D3）。
 - 设备热插拔不自动感知，只能点「刷新设备」；配置的设备名对不上时不会回退默认设备（D12）。
-- `voice_cache.json` 的孤儿条目（配置删了音色、缓存仍在）不主动清理；云端音色被删除时靠下次会话启动的校验自动重建（D11/D19）。
+- `cache.json` 的孤儿条目不主动清理：配置删了音色/热词记录仍保留；云端音色被删除时靠下次会话启动的校验自动重建（D11/D19）；云端热词列表被删除时自动重建（D31）。
+- 预编译热词仅华北2（北京）/新加坡地域、**仅主业务空间**支持；子业务空间或其它地域会创建失败并降级为不带热词识别（黄色告警）。
+- 每账号最多 50 个预编译热词列表；换 ASR 模型会新建列表，旧列表需用 `admin vocab delete` 清理；每次列表创建/更新后生效时间受百炼部署延迟影响，更新还受「两次间隔 ≥5 分钟」限制（D31）。
 - 跨机便携（拷贝整个目录到另一台机器）没有自动化测试，发布前需人工冒烟。
 - 中文方言的效果取决于音色是否支持方言指令：复刻音色支持官方 20 种方言，`qwen-audio-3.1-tts-flash` 的 4 个多语种/方言系统音色仅支持 8 种，其余系统音色可能只支持普通话。程序不做音色能力探测，不支持的组合可能仍按普通话合成（D29）。
 - `AudioPlaybackHandle::interrupt` 与 `AudioCapture::stop` 当前没有调用方（预留接口）；播放/采集的生命周期由 drop 控制。
@@ -585,3 +618,22 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - **双语渲染**：实时页一条字幕 = 译文大字行（24pt）+ 原文小字弱色行（15pt），两行各有语言列、各自复制；`show_source = false` 只渲染译文行（D26）。
 - **失败处理**：翻译失败发 `PipelineEvent::Error`（D8），该片段不送 TTS，后续片段继续。
 - **验证**：`cargo test` 覆盖 qwen_mt 协议/重试/错误、chunker 安全尾、config 校验与语言表、字幕双语 reducer；运行期用真实接口 + 打字输入验证 zh→en / zh→ja 双语字幕与源/译文各自复制，`show_source` 热加载即时生效，ASR 语音路径用环境语音间接验证；M3 用「翻译」页验证开关/目标语言/粒度改动触发 D20 热重启、`show_source` 不重启、配置写回保留 `model`。
+
+---
+
+## 16. ASR 预编译热词（D31）
+
+`[asr] hotwords` 由会话启动时的 `asr::resolve_vocabulary` 同步为百炼预编译热词列表：
+
+1. 空列表 → 直接返回 `None`，不访问网络；
+2. 加载 `cache.json`，按 ASR 模型查 `asr_hotwords`；
+3. 命中缓存 → `query_vocabulary` 校验（资源不存在则重建；网络异常沿用缓存 ID）；
+4. 词表未变 → 复用；词表变化且距 `updated_at` ≥5 分钟 → `update_vocabulary` 全量替换并更新缓存；
+5. 无缓存 → `create_vocabulary`（`target_model` = `[asr] model`，prefix 固定 `kaols`），
+   **立即把 `vocabulary_id` 写入 `cache.json`**，再轮询 `query_vocabulary` 到 `status == "OK"`（最多 60s）；
+6. 结果交给 `pipeline::session`，注入 ASR run-task 的 `payload.parameters.vocabulary_id`。
+
+- 词条格式：`{"text": "...", "weight": 4}`；不传 `lang` —— 识别同时带 `language_hints` 时只有语种匹配的词条生效，省略后词条对所有语言生效。
+- 失败降级：任何一步失败都不阻断会话，发 `PipelineEvent::Warning`，本次识别不带最新热词；有旧 ID 时沿用旧词表。
+- 限速：官方建议两次更新间隔 ≥5 分钟；未满时保留旧快照并提示，下次启动自动重试，避免「缓存已更新、百炼未生效、之后不再重试」。
+- 管理 API 走 `https://{workspace_host}/api/v1/services/audio/asr/customization`，`model = speech-biasing`，由 `asr/api.rs` 实现；admin 调试 CLI 只做列表/删除（D19）。
