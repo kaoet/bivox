@@ -77,7 +77,7 @@
 # 多语言样本追加语言代码（如 edgarzh / edgarja），单语言直接使用。
 # 建议配置键名使用 ASCII 小写字母/数字（非 ASCII 键名净化后可能为空，回退 voice 或只剩语言代码）。
 # 样例音频要求：清晰单说话人、至少约 5 秒（推荐 10~20 秒，单条建议不超过 60 秒，≤10 MB），
-# 可用 wav/mp3/m4a，尽量无背景音乐。
+# 可用 wav/mp3/m4a，尽量无背景音乐；复刻时只取前 20 秒（max_prompt_audio_length，D30）。
 #
 # [tts.custom_voices.edgar]
 # name = "异环 - 埃德嘉"      # 可选，显示名（默认用配置名）

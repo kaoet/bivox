@@ -233,18 +233,23 @@ impl BailianVoiceApi {
     ///
     /// `audio_source` 可以是公网/文件服务 URL（本项目用上传后拿到的临时 URL），
     /// 也可以是 Base64 Data URI；使用官方推荐的 `audio` 参数（旧的 `url` 参数将废弃）。
+    ///
+    /// `max_prompt_audio_length`：预处理后参与复刻的参考音频最大时长（秒，官方范围
+    /// [3.0, 30.0]、默认 10.0）。本项目固定传 20 秒（D30），避免默认值截断推荐长度的样本。
     pub async fn create_voice(
         &self,
         target_model: &str,
         prefix: &str,
         audio_source: &str,
         language: Option<&str>,
+        max_prompt_audio_length: f32,
     ) -> Result<String> {
         let mut input = json!({
             "action": "create_voice",
             "target_model": target_model,
             "prefix": prefix,
             "audio": audio_source,
+            "max_prompt_audio_length": max_prompt_audio_length,
         });
         if let Some(language) = language.map(str::trim).filter(|lang| !lang.is_empty()) {
             input["language_hints"] = json!([language]);
@@ -602,6 +607,7 @@ mod tests {
                 "kaoet1a2b",
                 "https://oss/x.wav",
                 Some("zh"),
+                20.0,
             )
             .await
             .unwrap();
@@ -620,6 +626,10 @@ mod tests {
         );
         assert!(body["input"].get("url").is_none(), "不应再传旧的 url 参数");
         assert_eq!(body["input"]["language_hints"][0], "zh");
+        assert_eq!(
+            body["input"]["max_prompt_audio_length"], 20.0,
+            "应显式传参考音频时长上限（D30）"
+        );
     }
 
     #[tokio::test]
@@ -629,7 +639,7 @@ mod tests {
                 .await;
         let api = test_api(&server);
 
-        api.create_voice("model", "prefix12", "https://oss/x.wav", None)
+        api.create_voice("model", "prefix12", "https://oss/x.wav", None, 20.0)
             .await
             .unwrap();
 
@@ -649,7 +659,7 @@ mod tests {
         let api = test_api(&server);
 
         let err = api
-            .create_voice("model", "bad-prefix", "https://oss/x.wav", None)
+            .create_voice("model", "bad-prefix", "https://oss/x.wav", None, 20.0)
             .await
             .unwrap_err();
         let text = format!("{err:#}");

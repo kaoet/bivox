@@ -34,6 +34,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// 百炼样例音频大小上限（10 MB）。
 const MAX_AUDIO_BYTES: usize = 10 * 1024 * 1024;
 
+/// 复刻时使用的参考音频最大时长（秒），官方 `max_prompt_audio_length`（D30）。
+///
+/// 官方范围 [3.0, 30.0]、默认 **10.0**；默认值会把「推荐 10~20 秒」样本的后半截静默丢掉，
+/// 因此显式取 20 秒，与 README/配置模板的推荐区间一致。样例音频超过该时长时，
+/// 只有前 20 秒（预处理后）参与复刻。
+const MAX_PROMPT_AUDIO_LENGTH: f32 = 20.0;
+
 /// 当前生效的音色：系统音色，或带多语言声线样本的自定义音色。
 #[derive(Debug, Clone)]
 pub enum ActiveVoice {
@@ -500,7 +507,13 @@ async fn enroll_one(
             prefix.cyan()
         );
         let voice_id = api
-            .create_voice(target_model, prefix, &audio_url, Some(language_code))
+            .create_voice(
+                target_model,
+                prefix,
+                &audio_url,
+                Some(language_code),
+                MAX_PROMPT_AUDIO_LENGTH,
+            )
             .await?;
         log::info!("⏳ 音色 {voice_id} 已创建，等待百炼完成复刻部署...");
         api.wait_until_ready(&voice_id, READY_TIMEOUT).await?;
@@ -561,7 +574,7 @@ fn sample_prefix(config_name: &str, language_code: Option<&str>) -> String {
     prefix
 }
 
-/// WAV 样例音频的本地预检。
+/// WAV 样例音频的本地预检（官方音频要求 + 复刻时长上限，D30）。
 fn check_audio_duration(bytes: &[u8], display_name: &str, language_code: &str) -> Result<()> {
     const MIN_SECONDS: f64 = 5.0;
     const RECOMMENDED_MAX_SECONDS: f64 = 60.0;
@@ -585,6 +598,11 @@ fn check_audio_duration(bytes: &[u8], display_name: &str, language_code: &str) -
         log::warn!(
             "⚠️ 自定义音色「{display_name}」语言 {language_code} 的样例音频较长（{seconds:.1} 秒），\
              建议裁剪到 10~20 秒（官方建议单条不超过 60 秒）以获得更好的复刻效果"
+        );
+    } else if seconds > f64::from(MAX_PROMPT_AUDIO_LENGTH) {
+        log::info!(
+            "ℹ️ 自定义音色「{display_name}」语言 {language_code} 的样例音频 {seconds:.1} 秒，\
+             其中只有前 {MAX_PROMPT_AUDIO_LENGTH:.0} 秒会参与复刻"
         );
     }
     Ok(())
@@ -732,6 +750,25 @@ mod tests {
         assert_eq!(resolved.default_language, "zh");
         assert_eq!(mock.created.load(Ordering::SeqCst), 2, "两个语言各复刻一次");
         assert_eq!(cache.len(), 2);
+
+        // 创建音色必须显式带参考音频时长上限（D30）
+        let prompt_lengths: Vec<f64> = mock
+            .server
+            .requests()
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_str(&request.body_text()).ok()?;
+                if body["input"]["action"] != "create_voice" {
+                    return None;
+                }
+                body["input"]["max_prompt_audio_length"].as_f64()
+            })
+            .collect();
+        assert_eq!(
+            prompt_lengths,
+            vec![f64::from(MAX_PROMPT_AUDIO_LENGTH); 2],
+            "每个音色创建请求都应带 max_prompt_audio_length"
+        );
 
         // 再跑一次（重新读取缓存）：应全部命中，不再创建
         let mut cache = VoiceCache::load(&cache_path).unwrap();

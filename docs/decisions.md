@@ -565,6 +565,27 @@
 
 ---
 
+## D30 复刻参考音频时长上限：固定 20 秒（`max_prompt_audio_length`）
+
+**决定**
+
+- 创建复刻音色（`voice-enrollment` / `create_voice`）时显式传 `input.max_prompt_audio_length = 20.0`，即 `src/voice/mod.rs` 的 `MAX_PROMPT_AUDIO_LENGTH`；官方默认值 `10.0`，取值范围 `[3.0, 30.0]`。
+- 该值**不做配置项**：它只影响一次性复刻结果，没有运行时调节需求；一旦可配，就必须并入 `voice_cache.json` 的缓存键（现为「模型 + 音频 SHA256」）与 D20 配置指纹，否则改值不生效，代价大于收益。
+- 本地预检仍按官方音频要求：WAV <5 秒报错、>60 秒警告；样例 >20 秒时日志提示只有前 20 秒参与复刻。
+
+**理由**
+
+- 官方音频要求推荐 10~20 秒样本，默认 `10.0` 会把推荐区间的后半截静默丢掉；取 20 秒与 README/配置模板的推荐区间一致。
+- 复刻免费且只发生一次，不影响合成延迟；固定常量避免新增配置面（D3 写回白名单、GUI 概览、校验、热重启指纹都要跟着改）。
+
+**边界**
+
+- 已缓存的音色不会自动按新值重做（缓存命中即跳过复刻）；要让某个音色重新复刻，需删掉 `voice_cache.json` 中对应条目（或整个文件）。
+- 官方文档标注该参数适用于 qwen-audio-3.0/3.1-tts、qwen-audio-3.x-realtime、cosyvoice-v3.5/v3；其它模型是否接受未验证（与 `language_hints` 同为无条件发送的既有做法）。
+- `enable_preprocess` / `enable_volume_normalization` 保持服务端默认（false），不在本决定范围内。
+
+---
+
 1. 先确认这是**长期约束**，而不是一次实现细节；实现细节写进 [architecture.md](./architecture.md)。
 2. 新决定用下一个编号；被替代的决定保留编号并标注“由 Dxx 取代/细化”，不要重排编号。
 3. 同步检查 `architecture.md` 与源码注释中的 `D<n>` 引用。
