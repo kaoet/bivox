@@ -2,7 +2,7 @@
 
 本文件面向**开发与贡献者**（以及需要维护本仓库的 AI 编码代理），是项目开发流程、编码规范与发布流程的**唯一权威来源**。
 
-- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D32`）
+- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D33`）
 - 模块、数据流与算法：[`docs/architecture.md`](docs/architecture.md)
 - 用户使用说明：[`README.md`](README.md)
 - AI 代理入口：[`AGENTS.md`](AGENTS.md)（只做导航，不重复本文件规则）
@@ -72,6 +72,7 @@ cargo test                # 全部单元测试
 | 纯函数（配置校验、TOML 写回、音色草稿、字幕 reducer、语言判定、分块） | 同模块 `#[cfg(test)]` 单测 |
 | WebSocket 协议/重连 | 测试内本地 `TcpListener` mock |
 | 音色 HTTP 接口 | `voice/mock_http.rs` |
+| VRChat 聊天框合成/截断/OSC 编码 | 同模块 `#[cfg(test)]` 单测；1 秒节流/清空可注入时钟或用本地 UDP loopback |
 | UI 交互 / 视觉 | 不写自动化 UI 测试（不使用 `egui_kittest`，D14）；用 egui_mcp 运行期观测 + 截图 |
 | 发布前整体行为 | 人工冒烟（见第 8 节） |
 
@@ -195,7 +196,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 ### 配置与便携模式
 
-- `config.toml` 是唯一配置事实源；GUI 只能写：`[api] key`、`[audio]` 设备、`[asr] model` / `[asr] languages` / `[asr] hotwords`（「语音识别」页）、`[tts] voice` / `[tts] dialect` / `[tts.custom_voices]`、`[translate] enabled` / `target` / `granularity` / `show_source`（「翻译」页）；`[vad]` / `[chunking]` 等仍只读；
+- `config.toml` 是唯一配置事实源；GUI 只能写：`[api] key`、`[audio]` 设备、`[asr] model` / `[asr] languages` / `[asr] hotwords`（「语音识别」页）、`[tts] voice` / `[tts] dialect` / `[tts.custom_voices]`、`[translate] enabled` / `target` / `granularity` / `show_source`（「翻译」页）、`[vrchat.osc] enabled` / `port` / `display`（「VRChat」页）；`[vad]` / `[chunking]` 等仍只读；
 - 写回使用 `toml_edit` 定点修改：写前用 `AppConfig::from_toml_str` 校验、写前备份 `config.toml.bak`、无改动不写盘；
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
 - 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md`；
@@ -234,7 +235,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 | 开发流程、规范、测试、发布、调试 | 本文件 | 其它文档只引用，不复制 |
 | AI 代理入口 | `AGENTS.md` | 只做导航与阅读顺序 |
 | 模块/数据流/算法 | `docs/architecture.md` | 当前实现的“怎么做” |
-| 设计决定与理由 | `docs/decisions.md` | `D1`–`D32`，编号稳定 |
+| 设计决定与理由 | `docs/decisions.md` | `D1`–`D33`，编号稳定 |
 | 配置字段与默认值 | `config.example.toml` | 编译期内嵌为首次启动模板 |
 | 语言代码集合 | `src/language.rs` | README 的用户表格据此维护 |
 | 模块职责概览 | `docs/architecture.md` | 本文件不重复维护目录树 |

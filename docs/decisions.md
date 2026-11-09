@@ -59,6 +59,7 @@
   5. `[translate] enabled` / `target` / `granularity` / `show_source`（D25/D26；`model` 仍只读）
   6. `[tts] dialect`（D29）
   7. `[asr] model` / `languages` / `hotwords`（D32；`[vad]`/`[chunking]` 仍只读）
+  8. `[vrchat.osc] enabled` / `port` / `display`（D33）
 - 其余字段（`[tts] model`、`[cache] file`、`[vad]`、`[chunking]`、`[api] workspace_host` 等）只读：设置页展示当前值，用户手改后点「重新加载配置」。
 - 写回流程：读原文本 → 用 `toml_edit` 定点修改 → 用 `AppConfig::from_toml_str` 校验整份新文本 → 备份 `config.toml.bak` → 写盘。没有实际改动时不写盘、不产生备份；校验失败不落盘。
 - API Key 以**明文**保存在 `config.toml`；界面与 README 都提示该文件含密钥、勿分享。
@@ -359,10 +360,12 @@
   2. 收到旧会话的 `StateChanged(Idle)` 后，用新配置自动 `start_session()`。
 - `Stopping`/`Idle`/`Failed` 不触发自动重启；关窗时清除 pending；重启失败只报一次错，不自动重试（避免坏配置/不可用设备形成重启循环）。
 - 指纹必须**顺序稳定**：手工拼接会影响运行的字段，自定义音色按配置名排序；不能直接 `format!("{config:?}")`（`HashMap` 的 Debug 顺序随实例随机，会导致每次保存都误判为变化）。
+- **例外**：`[vrchat.*]` 全部不进指纹（D33）。OSC 聊天框是旁路文本输出，开关/端口/显示模式由独立后台任务通过 watch 实时读取，改设置不重启实时管线。
 
 **理由**
 
 - 用户改 Key/设备/音色后立即生效，不必手动停止再开始；同时避免误判和重启风暴。
+- VRChat 设置与 ASR/TTS 生命周期解耦：重启会丢当前句、重新解析音色/热词，代价远大于收益。
 
 ---
 
@@ -484,7 +487,7 @@
 **决定**
 
 - 翻译模式下一"条"字幕由两行组成：**译文大字行**（24pt）在上、**原文小字行**（15pt，弱色）在下；两行各自有语言列（译文行=目标语言，原文行=源语言）。`show_source = false` 时只渲染译文行，行为与 M1 相同。
-- 字幕 reducer（`app::SubtitleState`）在 `translation_mode` 下拆成两个纯函数：`apply_source`（只刷新原文与「已送翻译」前缀，不句终）与 `apply_translation`（累积译文；句终时把「原文 + 译文」作为一条历史记录落库；同一 `sentence_id` 去重；空译文句终只清当前行、不落历史）。
+- 字幕 reducer（`subtitles::SubtitleState`）在 `translation_mode` 下拆成两个纯函数：`apply_source`（只刷新原文与「已送翻译」前缀，不句终）与 `apply_translation`（累积译文；句终时把「原文 + 译文」作为一条历史记录落库；同一 `sentence_id` 去重；空译文句终只清当前行、不落历史）。
 - 事件契约：翻译模式下 `PipelineEvent::Asr` 的 `sent_bytes` = 已送翻译的**源文**字节长度、`is_sentence_end` 恒为 `false`、`language` = 源语言；句终与当前行收口由 `PipelineEvent::Translation` 负责（其 `sent_bytes` = 已送 TTS 的**译文**字节长度）。非翻译模式下 `Asr` 语义与行为不变。
 - 原文行与译文行**各自**可复制：悬停对应行时该行右端显示复制图标，复制的是该行完整文本（原文行复制源文、译文行复制译文）。
 - `show_source` **不进**配置指纹：修改后「重新加载配置」即时改变渲染，不重启会话；`enabled/target/model/granularity` 进指纹，运行中变更按 D20 热重启。
@@ -651,6 +654,50 @@
 - 模型是自由文本，手误输入不支持的热词模型时，热词创建可能失败并降级（黄色告警），但 ASR 仍按该模型尝试启动。
 - 热词词条语种不可配置（D31）：同一份词表对所有 `language_hints` 生效。
 - 热词上传产生的 `vocabulary_id` 不在 GUI 中展示；用 `admin vocab list` 查看、`admin vocab delete` 删除。
+
+---
+
+## D33 VRChat OSC 聊天框输出
+
+**决定**
+
+- `config.toml` 新增父段 `[vrchat]` 与子段 `[vrchat.osc]`（父段为未来 VRChat 功能预留）：
+  - `enabled`（默认 `false`）、`port`（默认 `9000`）、`display`（`source` / `bilingual` / `translation`，默认 `bilingual`）；
+  - `port` 必须为 1–65535；GUI 可写这三个字段（D3 白名单扩展）。
+- GUI 在「语音合成」与「翻译」之间新增「VRChat」页：启用开关、发送端口、三种显示模式、发送测试消息。
+  - 翻译模式未开启时三种模式仍可编辑，页面不写额外提示；
+  - 不做状态行、typing 说明或隐私提示；发送失败只写日志；
+  - 「发送测试消息」**立即发送**，不受 1 秒文本节流约束，不改变 typing。
+- 发送端固定向 `127.0.0.1:port` 发 `/chatbox/input`，参数 `(text, true, false)`：
+  - `true` = immediate（绕过键盘直接显示），`false` = 不播放通知音；
+  - 一条消息一个 UDP 包，不使用 OSC bundle；
+  - 用 `rosc` 编码、`std::net::UdpSocket` 发送；不 bind 9000，源端口临时分配。
+- 文本最小发送间隔固定 **1000ms**（2026-11-08 实测：900ms 长跑跳字；1000ms + 144 字符 + 每秒 typing 稳定）：
+  - 1 秒内多次变化只发最新内容；相同文本只在同一段显示内去重；
+  - 新当前句/打字输入会重置去重记忆，避免上一段自然过期后同样文本不再显示。
+- **typing**：`/chatbox/typing true` 只在当前句活跃时打开，句终/清空时关闭；只在状态跳变时发送。
+  实测 typing 不占文本的 1 条/秒预算（1000ms 文本 + 每秒 typing 连续 120 秒正常）。
+- **聊天框持久性**：正常句终后保留最后文本，由 VRChat 约 30 秒自然过期，不做 5 秒强制清空；
+  停止会话/失败/关闭 OSC/关窗时显式发空字符串清空（已实测立即生效）。
+- 文本最长 144 字符 / 9 行（UTF-16 码元预算）：
+  - 超长时**保留句尾**，用前导 `…` 代替被截掉的句头；
+  - 双语时译文优先分配预算，源文用剩余预算，两条都保尾；
+  - 超过 9 行时保留尾部行。
+- 三种显示模式只对翻译模式生效；非翻译模式固定显示 ASR 原文。
+  - `bilingual` 顺序为「译文\n原文」；
+  - `translation` 模式译文未到时保留上一帧，不临时显示原文。
+- 架构：独立 tokio 任务 `ChatboxService` 消费 `PipelineEvent` 的克隆，不依赖 GUI 重绘；
+  - 会话 `emit` 同时发 GUI 与 OSC 两个通道；
+  - 设置通过 `watch` 实时同步；`[vrchat.*]` 不进配置指纹（D20 例外），改设置不重启实时管线；
+  - VRChat 未运行是正常状态，UDP 发送失败只记 debug 日志，不弹错误横幅。
+
+**理由**
+
+- 聊天框是旁路文本输出，不应耦合 ASR/TTS 生命周期；独立任务保证窗口最小化/VR 全屏时仍持续更新。
+- 本机实测 900ms 长跑跳字、1000ms 稳定，因此固定 1 秒；社区 1500ms 偏保守，但作为边界参考保留在调研文档中。
+- typing 只在跳变时发，既能让观众区分当前句/历史文本，又不增加可感知的限流压力。
+- 30 秒自然过期是 VRChat 的兜底行为；放弃 5 秒清空可减少无意义消息，停止/关闭仍显式清空避免残留。
+- 截断保尾是因为句尾信息量最大；复用 `SubtitleState` 归约语义避免 D16/D26 字幕行为在聊天框侧漂移。
 
 ---
 

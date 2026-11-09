@@ -1,9 +1,10 @@
 # VRChat OSC 聊天框字幕：调研与实现方案
 
-> 调研日期：2026-11-08
-> 状态：**未改主程序代码**。本文是实现前的调研与方案，不进入当前事实源；实施时应把结论合并进
-> [`docs/decisions.md`](../decisions.md)（新增 `D33`）、[`docs/architecture.md`](../architecture.md)、
-> [`README.md`](../../README.md) 与 [`config.example.toml`](../../config.example.toml)。
+> 调研日期：2026-11-08；实施日期：2026-11-09
+> 状态：**已实施**。本文保留调研过程、限流/持久性实测数据与设计推演；
+> 实现与长期约束以 [`docs/decisions.md`](../decisions.md) 的 `D33`、
+> [`docs/architecture.md`](../architecture.md) 第 17 节、[`README.md`](../../README.md)
+> 与 [`config.example.toml`](../../config.example.toml) 为准。
 >
 > **v5 修订（2026-11-08 UI 精简，按你的要求）**
 > - 翻译模式未开启时，三种显示模式仍可编辑，但**不显示灰色提示**；

@@ -8,7 +8,7 @@
 
 1. [`CONTRIBUTING.md`](CONTRIBUTING.md) —— 强制门禁、代码/注释规范、测试、文档维护、发布流程；
 2. [`docs/architecture.md`](docs/architecture.md) —— 模块划分、数据流、关键算法与边界；
-3. [`docs/decisions.md`](docs/decisions.md) —— `D1`–`D32` 设计决定；改动涉及这些约束时逐条对照；
+3. [`docs/decisions.md`](docs/decisions.md) —— `D1`–`D33` 设计决定；改动涉及这些约束时逐条对照；
 4. 涉及用户可见行为时读 [`README.md`](README.md)；涉及配置字段时读 [`config.example.toml`](config.example.toml)；
 5. 具体源码模块顶部的 `//!` 文档注释。
 

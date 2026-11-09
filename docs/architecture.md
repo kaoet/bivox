@@ -17,6 +17,7 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 - 两个二进制：`kaols.exe`（GUI 主程序）与 `admin.exe`（百炼音色/热词调试 CLI，不随发布包分发，D19）；
 - 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口、声音复刻 HTTP 接口，以及 ASR 预编译热词管理 HTTP 接口（D31）；
 - 翻译模式（`[translate] enabled`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成，字幕以「译文 + 原文」双语呈现（M2，D26；独立 GUI 翻译页是 M3）；
+- VRChat OSC 聊天框（`[vrchat.osc]`，D33）：会话事件额外喂给独立后台任务，按固定 1 秒文本间隔、typing 跳变和约 30 秒自然过期更新本机 `127.0.0.1:9000` 的 ChatBox；
 - 没有本地语音模型，运行必须联网并配置 API Key。
 
 ### 数据流
@@ -50,6 +51,11 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
               └─ PipelineEvent::Asr（原文进度）+ PipelineEvent::Translation（译文/句终）
                    └─ 字幕：译文大字行 + 原文小字行，两行各自复制（M2，D26）
 
+VRChat OSC 聊天框（D33）：
+  pipeline::session::emit（事件克隆一份）→ ChatboxService 后台任务
+    └─ 自己的 SubtitleState + 1 秒文本节流 + typing 跳变 + 约 30 秒自然过期
+         └─ rosc 编码 → UDP 127.0.0.1:{vrchat.osc.port}（/chatbox/input、/chatbox/typing）
+
 关键取舍：
 
 - **低延迟优先**：不等整句识别结束，ASR 文本一稳定就分块送 TTS；语言判定在每句首个 chunk 前完成并冻结。
@@ -72,6 +78,9 @@ src/
 ├── config.rs            config.toml 解析、默认值、归一化、校验、URL/路径派生
 ├── config_edit.rs       toml_edit 定点写回（校验 + .bak）
 ├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
+├── chatbox.rs           VRChat 聊天框文本合成/typing 判断/144 字符与 9 行截断（纯逻辑，D33）
+├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、清空、测试消息（D33）
+├── subtitles.rs         SubtitleState：ASR/翻译/打字事件的纯归约（GUI 与 OSC 共用）
 ├── http.rs              百炼 HTTP JSON 接口的公共错误类型与响应解析
 ├── language.rs          语言代码集合、脚本统计、LanguageTracker、instruction 映射
 ├── asr/
@@ -109,6 +118,7 @@ src/
 │   ├── tts_current_voice.rs 语音合成页：顶部「当前音色」选择
 │   ├── tts_voice_editor.rs  语音合成页：自定义音色样本编辑/排序/语速
 │   ├── translate_tab.rs 翻译页：翻译模式开关、目标语言、粒度、显示原文
+│   ├── vrchat_tab.rs    VRChat 页：OSC 开关、端口、显示模式、发送测试消息（D33）
 │   ├── settings_tab.rs  设置页：路径、API Key、配置概览
 │   ├── log_panel.rs     底部日志面板
 │   ├── widgets.rs       通用小部件（错误横幅、键值行、设备下拉）
@@ -127,6 +137,9 @@ src/
 | `audio` | 采集/播放/VAD；不感知 GUI | 独立 |
 | `voice` | 配置 → 音色解析/注册/缓存 | 依赖 config + `cache` + 自身 HTTP 客户端 |
 | `asr` | 预编译热词注册与管理 API；不感知 GUI | 依赖 config + `cache` + `http` |
+| `subtitles` | 字幕状态归约（当前句/历史/翻译/打字） | 独立，纯逻辑 |
+| `chatbox` | VRChat 聊天框文本合成与截断 | 依赖 config + `subtitles` |
+| `osc` | VRChat OSC 后台发送、节流、typing、清空 | 依赖 config + `subtitles` + `chatbox` + rosc |
 | `config`/`config_edit` | 配置模型与安全写回 | 独立（config_edit 依赖 config 校验） |
 | `events` | 跨线程数据结构 | 被 app 与 pipeline 共用 |
 
@@ -160,6 +173,7 @@ main()
 
 - 路径与运行时：`paths`、`runtime`、`egui_ctx`；
 - 会话：`state: SessionState`、`session: Option<PipelineSessionHandle>`、`events_rx`、`running_config_signature`、`restart_pending`；
+- VRChat：`chatbox: ChatboxService`（后台 OSC 任务句柄；不参与配置指纹）；
 - 配置：`config: ConfigState`（`Loaded` / `Invalid`）、`api_key_input`、设备列表与当前设备；
 - 打字输入：`typed_input`（输入框内容）、`typed_input_error`（行内错误）；提交通过 `PipelineSessionHandle::speak_typed` 走命令通道；
 - 音色编辑：`voice_drafts`（未保存草稿）、`selected_voice`、`voice_mode` / `voice_input` / `voice_custom_key`；
@@ -179,7 +193,7 @@ main()
 4. `request_close()`：处理关窗（见 3.5）；
 5. 绘制顶栏、底部日志面板（可拖拽高度）、CentralPanel 中的页签。
 
-页签顺序固定为：实时 / 音频 / 语音识别 / 语音合成 / 翻译 / 设置。
+页签顺序固定为：实时 / 音频 / 语音识别 / 语音合成 / VRChat / 翻译 / 设置。
 
 ### 3.4 会话启动
 
@@ -262,6 +276,9 @@ main()
 | | `model` | `qwen-mt-flash` | 翻译模型 |
 | | `granularity` | `clause` | `clause`（标点/句终切 + 安全尾）或 `sentence`（只句终切） |
 | | `show_source` | `true` | 字幕是否显示原文行；关掉只显示译文（D26）。不进配置指纹，改后「重新加载配置」即时生效，不重启会话 |
+| `[vrchat.osc]` | `enabled` | `false` | VRChat OSC 聊天框开关（D33） |
+| | `port` | `9000` | VRChat 的 OSC 接收端口（1–65535；启动参数 `--osc=inPort:...` 改过时同步） |
+| | `display` | `bilingual` | 翻译模式下的聊天框内容：`source` / `bilingual` / `translation`；非翻译模式固定显示原文 |
 
 `[tts.custom_voices.<键名>]`：
 
@@ -294,7 +311,8 @@ rate = 1.0
 - `[asr] hotwords`：最多 50 条（固定使用超级热词权重 50，官方限制每词表最多 50 个超级热词）；含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时 ≤7 个空格分隔片段；归一化时去空白、丢空条目、按首次出现去重；
 - 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
 - `[chunking] words > 0`；`[vad] margin_db` 必须是有限数；
-- `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`。
+- `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`；
+- `[vrchat.osc] port` 必须在 1–65535 之间（`0` 拒绝）。
 
 **派生 URL**：
 
@@ -306,14 +324,14 @@ rate = 1.0
 
 `src/config_edit.rs` 提供定点修改函数：
 
-- `set_api_key`、`set_audio_devices`、`set_asr`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`；
+- `set_api_key`、`set_audio_devices`、`set_asr`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`、`set_vrchat_osc`；
 - 统一入口 `save(path, original, updated)`：无改动直接返回；否则先用 `AppConfig::from_toml_str` 校验新文本，失败不落盘；成功后把原文件复制为 `config.toml.bak`，再写盘。
 
 `toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）；`set_asr` 的 `hotwords` 为空时删除该键。
 
 ### 4.4 配置指纹与热更新
 
-`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言/热词、TTS 模型/音色/方言、缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
+`app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言/热词、TTS 模型/音色/方言、缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。**`[vrchat.*]` 不入指纹**：由 `ChatboxService` 的 watch 实时读取，改设置不重启（D33）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
 
 写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。
 
@@ -334,10 +352,14 @@ rate = 1.0
 后台任务 ──(PipelineEvent, unbounded)──▶ KaolsApp::pump_events
       └── ctx.request_repaint() ──▶ egui 下一帧
 
+pipeline::session::emit ──(PipelineEvent 克隆, unbounded)──▶ ChatboxService（D33）
+      └── 独立任务：SubtitleState → 1 秒文本节流 / typing / 清空
+
 实时页输入框 ──(TypedInput, unbounded)──▶ session 调度循环（biased 优先）
 ```
 
 - `PipelineEvent` 字段以 `src/events.rs` 为唯一事实源；事件不携带 egui 类型。
+- 会话的 `emit` 同时向 GUI 与 OSC 两个无界通道发送事件克隆；OSC 任务不依赖 GUI 重绘（D33）。
 - `Warning`：用户可感知但不影响会话继续的降级（例如预编译热词注册失败，D31），界面显示黄色「运行告警」条，可手动清除。
 - `TypedSentence`：会话接受一句打字输入、已交给 TTS 排队后发给界面（进字幕历史）。
 - `Translation`：翻译模式下的译文（可能随 ASR 修订多次到达），`language` 固定为目标语言；界面用它累积译文行，句终时与原文行一起进历史（M2，D26）。
@@ -562,20 +584,21 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 | 语音识别 | 识别模型 + 有序语言列表 + 预编译热词 | 模型输入框（可恢复默认）；语言列表拖动行首「≡」手柄排序 / 删除 + 下拉追加（首个为默认，>4 种提示 `language_hints` 只用前 4 个）；热词多行文本框（一行一个，权重固定 50 超级热词、最多 50 条）；Tab 级保存/放弃更改（一次写回 `[asr] model/languages/hotwords`，D32）；运行中保存触发 D20 热重启；热词在下一次会话启动时自动同步到百炼（D31） |
 | 语音合成 | 当前音色 + 中文方言 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色 + 中文方言下拉（选项来自 `CHINESE_DIALECTS`，默认普通话）；Tab 级保存/放弃更改（一次写回 `[tts] voice`/`dialect`/`custom_voices`）；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳/方言/列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
 | 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
+| VRChat | OSC 聊天框 | 启用开关、发送端口（1–65535）、三种显示模式、发送测试消息（D33）；改值即写回 `[vrchat.osc]`，不进配置指纹、不重启；翻译模式未开启时模式仍可编辑但无额外提示；无状态行/typing 说明/隐私提示；测试消息立即发送、不走 1 秒文本节流 |
 | 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/识别模型/识别语言/预编译热词条数/合成模型/音色/方言；配置无效时显示错误链 |
 
 - 错误展示：启动横幅（黄）、运行告警（黄，可清除，D8/D31）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
 - 语音合成页的“脏”状态 = 音色草稿 / 当前音色 / 中文方言任一与配置不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
 - 语音识别页的“脏”状态 = 模型 / 语言列表 / 归一化后的热词列表任一与配置不一致（空行/重复项不算改动）。
-- 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `app::SubtitleState` 的纯函数维护（普通模式 `apply_asr` / `push_typed`；翻译模式 `apply_source` / `apply_translation`），并有单测覆盖。
+- 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `subtitles::SubtitleState` 的纯函数维护（普通模式 `apply_asr` / `push_typed`；翻译模式 `apply_source` / `apply_translation`），GUI 与 VRChat OSC 任务共用同一份归约逻辑，并有单测覆盖。
 - 打字输入行在 `gui/typed_input.rs`：多行输入，Shift+Enter 换行、Enter 提交并保持焦点；Windows 的 IME 确认候选由 egui-winit 的 `VK_PROCESSKEY` 过滤，不会误提交。
 
 ---
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **217** 个（以 `cargo test` 输出为准）。
-- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名等纯逻辑。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **231** 个（以 `cargo test` 输出为准）。
+- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
 - 静态截图：glow 变体 + `EFRAME_SCREENSHOT_TO`（wgpu 不支持该调试特性）。
@@ -601,6 +624,11 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 翻译模式（M3）提供独立「翻译」页：开关、目标语言、粒度、显示原文都可图形化修改并热更新；`model` 仍只读（手改配置后「重新加载配置」生效）。字幕双语（原文行 + 译文行，两行各自复制），`show_source = false` 时只显示译文（D25/D26）。
 - 翻译是逐块 HTTP 请求：clause 模式的实际延迟、端到端 1s 目标、16 语种 TTS 自然度与碎句译文质量尚未做真实语料评估。
 - 已送 TTS 的译文不可撤回；翻译失败的片段不发声，只按 D8 显示错误条。
+- VRChat 聊天框文本**固定最多 1 条/秒**（本机实测 900ms 长跑跳字），因此聊天框字幕是低频镜像，不是逐事件刷新；GUI 字幕不受影响（D33）。
+- VRChat 约 30 秒无新文本会自然过期；正常句终不主动清空，停止/失败/关闭 OSC/关窗才显式清空。当前句若超过约 30 秒没有任何文本变化（极罕见）也可能自然消失。
+- `/chatbox/typing` 实测不占文本 1 条/秒预算；若未来 VRChat 版本变化，需要重新评估。
+- 144 字符按 UTF-16 码元预算、最多 9 行；中文/emoji 的精确上限与 VRChat 字体表现仍需真机验收。
+- 只支持与本机 VRChat 通信（loopback），不支持远程主机或 OSCQuery 自动发现。
 - 没有 CI；UI 与真实音频链路的回归依赖人工验证。
 
 ---
@@ -638,3 +666,50 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 失败降级：任何一步失败都不阻断会话，发 `PipelineEvent::Warning`，本次识别不带最新热词；有旧 ID 时沿用旧词表。
 - 限速：官方建议两次更新间隔 ≥5 分钟；未满时保留旧快照并提示，下次启动自动重试，避免「缓存已更新、百炼未生效、之后不再重试」。
 - 管理 API 走 `https://{workspace_host}/api/v1/services/audio/asr/customization`，`model = speech-biasing`，由 `asr/api.rs` 实现；admin 调试 CLI 只做列表/删除（D19）。
+
+---
+
+## 17. VRChat OSC 聊天框（D33）
+
+### 17.1 配置与界面
+
+- `[vrchat.osc]`：`enabled`（默认 false）、`port`（默认 9000）、`display`（`source` / `bilingual` / `translation`，默认 `bilingual`）。
+- `[vrchat.*]` 不进配置指纹：GUI 写回后 `ChatboxService` 通过 watch 立即读取，不重启实时管线（D20 例外）。
+- 「VRChat」页在「语音合成」和「翻译」之间：启用开关、发送端口、三种显示模式、发送测试消息。
+  - 翻译模式未开启时三种模式仍可编辑，页面不写额外提示；
+  - 无状态行、typing 说明、隐私提示；
+  - 测试消息立即发送，不受 1 秒文本节流约束；不改变 typing。
+
+### 17.2 文本合成与截断
+
+入口：`chatbox::compose(&SubtitleState, display) -> Text/Keep`。
+
+- 普通模式：显示 ASR 当前句；没有当前句时显示最后一条历史。
+- 翻译模式：`source` 显示源文，`translation` 显示译文（译文未到时 Keep、保留上一帧，不回退原文），`bilingual` 为「译文\n原文」。
+- 当前句是否存在决定 typing，与 display 无关。
+- 截断：`chatbox::truncate_chatbox` / 内部 `fit_*`：
+  - 144 UTF-16 码元、最多 9 行；
+  - 超长保留句尾，被截掉的句头用前导 `…` 代替；
+  - 双语译文优先分配预算，源文用剩余预算，两者都保尾；
+  - 超过 9 行时保留尾部行。
+
+### 17.3 发送与限流
+
+- `ChatboxService` 是 `KaolsApp` 持有的常驻 tokio 任务；会话 `emit` 把 `PipelineEvent` 克隆一份发到其无界通道。
+- 文本：距上次成功文本发送 ≥ `CHATBOX_TEXT_INTERVAL`（1000ms）才发；1 秒内多次变化只发最新内容；相同文本只在同一段显示内去重，新当前句/打字输入会重置去重。
+- typing：`/chatbox/typing` 只在当前句开始/结束时发送；实测不占文本预算。
+- 正常句终不清空；VRChat 约 30 秒自然过期。停止/失败/关闭 OSC/关窗发空字符串显式清空。
+- 发送：`rosc` 编码 `/chatbox/input` `(text, true, false)` 或 `/chatbox/typing`，`std::net::UdpSocket` 发到 `127.0.0.1:port`；不 bind 9000、不用 bundle。
+- 失败只写 debug 日志；VRChat 未运行是正常状态，不弹错误。
+
+### 17.4 与 GUI 的边界
+
+- `SubtitleState` 由 `subtitles.rs` 提供，GUI 与 OSC 任务共用，避免 D16/D26 语义漂移。
+- 会话启动失败时，包装任务额外向 OSC 通道发 `StateChanged(Failed)`，让聊天框清空。
+- 关窗流程调用 `ChatboxService::shutdown()` 尽力清空并退出任务。
+
+### 17.5 验证
+
+- 单测：配置解析/校验、`set_vrchat_osc` 写回、文本合成/保尾截断/9 行、typing 跳变、OSC 编码（`/chatbox/input` 的 `sTF`、`/chatbox/typing` 的 bool）、1 秒节流与清空（注入时钟）。
+- GUI：egui_mcp 验证页签、开关/模式/端口写回、测试消息发包。
+- 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、30 秒自然过期与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。
