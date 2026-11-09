@@ -78,7 +78,7 @@ src/
 ├── config.rs            config.toml 解析、默认值、归一化、校验、URL/路径派生
 ├── config_edit.rs       toml_edit 定点写回（校验 + .bak）
 ├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
-├── chatbox.rs           VRChat 聊天框文本合成/typing 判断/144 字符与 9 行截断（纯逻辑，D33）
+├── chatbox.rs           VRChat 聊天框文本合成/typing 判断/144 UTF-16、9 显示行截断（D33）
 ├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、清空、测试消息（D33）
 ├── subtitles.rs         SubtitleState：ASR/翻译/打字事件的纯归约（GUI 与 OSC 共用）
 ├── http.rs              百炼 HTTP JSON 接口的公共错误类型与响应解析
@@ -597,7 +597,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **231** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **232** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -627,7 +627,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - VRChat 聊天框文本**固定最多 1 条/秒**（本机实测 900ms 长跑跳字），因此聊天框字幕是低频镜像，不是逐事件刷新；GUI 字幕不受影响（D33）。
 - VRChat 约 30 秒无新文本会自然过期；正常句终不主动清空，停止/失败/关闭 OSC/关窗才显式清空。当前句若超过约 30 秒没有任何文本变化（极罕见）也可能自然消失。
 - `/chatbox/typing` 实测不占文本 1 条/秒预算；若未来 VRChat 版本变化，需要重新评估。
-- 144 字符按 UTF-16 码元预算、最多 9 行；中文/emoji 的精确上限与 VRChat 字体表现仍需真机验收。
+- 144 按 UTF-16 码元预算、9 个显示行（含自动换行）；默认 UI 行宽已实测（ASCII 24 / 中文 15 / emoji 12），但 UI 缩放、字体和复杂 ZWJ emoji 仍可能影响换行，截断模型保留保守余量。
 - 只支持与本机 VRChat 通信（loopback），不支持远程主机或 OSCQuery 自动发现。
 - 没有 CI；UI 与真实音频链路的回归依赖人工验证。
 
@@ -688,10 +688,11 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 翻译模式：`source` 显示源文，`translation` 显示译文（译文未到时 Keep、保留上一帧，不回退原文），`bilingual` 为「译文\n原文」。
 - 当前句是否存在决定 typing，与 display 无关。
 - 截断：`chatbox::truncate_chatbox` / 内部 `fit_*`：
-  - 144 UTF-16 码元、最多 9 行；
-  - 超长保留句尾，被截掉的句头用前导 `…` 代替；
-  - 双语译文优先分配预算，源文用剩余预算，两者都保尾；
-  - 超过 9 行时保留尾部行。
+  - 144 UTF-16 码元、最多 9 个**显示行**（包含自动换行；VRChat 超行时保留前 9 行、裁尾）；
+  - 实测默认 UI 行宽：约 24 ASCII / 15 中文 / 12 emoji；`chatbox` 用保守单位模型
+    （ASCII 3 / CJK 5 / emoji 6，行宽 72）估算自动换行；
+  - 超长时从头部删行/删字符，保留句尾；被截掉的句头用前导 `…` 代替（替换首字符，不额外占预算）；
+  - 双语译文优先分配字符与行预算，源文用剩余预算，两者都保尾。
 
 ### 17.3 发送与限流
 
@@ -711,5 +712,6 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 ### 17.5 验证
 
 - 单测：配置解析/校验、`set_vrchat_osc` 写回、文本合成/保尾截断/9 行、typing 跳变、OSC 编码（`/chatbox/input` 的 `sTF`、`/chatbox/typing` 的 bool）、1 秒节流与清空（注入时钟）。
+- 2026-11-09 真机复核：144 ASCII 显示 6 行；160 ASCII 在 144 字符处裁尾；12 个显式行只显示 L01–L09；默认 UI 每行约 24 ASCII / 15 中文 / 12 emoji；144 纯中文约 10 行，双语 144 字符会因自动换行超过 9 行而裁掉源文尾。修复后 `chatbox` 按显示宽度估算换行，客户端发的 144 中文/双语样例均为 9 行且保留尾部标记。
 - GUI：egui_mcp 验证页签、开关/模式/端口写回、测试消息发包。
 - 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、30 秒自然过期与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。

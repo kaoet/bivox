@@ -3,10 +3,12 @@
 //! 输入是 [`SubtitleState`]（与 GUI 同一份字幕状态）与 `[vrchat.osc] display`，
 //! 输出要发给 `/chatbox/input` 的文本。这里不碰网络、不依赖时间，便于单测。
 //!
-//! 截断规则（2026-11-08 实测后）：
-//! - VRChat 最多 144 字符 / 9 行；
+//! 截断规则（2026-11-09 实测后）：
+//! - VRChat 最多 144 个 UTF-16 码元 / 9 个**显示行**（包含自动换行）；
+//! - 默认 UI 下每行约 24 个 ASCII、15 个中文、12 个 emoji；超过 9 行时 VRChat
+//!   保留**前 9 行**、裁掉尾部，因此客户端必须主动删头保尾；
 //! - **保留句尾**（最新内容），被截掉的句头用前导 `…` 代替，不再在末尾加省略号；
-//! - 双语时译文优先分配预算，源文用剩余预算，两条都保尾。
+//! - 双语时译文优先分配行/字符预算，源文用剩余预算，两条都保尾。
 
 use crate::config::VrchatDisplay;
 use crate::subtitles::SubtitleState;
@@ -15,6 +17,15 @@ use crate::subtitles::SubtitleState;
 pub const CHATBOX_MAX_UTF16_UNITS: usize = 144;
 /// VRChat ChatBox 的最大显示行数。
 pub const CHATBOX_MAX_LINES: usize = 9;
+
+/// 实测：默认 UI 下每行约 24 个 ASCII 字符。
+/// 用整数单位避免浮点误差：ASCII=3，CJK=5，emoji=6，行宽 72。
+/// 这比实际略保守（实测 CJK 约 15 字/行，该模型取 14），保证不会因自动换行
+/// 把尾部挤出 9 行。
+const CHATBOX_LINE_UNITS: u32 = 72;
+const ASCII_UNITS: u32 = 3;
+const CJK_UNITS: u32 = 5;
+const EMOJI_UNITS: u32 = 6;
 
 /// 一次合成结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +102,7 @@ fn fit_bilingual(translation: &str, source: &str) -> String {
     }
 
     let used = utf16_len(&translation);
-    let translation_lines = line_count(&translation);
+    let translation_lines = visual_line_count(&translation);
     if used >= CHATBOX_MAX_UTF16_UNITS || translation_lines >= CHATBOX_MAX_LINES {
         return translation;
     }
@@ -111,37 +122,149 @@ fn fit_bilingual(translation: &str, source: &str) -> String {
     }
 }
 
-/// 保留文本尾部，最多 `max_units` 个 UTF-16 码元、`max_lines` 行。
+/// 保留文本尾部，最多 `max_units` 个 UTF-16 码元、`max_lines` 个**实际显示行**。
 ///
-/// 若发生截断（丢行或丢字符），在保留内容前加 `…`；`…` 也计入预算。
+/// 先按实测行宽估算自动换行（VRChat 的 9 行上限包含 word wrap），再从头部丢弃；
+/// 若发生截断（丢行或丢字符），在保留内容前加 `…`。
 fn fit_tail(text: &str, max_units: usize, max_lines: usize) -> String {
     if max_units == 0 || max_lines == 0 {
         return String::new();
     }
 
-    let mut lines = normalize_lines(text);
-    if lines.is_empty() {
+    let normalized = normalize_lines(text);
+    if normalized.is_empty() {
         return String::new();
     }
 
-    let mut head_cut = false;
-    if lines.len() > max_lines {
-        lines = lines.split_off(lines.len() - max_lines);
-        head_cut = true;
-    }
-    let joined = lines.join("\n");
+    let mut body = normalized.join("\n");
+    let mut cut = false;
 
-    if !head_cut && utf16_len(&joined) <= max_units {
-        return joined;
+    if utf16_len(&body) > max_units {
+        body = tail_utf16(&body, max_units);
+        cut = true;
     }
 
-    let body_budget = max_units.saturating_sub(1);
-    let body = tail_utf16(&joined, body_budget);
-    if body.is_empty() {
-        // 只放得下省略号时，至少留下省略号。
-        return "…".to_string();
+    let ranges = visual_line_ranges(&body);
+    if ranges.len() > max_lines {
+        let start = ranges[ranges.len() - max_lines].0;
+        body = body[start..].to_string();
+        cut = true;
     }
-    format!("…{body}")
+
+    if cut {
+        add_head_ellipsis(body, max_units)
+    } else {
+        body
+    }
+}
+
+/// 按 VRChat 实际显示宽度（编码见上面的单位常量）做贪心换行，返回每个视觉行的
+/// 字节区间；**不插入换行符**，只用于判断是否超过 9 行。
+fn visual_line_ranges(text: &str) -> Vec<(usize, usize)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut width = 0u32;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            ranges.push((start, index));
+            start = index + 1;
+            width = 0;
+            continue;
+        }
+        let units = char_units(ch);
+        if width + units > CHATBOX_LINE_UNITS && index > start {
+            ranges.push((start, index));
+            start = index;
+            width = 0;
+        }
+        width += units;
+    }
+    ranges.push((start, text.len()));
+    ranges
+}
+
+/// 在保留内容前加 `…`，并保证不因省略号多出一行 / 超过 144 码元。
+///
+/// 用 `…` **替换**首字符而不是插入：显示宽度与 UTF-16 码元数不会增加
+/// （CJK/emoji 反而更小），因此不会把行数或 144 码元预算挤爆。
+fn add_head_ellipsis(mut text: String, max_units: usize) -> String {
+    if text.is_empty() {
+        return if max_units == 0 {
+            String::new()
+        } else {
+            "…".to_string()
+        };
+    }
+
+    let Some(first) = text.chars().next() else {
+        return String::new();
+    };
+    text.replace_range(0..first.len_utf8(), "…");
+
+    while utf16_len(&text) > max_units {
+        let Some((index, _)) = text.char_indices().nth(1) else {
+            break;
+        };
+        text.remove(index);
+    }
+    text
+}
+
+fn visual_line_count(text: &str) -> usize {
+    visual_line_ranges(text).len()
+}
+
+fn char_units(ch: char) -> u32 {
+    let code = ch as u32;
+    // 零宽修饰符不占显示宽度。
+    if matches!(code, 0x200D | 0xFE0E | 0xFE0F | 0x1F3FB..=0x1F3FF) {
+        return 0;
+    }
+    if is_emoji(code) {
+        return EMOJI_UNITS;
+    }
+    if is_cjk(code) {
+        return CJK_UNITS;
+    }
+    ASCII_UNITS
+}
+
+fn is_emoji(code: u32) -> bool {
+    matches!(
+        code,
+        0x2300..=0x23FF
+            | 0x2600..=0x27BF
+            | 0x2B00..=0x2BFF
+            | 0x1F000..=0x1FAFF
+            | 0x1FC00..=0x1FFFD
+    )
+}
+
+fn is_cjk(code: u32) -> bool {
+    matches!(
+        code,
+        0x2E80..=0x2FFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3100..=0x312F
+            | 0x3130..=0x318F
+            | 0x31A0..=0x31BF
+            | 0x31F0..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE1F
+            | 0xFE30..=0xFE4F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1B000..=0x1B16F
+    )
 }
 
 fn normalize_lines(text: &str) -> Vec<String> {
@@ -174,10 +297,6 @@ fn normalize_lines(text: &str) -> Vec<String> {
 
 fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
-}
-
-fn line_count(text: &str) -> usize {
-    text.split('\n').count()
 }
 
 /// 从尾部保留最多 `max_units` 个 UTF-16 码元（不切断 char / 代理对）。
@@ -233,6 +352,31 @@ mod tests {
         assert!(fitted.starts_with('…'), "{fitted}");
         assert!(fitted.contains("line-14"), "{fitted}");
         assert!(!fitted.contains("line-00"), "{fitted}");
+    }
+
+    #[test]
+    fn wrapped_line_budget_keeps_tail_within_nine_lines() {
+        // 144 ASCII 实测显示 6 行，应原样保留。
+        let ascii = "A".repeat(144);
+        assert_eq!(truncate_chatbox(&ascii), ascii);
+        assert!(visual_line_count(&ascii) <= CHATBOX_MAX_LINES);
+
+        // 纯中文 144 字符按实测宽度会超过 9 个显示行，必须裁头保尾。
+        let cjk = format!("{}尾", "中".repeat(143));
+        let fitted = truncate_chatbox(&cjk);
+        assert!(fitted.ends_with('尾'), "{fitted}");
+        assert!(fitted.starts_with('…'), "{fitted}");
+        assert!(visual_line_count(&fitted) <= CHATBOX_MAX_LINES, "{fitted}");
+        assert!(utf16_len(&fitted) <= CHATBOX_MAX_UTF16_UNITS);
+
+        // 双语：译文 + 源文加起来也必须落在 9 个显示行内，且源文尾保留。
+        let translation = format!("{}TRANS-TAIL", "译".repeat(65));
+        let source = format!("{}SOURCE-TAIL", "源".repeat(65));
+        let fitted = fit_bilingual(&translation, &source);
+        assert!(fitted.contains("TRANS-TAIL"), "{fitted}");
+        assert!(fitted.contains("SOURCE-TAIL"), "{fitted}");
+        assert!(visual_line_count(&fitted) <= CHATBOX_MAX_LINES, "{fitted}");
+        assert!(utf16_len(&fitted) <= CHATBOX_MAX_UTF16_UNITS);
     }
 
     #[test]
