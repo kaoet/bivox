@@ -8,7 +8,8 @@
 //! - 默认 UI 下每行约 24 个 ASCII、15 个中文、12 个 emoji；超过 9 行时 VRChat
 //!   保留**前 9 行**、裁掉尾部，因此客户端必须主动删头保尾；
 //! - **保留句尾**（最新内容），被截掉的句头用前导 `…` 代替，不再在末尾加省略号；
-//! - 双语时译文优先分配行/字符预算，源文用剩余预算，两条都保尾。
+//! - 双语按软 5:4 配额：字符约 79/64（正文 143 个码元），显示行默认 5/4；
+//!   任一侧用不完时把额度借给另一侧，只有两侧都超过配额时才严格 5/4；
 
 use crate::config::VrchatDisplay;
 use crate::subtitles::SubtitleState;
@@ -96,26 +97,53 @@ fn fit_bilingual(translation: &str, source: &str) -> String {
         return fit_single(translation);
     }
 
-    let translation = fit_tail(translation, CHATBOX_MAX_UTF16_UNITS, CHATBOX_MAX_LINES);
+    // 两段之间的换行占 1 个码元；剩余 143 个按 5:4 分给译文/原文。
+    // 先按软配额分字符：哪一边用不完就把余额借给另一边。
+    let content_budget = CHATBOX_MAX_UTF16_UNITS - 1;
+    let base_translation = content_budget * 5 / 9;
+    let base_source = content_budget - base_translation;
+    let natural_translation = utf16_len(&normalize_lines(translation).join("\n"));
+    let natural_source = utf16_len(&normalize_lines(source).join("\n"));
+
+    let translation_units = if natural_translation <= base_translation {
+        natural_translation
+    } else if natural_source <= base_source {
+        content_budget.saturating_sub(natural_source)
+    } else {
+        base_translation
+    };
+    let source_units = content_budget.saturating_sub(translation_units);
+
+    // 先按字符配额裁一次，再用实际视觉行数分配 5/4 行配额。
+    let translation = fit_tail(translation, translation_units, CHATBOX_MAX_LINES);
+    let source = fit_tail(source, source_units, CHATBOX_MAX_LINES);
     if translation.is_empty() {
-        return fit_single(source);
+        return source;
     }
-
-    let used = utf16_len(&translation);
-    let translation_lines = visual_line_count(&translation);
-    if used >= CHATBOX_MAX_UTF16_UNITS || translation_lines >= CHATBOX_MAX_LINES {
-        return translation;
-    }
-
-    // 1 个码元留给两行之间的换行。
-    let remaining = CHATBOX_MAX_UTF16_UNITS - used - 1;
-    let remaining_lines = CHATBOX_MAX_LINES - translation_lines;
-    if remaining <= 1 || remaining_lines == 0 {
-        return translation;
-    }
-
-    let source = fit_tail(source, remaining, remaining_lines);
     if source.is_empty() {
+        return translation;
+    }
+
+    let translation_lines = visual_line_count(&translation);
+    let source_lines = visual_line_count(&source);
+    if translation_lines + source_lines <= CHATBOX_MAX_LINES {
+        return format!("{translation}\n{source}");
+    }
+
+    // 软 5/4：默认译文 5 行、原文 4 行；哪边用不到 5/4 行就把行数借给另一边。
+    let (translation_cap, source_cap) = if translation_lines < 5 {
+        (translation_lines, CHATBOX_MAX_LINES - translation_lines)
+    } else if source_lines < 4 {
+        (CHATBOX_MAX_LINES - source_lines, source_lines)
+    } else {
+        (5, 4)
+    };
+
+    let translation = fit_tail(&translation, translation_units, translation_cap);
+    let source = fit_tail(&source, source_units, source_cap);
+    if translation.is_empty() {
+        source
+    } else if source.is_empty() {
         translation
     } else {
         format!("{translation}\n{source}")
@@ -398,12 +426,110 @@ mod tests {
     }
 
     #[test]
-    fn bilingual_translation_that_fills_budget_omits_source() {
+    fn bilingual_soft_quota_borrows_unused_lines() {
+        // 译文只有 2 行，原文 12 行：译文不占满 5 行，多出的 3 行借给原文。
+        let translation = "译文 1\n译文 2";
+        let source = (1..=12)
+            .map(|index| format!("原文 {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fitted = fit_bilingual(translation, &source);
+
+        assert_eq!(fitted.lines().count(), CHATBOX_MAX_LINES, "{fitted}");
+        assert!(fitted.starts_with("译文 1"), "{fitted}");
+        assert!(fitted.contains("原文 12"), "{fitted}");
+        assert!(!fitted.contains("原文 01"), "{fitted}");
+        assert!(
+            fitted
+                .lines()
+                .nth(2)
+                .is_some_and(|line| line.starts_with('…')),
+            "源文被裁时应保尾并加前导省略号: {fitted}"
+        );
+    }
+
+    #[test]
+    fn bilingual_both_over_quota_uses_five_four_lines() {
+        // 两侧都超过配额：译文 5 行、原文 4 行。
+        let translation = (1..=6)
+            .map(|index| format!("T{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = (1..=6)
+            .map(|index| format!("S{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fitted = fit_bilingual(&translation, &source);
+        let lines: Vec<_> = fitted.lines().collect();
+
+        assert_eq!(lines.len(), CHATBOX_MAX_LINES, "{fitted}");
+        assert!(lines[0].starts_with('…'), "译文被裁: {fitted}");
+        assert!(lines[5].starts_with('…'), "源文被裁: {fitted}");
+        assert!(lines[4].contains("T06"), "译文应保尾: {fitted}");
+        assert!(lines[8].contains("S06"), "源文应保尾: {fitted}");
+    }
+
+    #[test]
+    fn bilingual_exact_nine_lines_is_not_truncated() {
+        // 6 + 3 正好 9 行：不应按 5/4 硬切。
+        let translation = (1..=6)
+            .map(|index| format!("T{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = (1..=3)
+            .map(|index| format!("S{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fitted = fit_bilingual(&translation, &source);
+
+        assert_eq!(fitted.lines().count(), CHATBOX_MAX_LINES, "{fitted}");
+        assert!(!fitted.contains('…'), "{fitted}");
+        assert!(fitted.contains("T06"));
+        assert!(fitted.contains("S03"));
+    }
+
+    #[test]
+    fn bilingual_character_quota_is_five_four_and_keeps_tails() {
+        // 两侧都远超字符预算：144 字符（含分隔换行）按约 5:4 分。
+        let translation = format!("{}TRANS-TAIL", "T".repeat(200));
+        let source = format!("{}SOURCE-TAIL", "S".repeat(200));
+        let fitted = fit_bilingual(&translation, &source);
+        let (translation, source) = fitted.split_once('\n').expect("bilingual separator");
+
+        assert!(utf16_len(&fitted) <= CHATBOX_MAX_UTF16_UNITS, "{fitted}");
+        assert!(translation.starts_with('…'), "{fitted}");
+        assert!(source.starts_with('…'), "{fitted}");
+        assert!(translation.ends_with("TRANS-TAIL"), "{fitted}");
+        assert!(source.ends_with("SOURCE-TAIL"), "{fitted}");
+        assert!(
+            utf16_len(translation) > utf16_len(source),
+            "字符预算应偏向译文: {fitted}"
+        );
+        assert!(visual_line_count(&fitted) <= CHATBOX_MAX_LINES, "{fitted}");
+    }
+
+    #[test]
+    fn bilingual_short_side_lends_character_budget() {
+        // 译文很短时，原文可以使用超过 4/9 的字符预算，但仍保留 5:4 的软上限语义。
+        let translation = "短";
+        let source = format!("{}SOURCE-TAIL", "S".repeat(200));
+        let fitted = fit_bilingual(translation, &source);
+        let (_, source_part) = fitted.split_once('\n').expect("bilingual separator");
+
+        assert!(utf16_len(&fitted) <= CHATBOX_MAX_UTF16_UNITS);
+        assert!(source_part.ends_with("SOURCE-TAIL"), "{fitted}");
+        assert!(utf16_len(source_part) > 64, "{fitted}");
+        assert!(visual_line_count(&fitted) <= CHATBOX_MAX_LINES, "{fitted}");
+    }
+
+    #[test]
+    fn bilingual_short_source_still_gets_its_quota() {
         let translation = "译".repeat(200);
         let fitted = fit_bilingual(&translation, "源文");
 
         assert!(utf16_len(&fitted) <= CHATBOX_MAX_UTF16_UNITS);
-        assert!(!fitted.contains("源文"), "{fitted}");
+        assert!(fitted.contains("源文"), "{fitted}");
+        assert!(visual_line_count(&fitted) <= CHATBOX_MAX_LINES, "{fitted}");
     }
 
     #[test]
