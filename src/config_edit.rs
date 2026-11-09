@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 
-use crate::config::{CustomVoiceConfig, TranslateGranularity};
+use crate::config::{CustomVoiceConfig, TranslateGranularity, VrchatDisplay};
 
 /// 读取配置原文。
 pub fn read(path: &Path) -> Result<String> {
@@ -67,6 +67,27 @@ pub fn set_translate(
     translate["target"] = toml_edit::value(target.trim());
     translate["granularity"] = toml_edit::value(granularity.label());
     translate["show_source"] = toml_edit::value(show_source);
+
+    render(&doc, original)
+}
+
+/// 设置 `[vrchat.osc]` 中由 VRChat 页负责的字段（D3/D33）。
+///
+/// 只改 `enabled` / `port` / `display`；父段 `[vrchat]` 与其它子表（未来的 avatar 等）
+/// 原样保留。写回后由整份配置校验端口范围。
+pub fn set_vrchat_osc(
+    original: &str,
+    enabled: bool,
+    port: u16,
+    display: VrchatDisplay,
+) -> Result<String> {
+    let mut doc = parse(original)?;
+    let vrchat = ensure_table(&mut doc, "vrchat")?;
+    let osc = ensure_subtable(vrchat, "osc")?;
+
+    osc["enabled"] = toml_edit::value(enabled);
+    osc["port"] = toml_edit::value(i64::from(port));
+    osc["display"] = toml_edit::value(display.label());
 
     render(&doc, original)
 }
@@ -198,6 +219,16 @@ fn ensure_table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Tabl
         doc[name] = Item::Table(Table::new());
     }
     doc[name]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("配置项 [{name}] 不是表"))
+}
+
+/// 确保 `parent[name]` 是表（用于 `[vrchat.osc]` 这样的嵌套段）。
+fn ensure_subtable<'a>(parent: &'a mut Table, name: &str) -> Result<&'a mut Table> {
+    if !parent.contains_key(name) {
+        parent[name] = Item::Table(Table::new());
+    }
+    parent[name]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("配置项 [{name}] 不是表"))
 }
@@ -572,5 +603,35 @@ languages = ["zh", "ja"]
         assert!(updated.contains(r#"target = "en""#));
         assert!(updated.contains(r#"granularity = "clause""#));
         assert!(updated.contains("show_source = true"));
+    }
+
+    #[test]
+    fn set_vrchat_osc_creates_nested_table_and_keeps_other_fields() {
+        let original =
+            format!("{SAMPLE}\n# 未来 [vrchat.avatar] 等子表应原样保留（当前配置模型尚未定义）\n");
+        let updated = set_vrchat_osc(&original, true, 9001, VrchatDisplay::Translation).unwrap();
+
+        assert!(updated.contains("# 顶部注释"));
+        assert!(updated.contains(r#"[vrchat.osc]"#), "{updated}");
+        assert!(updated.contains(r#"enabled = true"#));
+        assert!(updated.contains(r#"port = 9001"#));
+        assert!(updated.contains(r#"display = "translation""#));
+        assert!(
+            updated.contains("未来 [vrchat.avatar] 等子表应原样保留"),
+            "{updated}"
+        );
+
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert!(config.vrchat.osc.enabled);
+        assert_eq!(config.vrchat.osc.port, 9001);
+        assert_eq!(config.vrchat.osc.display, VrchatDisplay::Translation);
+
+        // 再次写回只改字段，不重复创建 [vrchat.osc]
+        let updated2 = set_vrchat_osc(&updated, false, 9000, VrchatDisplay::Bilingual).unwrap();
+        assert_eq!(updated2.matches("[vrchat.osc]").count(), 1, "{updated2}");
+        let config = AppConfig::from_toml_str(&updated2).unwrap();
+        assert!(!config.vrchat.osc.enabled);
+        assert_eq!(config.vrchat.osc.port, 9000);
+        assert_eq!(config.vrchat.osc.display, VrchatDisplay::Bilingual);
     }
 }

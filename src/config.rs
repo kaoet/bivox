@@ -76,6 +76,9 @@ pub const DEFAULT_TRANSLATE_TARGET: &str = "en";
 /// 默认翻译粒度：标点/句终即翻（低延迟，可能翻碎句）。
 pub const DEFAULT_TRANSLATE_GRANULARITY: TranslateGranularity = TranslateGranularity::Clause;
 
+/// 默认 VRChat OSC 接收端口（VRChat 的默认 inPort）。
+pub const DEFAULT_VRCHAT_OSC_PORT: u16 = 9000;
+
 /// 应用配置，对应 `config.toml` 的顶层结构。
 ///
 /// 所有字段都有默认值：最小的配置文件只需要提供 `[api] key`。
@@ -88,6 +91,7 @@ pub struct AppConfig {
     pub tts: TtsConfig,
     pub cache: CacheConfig,
     pub translate: TranslateConfig,
+    pub vrchat: VrchatConfig,
     pub audio: AudioConfig,
     pub vad: VadConfig,
     pub chunking: ChunkingConfig,
@@ -247,6 +251,61 @@ impl Default for TranslateConfig {
             model: DEFAULT_TRANSLATE_MODEL.to_string(),
             granularity: DEFAULT_TRANSLATE_GRANULARITY,
             show_source: true,
+        }
+    }
+}
+
+/// `[vrchat]`：VRChat 相关功能的父段（预留给以后的 avatar 等功能）。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct VrchatConfig {
+    pub osc: VrchatOscConfig,
+}
+
+/// `[vrchat.osc]`：OSC 聊天框输出。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VrchatOscConfig {
+    /// 是否把实时字幕发送到 VRChat 的 OSC 聊天框。
+    pub enabled: bool,
+
+    /// VRChat 的 OSC 接收端口（默认 9000）。
+    pub port: u16,
+
+    /// 翻译模式下的聊天框显示内容；非翻译模式固定显示 ASR 原文。
+    pub display: VrchatDisplay,
+}
+
+impl Default for VrchatOscConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: DEFAULT_VRCHAT_OSC_PORT,
+            display: VrchatDisplay::default(),
+        }
+    }
+}
+
+/// VRChat 聊天框显示模式（仅翻译模式生效）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VrchatDisplay {
+    /// 只显示原文。
+    Source,
+    /// 原文和译文（译文在前、原文在后）。
+    #[default]
+    Bilingual,
+    /// 只显示译文。
+    Translation,
+}
+
+impl VrchatDisplay {
+    /// 配置/日志里的稳定写法。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Bilingual => "bilingual",
+            Self::Translation => "translation",
         }
     }
 }
@@ -456,6 +515,7 @@ impl AppConfig {
         }
         self.validate_custom_voices()?;
         self.validate_translate()?;
+        self.validate_vrchat()?;
         if self.chunking.words == 0 {
             bail!("配置项 [chunking] words 必须大于 0");
         }
@@ -569,6 +629,13 @@ impl AppConfig {
                 self.translate.target,
                 language::TRANSLATION_LANGUAGES
             );
+        }
+        Ok(())
+    }
+
+    fn validate_vrchat(&self) -> Result<()> {
+        if self.vrchat.osc.port == 0 {
+            bail!("配置项 [vrchat.osc] port 必须在 1–65535 之间");
         }
         Ok(())
     }
@@ -812,6 +879,9 @@ mod tests {
             "默认翻译粒度是标点即翻"
         );
         assert!(config.translate.show_source);
+        assert!(!config.vrchat.osc.enabled);
+        assert_eq!(config.vrchat.osc.port, DEFAULT_VRCHAT_OSC_PORT);
+        assert_eq!(config.vrchat.osc.display, VrchatDisplay::Bilingual);
         assert_eq!(
             config.cache_path(),
             PathBuf::from("cache.json"),
@@ -1244,6 +1314,33 @@ rate = 1.25
         let config = AppConfig::from_toml_str(&with_key).unwrap();
         assert_eq!(config.api.key.as_deref(), Some("sk-test"));
         assert_eq!(config.api.workspace_host, DEFAULT_WORKSPACE_HOST);
+    }
+
+    #[test]
+    fn vrchat_osc_config_is_parsed_and_validated() {
+        let config = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nenabled = true\nport = 9001\ndisplay = \"translation\"\n",
+        )
+        .unwrap();
+        assert!(config.vrchat.osc.enabled);
+        assert_eq!(config.vrchat.osc.port, 9001);
+        assert_eq!(config.vrchat.osc.display, VrchatDisplay::Translation);
+
+        let err = AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nport = 0\n")
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[vrchat.osc] port"),
+            "port=0 应被拒绝: {err:#}"
+        );
+
+        let err = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\ndisplay = \"both\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("display"),
+            "未知 display 值应被拒绝: {err:#}"
+        );
     }
 
     #[test]

@@ -111,11 +111,16 @@ impl PipelineSessionHandle {
 pub async fn run(
     config: AppConfig,
     events: UnboundedSender<PipelineEvent>,
+    chatbox_events: Option<UnboundedSender<PipelineEvent>>,
     repaint: eframe::egui::Context,
     handle: PipelineSessionHandle,
     mut typed_rx: UnboundedReceiver<TypedInput>,
 ) -> Result<()> {
     let emit = |event: PipelineEvent| {
+        if let Some(chatbox) = &chatbox_events {
+            // best-effort: OSC 服务可能已退出，不影响主事件流
+            let _ = chatbox.send(event.clone());
+        }
         let _ = events.send(event);
         repaint.request_repaint();
     };

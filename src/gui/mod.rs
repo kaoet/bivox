@@ -14,4 +14,5 @@ pub mod tts_current_voice;
 pub mod tts_tab;
 pub mod tts_voice_editor;
 pub mod typed_input;
+pub mod vrchat_tab;
 pub mod widgets;

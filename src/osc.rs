@@ -1,0 +1,557 @@
+//! VRChat OSC 聊天框后台服务（D33）。
+//!
+//! 独立于 GUI 重绘：会话把 `PipelineEvent` 克隆一份发到这里，本任务维护自己的
+//! [`SubtitleState`]、1 秒文本节流、typing 跳变和显式清空。
+//!
+//! 关键约束（2026-11-08 实测）：
+//! - `/chatbox/input` 文本最多 1 条/秒；900ms 长跑会跳字；
+//! - `/chatbox/typing` 不占文本限流；
+//! - 聊天框在最后一个文本包后约 30 秒自然过期；正常句终不清空，停止/关闭才显式清空。
+
+use std::net::UdpSocket;
+use std::time::{Duration, Instant};
+
+use log::{debug, warn};
+use rosc::{encoder, OscMessage, OscPacket, OscType};
+use tokio::sync::{mpsc, watch};
+
+use crate::chatbox::{self, ChatboxText};
+use crate::config::{AppConfig, VrchatDisplay};
+use crate::events::{PipelineEvent, SessionState};
+use crate::subtitles::SubtitleState;
+
+/// 两次文本发送之间的最小间隔（实测 1000ms 稳定，900ms 长跑跳字）。
+pub const CHATBOX_TEXT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 测试消息立即发送，不参与文本节流。
+const TEST_MESSAGE: &str = "kaols OSC 测试：你好，VRChat！";
+
+/// 当前 OSC 配置（由 GUI 写回后通过 watch 实时同步）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatboxSettings {
+    pub enabled: bool,
+    pub port: u16,
+    pub display: VrchatDisplay,
+    pub translate_enabled: bool,
+}
+
+impl ChatboxSettings {
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self {
+            enabled: config.vrchat.osc.enabled,
+            port: config.vrchat.osc.port,
+            display: config.vrchat.osc.display,
+            translate_enabled: config.translate.enabled,
+        }
+    }
+}
+
+impl Default for ChatboxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: crate::config::DEFAULT_VRCHAT_OSC_PORT,
+            display: VrchatDisplay::default(),
+            translate_enabled: false,
+        }
+    }
+}
+
+/// GUI 持有的服务句柄。
+#[derive(Clone)]
+pub struct ChatboxService {
+    settings_tx: watch::Sender<ChatboxSettings>,
+    events_tx: mpsc::UnboundedSender<PipelineEvent>,
+    command_tx: mpsc::UnboundedSender<Command>,
+}
+
+enum Command {
+    SendTest,
+    Shutdown,
+}
+
+impl ChatboxService {
+    /// 启动常驻后台任务。即使 OSC 关闭也保持空转，方便运行中打开开关立即显示当前句。
+    pub fn spawn(runtime: &tokio::runtime::Handle, settings: ChatboxSettings) -> Self {
+        let (settings_tx, settings_rx) = watch::channel(settings);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+        runtime.spawn(async move {
+            run(settings_rx, events_rx, command_rx).await;
+        });
+
+        Self {
+            settings_tx,
+            events_tx,
+            command_tx,
+        }
+    }
+
+    /// 交给会话的 `PipelineEvent` 发送端。
+    pub fn event_sender(&self) -> mpsc::UnboundedSender<PipelineEvent> {
+        self.events_tx.clone()
+    }
+
+    pub fn update_settings(&self, settings: ChatboxSettings) {
+        // 发送端仍在服务里；失败只可能是任务已退出，忽略即可。
+        let _ = self.settings_tx.send(settings);
+    }
+
+    /// 立即发一条测试消息；返回 false 表示服务已退出。
+    pub fn send_test(&self) -> bool {
+        self.command_tx.send(Command::SendTest).is_ok()
+    }
+
+    /// 关窗时尽力清空聊天框并退出任务。
+    pub fn shutdown(&self) {
+        let _ = self.command_tx.send(Command::Shutdown);
+    }
+}
+
+async fn run(
+    mut settings_rx: watch::Receiver<ChatboxSettings>,
+    mut events_rx: mpsc::UnboundedReceiver<PipelineEvent>,
+    mut command_rx: mpsc::UnboundedReceiver<Command>,
+) {
+    let mut runtime = Runtime::new(settings_rx.borrow().clone());
+    let mut events_open = true;
+    let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            command = command_rx.recv() => {
+                match command {
+                    Some(Command::SendTest) => runtime.send_test(),
+                    Some(Command::Shutdown) => {
+                        runtime.shutdown(Instant::now());
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            changed = settings_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let settings = settings_rx.borrow().clone();
+                runtime.update_settings(settings, Instant::now());
+            }
+            event = events_rx.recv(), if events_open => {
+                match event {
+                    Some(event) => runtime.on_event(event, Instant::now()),
+                    None => events_open = false,
+                }
+            }
+            _ = ticker.tick() => runtime.tick(Instant::now()),
+        }
+    }
+}
+
+struct Runtime {
+    settings: ChatboxSettings,
+    sender: ChatboxSender,
+    state: SubtitleState,
+    session_active: bool,
+    last_sent_text: String,
+    last_text_sent_at: Option<Instant>,
+    typing_sent: bool,
+}
+
+impl Runtime {
+    fn new(settings: ChatboxSettings) -> Self {
+        let mut state = SubtitleState::default();
+        state.set_translation_mode(settings.translate_enabled);
+        let sender = ChatboxSender::new(settings.port);
+        Self {
+            settings,
+            sender,
+            state,
+            session_active: false,
+            last_sent_text: String::new(),
+            last_text_sent_at: None,
+            typing_sent: false,
+        }
+    }
+
+    fn update_settings(&mut self, settings: ChatboxSettings, now: Instant) {
+        if settings.port != self.settings.port {
+            self.sender.clear();
+            self.sender.send_typing(false);
+            self.sender = ChatboxSender::new(settings.port);
+            self.last_sent_text.clear();
+            self.last_text_sent_at = None;
+            self.typing_sent = false;
+        }
+
+        let was_enabled = self.settings.enabled;
+        self.settings = settings;
+        if !self.settings.enabled && was_enabled {
+            self.clear(now);
+        } else if self.settings.enabled && !was_enabled {
+            self.last_sent_text.clear();
+            self.last_text_sent_at = None;
+            self.typing_sent = false;
+        }
+        self.tick(now);
+    }
+
+    fn on_event(&mut self, event: PipelineEvent, now: Instant) {
+        match event {
+            PipelineEvent::StateChanged(SessionState::Running) => {
+                self.session_active = true;
+                self.state = SubtitleState::default();
+                self.state
+                    .set_translation_mode(self.settings.translate_enabled);
+                self.last_sent_text.clear();
+                self.last_text_sent_at = None;
+                self.typing_sent = false;
+                if self.settings.enabled {
+                    // 新会话开始先清掉上一个会话可能残留的文本，并记录为一次文本发送，
+                    // 避免紧接着的第一条 ASR 文本和清空挤在同一个 1 秒窗口里。
+                    self.clear(now);
+                }
+                self.tick(now);
+            }
+            PipelineEvent::StateChanged(SessionState::Idle | SessionState::Failed) => {
+                self.session_active = false;
+                self.state = SubtitleState::default();
+                if self.settings.enabled {
+                    self.clear(now);
+                } else {
+                    self.last_sent_text.clear();
+                    self.last_text_sent_at = None;
+                    self.typing_sent = false;
+                }
+            }
+            PipelineEvent::StateChanged(_) => {}
+            PipelineEvent::Asr {
+                text,
+                is_sentence_end,
+                sent_bytes,
+                language,
+                sentence_id,
+            } => {
+                let had_current = self.has_current();
+                self.state
+                    .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id);
+                if !had_current && self.has_current() {
+                    // 新的一段显示：允许同样的文本再次显示（上一段可能已自然过期）。
+                    self.last_sent_text.clear();
+                }
+                self.tick(now);
+            }
+            PipelineEvent::Translation {
+                text,
+                sent_bytes,
+                is_sentence_end,
+                language,
+                sentence_id,
+            } => {
+                let had_current = self.has_current();
+                self.state.apply_translation(
+                    &text,
+                    sent_bytes,
+                    is_sentence_end,
+                    language,
+                    sentence_id,
+                );
+                if !had_current && self.has_current() {
+                    self.last_sent_text.clear();
+                }
+                self.tick(now);
+            }
+            PipelineEvent::TypedSentence { text, language } => {
+                self.state.push_typed(text, language);
+                self.last_sent_text.clear();
+                self.tick(now);
+            }
+            PipelineEvent::Devices { .. }
+            | PipelineEvent::VoiceInfo { .. }
+            | PipelineEvent::VadActive(_)
+            | PipelineEvent::Warning { .. }
+            | PipelineEvent::Error { .. } => {}
+        }
+    }
+
+    fn tick(&mut self, now: Instant) {
+        if !self.settings.enabled || !self.session_active {
+            if !self.last_sent_text.is_empty() {
+                self.sender.clear();
+                self.last_sent_text.clear();
+            }
+            if self.typing_sent {
+                self.sender.send_typing(false);
+                self.typing_sent = false;
+            }
+            return;
+        }
+
+        // typing 只跟“当前句是否存在”有关，与 display 模式无关。
+        let current_exists = self.has_current();
+        if current_exists != self.typing_sent {
+            self.sender.send_typing(current_exists);
+            self.typing_sent = current_exists;
+        }
+
+        let ChatboxText::Text(desired) = chatbox::compose(&self.state, self.settings.display)
+        else {
+            return;
+        };
+
+        if desired == self.last_sent_text {
+            return;
+        }
+        if self
+            .last_text_sent_at
+            .is_some_and(|last| now.duration_since(last) < CHATBOX_TEXT_INTERVAL)
+        {
+            return;
+        }
+
+        if self.sender.send_text(&desired) {
+            self.last_sent_text = desired;
+            self.last_text_sent_at = Some(now);
+        }
+    }
+
+    fn send_test(&mut self) {
+        if self.settings.enabled {
+            // 测试消息立即发送，不走 1 秒文本窗口，也不改变 typing。
+            self.sender.send_text(TEST_MESSAGE);
+        }
+    }
+
+    fn shutdown(&mut self, now: Instant) {
+        if self.settings.enabled {
+            self.clear(now);
+        }
+    }
+
+    fn clear(&mut self, now: Instant) {
+        self.sender.clear();
+        self.sender.send_typing(false);
+        self.last_sent_text.clear();
+        self.last_text_sent_at = Some(now);
+        self.typing_sent = false;
+    }
+
+    fn has_current(&self) -> bool {
+        !self.state.current.is_empty() || !self.state.current_translation.is_empty()
+    }
+}
+
+struct ChatboxSender {
+    socket: Option<UdpSocket>,
+    port: u16,
+}
+
+impl ChatboxSender {
+    fn new(port: u16) -> Self {
+        let socket = match UdpSocket::bind("127.0.0.1:0").and_then(|socket| {
+            socket.set_nonblocking(true)?;
+            Ok(socket)
+        }) {
+            Ok(socket) => Some(socket),
+            Err(err) => {
+                warn!("VRChat OSC：创建 UDP socket 失败：{err}");
+                None
+            }
+        };
+        Self { socket, port }
+    }
+
+    fn send_text(&self, text: &str) -> bool {
+        match encode_chatbox(text) {
+            Ok(bytes) => self.send(&bytes),
+            Err(err) => {
+                debug!("VRChat OSC：编码聊天框文本失败：{err}");
+                false
+            }
+        }
+    }
+
+    fn send_typing(&self, typing: bool) -> bool {
+        match encode_typing(typing) {
+            Ok(bytes) => self.send(&bytes),
+            Err(err) => {
+                debug!("VRChat OSC：编码 typing 失败：{err}");
+                false
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.send_text("");
+    }
+
+    fn send(&self, bytes: &[u8]) -> bool {
+        let Some(socket) = &self.socket else {
+            return false;
+        };
+        let target = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+        match socket.send_to(bytes, target) {
+            Ok(_) => true,
+            Err(err) => {
+                // UDP 无连接；VRChat 未运行不是可感知错误，只记 debug。
+                debug!("VRChat OSC：发送到 {target} 失败：{err}");
+                false
+            }
+        }
+    }
+}
+
+pub(crate) fn encode_chatbox(text: &str) -> Result<Vec<u8>, rosc::OscError> {
+    encoder::encode(&OscPacket::Message(OscMessage {
+        addr: "/chatbox/input".to_string(),
+        args: vec![
+            OscType::String(text.to_string()),
+            OscType::Bool(true),  // immediate：绕过键盘直接显示
+            OscType::Bool(false), // notification sound：不响
+        ],
+    }))
+}
+
+pub(crate) fn encode_typing(typing: bool) -> Result<Vec<u8>, rosc::OscError> {
+    encoder::encode(&OscPacket::Message(OscMessage {
+        addr: "/chatbox/typing".to_string(),
+        args: vec![OscType::Bool(typing)],
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rosc::decoder;
+
+    fn decode(bytes: &[u8]) -> rosc::OscPacket {
+        decoder::decode_udp(bytes).expect("valid OSC packet").1
+    }
+
+    #[test]
+    fn chatbox_packet_has_expected_address_and_args() {
+        let packet = decode(&encode_chatbox("hello").unwrap());
+        let OscPacket::Message(message) = packet else {
+            panic!("expected message");
+        };
+        assert_eq!(message.addr, "/chatbox/input");
+        assert_eq!(message.args.len(), 3);
+        assert_eq!(message.args[0], OscType::String("hello".to_string()));
+        assert_eq!(message.args[1], OscType::Bool(true));
+        assert_eq!(message.args[2], OscType::Bool(false));
+    }
+
+    #[test]
+    fn typing_packet_has_expected_address_and_bool() {
+        let packet = decode(&encode_typing(true).unwrap());
+        let OscPacket::Message(message) = packet else {
+            panic!("expected message");
+        };
+        assert_eq!(message.addr, "/chatbox/typing");
+        assert_eq!(message.args, vec![OscType::Bool(true)]);
+    }
+
+    #[test]
+    fn settings_follow_config() {
+        let mut config = AppConfig::default();
+        config.vrchat.osc.enabled = true;
+        config.vrchat.osc.port = 9100;
+        config.vrchat.osc.display = VrchatDisplay::Translation;
+        config.translate.enabled = true;
+        let settings = ChatboxSettings::from_config(&config);
+        assert!(settings.enabled);
+        assert_eq!(settings.port, 9100);
+        assert_eq!(settings.display, VrchatDisplay::Translation);
+        assert!(settings.translate_enabled);
+    }
+
+    #[test]
+    fn runtime_throttles_text_and_keeps_typing_independent() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: true,
+            port,
+            display: VrchatDisplay::Source,
+            translate_enabled: false,
+        });
+        let start = Instant::now();
+        runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
+
+        // Running 时先显式清空，并关闭上一次可能残留的 typing。
+        let clear = recv_packet(&listener);
+        assert!(is_text(&clear, ""));
+        let typing_off = recv_packet(&listener);
+        assert!(is_typing(&typing_off, false));
+
+        // 第一条当前句：先 typing=true，再发文本。
+        runtime.on_event(asr_event("hello"), start + Duration::from_secs(2));
+        let typing = recv_packet(&listener);
+        assert!(is_typing(&typing, true));
+        let text = recv_packet(&listener);
+        assert!(is_text(&text, "hello"));
+
+        // 1 秒内文本变化：不发文本。
+        runtime.on_event(asr_event("hello2"), start + Duration::from_millis(2500));
+        assert!(recv_packet_opt(&listener).is_none(), "1 秒内不应再发文本");
+
+        // 过了 1 秒窗口：发最新文本。
+        runtime.on_event(asr_event("hello3"), start + Duration::from_secs(3));
+        let text = recv_packet(&listener);
+        assert!(is_text(&text, "hello3"));
+
+        // 停止会话：显式清空。
+        runtime.on_event(
+            PipelineEvent::StateChanged(SessionState::Idle),
+            start + Duration::from_secs(4),
+        );
+        let clear = recv_packet(&listener);
+        assert!(is_text(&clear, ""));
+    }
+
+    fn asr_event(text: &str) -> PipelineEvent {
+        PipelineEvent::Asr {
+            text: text.to_string(),
+            is_sentence_end: false,
+            sent_bytes: 0,
+            language: Some("en".to_string()),
+            sentence_id: None,
+        }
+    }
+
+    fn recv_packet(listener: &UdpSocket) -> Vec<u8> {
+        let mut buffer = [0u8; 2048];
+        let (len, _) = listener.recv_from(&mut buffer).expect("expected packet");
+        buffer[..len].to_vec()
+    }
+
+    fn recv_packet_opt(listener: &UdpSocket) -> Option<Vec<u8>> {
+        let mut buffer = [0u8; 2048];
+        match listener.recv_from(&mut buffer) {
+            Ok((len, _)) => Some(buffer[..len].to_vec()),
+            Err(_) => None,
+        }
+    }
+
+    fn is_text(packet: &[u8], expected: &str) -> bool {
+        let OscPacket::Message(message) = decode(packet) else {
+            return false;
+        };
+        message.addr == "/chatbox/input"
+            && message.args.first() == Some(&OscType::String(expected.to_string()))
+    }
+
+    fn is_typing(packet: &[u8], expected: bool) -> bool {
+        let OscPacket::Message(message) = decode(packet) else {
+            return false;
+        };
+        message.addr == "/chatbox/typing" && message.args == vec![OscType::Bool(expected)]
+    }
+}

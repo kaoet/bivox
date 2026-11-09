@@ -10,16 +10,18 @@ use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
 use crate::config::{
-    AppConfig, TranslateGranularity, CUSTOM_VOICE_PREFIX, DEFAULT_ASR_LANGUAGE, DEFAULT_ASR_MODEL,
-    DEFAULT_VOICE,
+    AppConfig, TranslateGranularity, VrchatDisplay, CUSTOM_VOICE_PREFIX, DEFAULT_ASR_LANGUAGE,
+    DEFAULT_ASR_MODEL, DEFAULT_VOICE,
 };
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
 use crate::language;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
+use crate::osc::{ChatboxService, ChatboxSettings};
 use crate::paths::AppPaths;
 use crate::pipeline::session::{PipelineSessionHandle, TypedInput, MAX_TYPED_INPUT_CHARS};
+use crate::subtitles::SubtitleState;
 use crate::voice::editor::{self, VoiceDraft};
 
 /// 窗口标题。
@@ -34,211 +36,6 @@ pub enum VoiceMode {
     Custom,
 }
 
-/// 字幕历史保留上限（D16）。
-pub const MAX_SUBTITLES: usize = 500;
-
-/// 一条已结束的字幕。
-///
-/// 普通模式：`text` 是 ASR 文本，`source` / `source_language` 为空。
-/// 翻译模式：`text` 是译文、`language` 是目标语言；`source` 是原文、`source_language` 是源语言（D27）。
-#[derive(Debug, Clone)]
-pub struct SubtitleLine {
-    pub language: String,
-    pub text: String,
-    pub source: String,
-    pub source_language: String,
-    pub sentence_id: Option<u64>,
-}
-
-/// 实时字幕状态（当前句 + 历史）。
-#[derive(Debug, Default)]
-pub struct SubtitleState {
-    /// 当前会话是否处于翻译模式（启动会话时按配置设置）。
-    pub translation_mode: bool,
-    /// 当前句原文（普通模式 = ASR 文本；翻译模式 = 源文）。
-    pub current: String,
-    /// 当前句原文已送入下一步（普通模式 = TTS；翻译模式 = 翻译）的字节前缀。
-    pub sent_bytes: usize,
-    /// 翻译模式：当前句累计译文。
-    pub current_translation: String,
-    /// 翻译模式：当前句译文已送入 TTS 的字节前缀。
-    pub translation_sent_bytes: usize,
-    /// 当前句语言（普通模式 = ASR 语言；翻译模式 = 目标语言）。
-    pub language: Option<String>,
-    /// 翻译模式：当前句源语言。
-    pub source_language: Option<String>,
-    /// 已结束的句子（上限 `MAX_SUBTITLES`）。
-    pub history: Vec<SubtitleLine>,
-    /// 上一条已落历史的句子 id：只用于丢弃「同一句被服务端重复下发」的最终结果。
-    pub last_finalized_sentence_id: Option<u64>,
-}
-
-/// 把「已送入前缀长度」夹到字符边界，避免切片 panic。
-fn clamp_prefix_len(text: &str, sent: usize) -> usize {
-    let mut sent = sent.min(text.len());
-    while sent > 0 && !text.is_char_boundary(sent) {
-        sent -= 1;
-    }
-    sent
-}
-
-impl SubtitleState {
-    /// 会话启动时设置当前模式（只影响本次会话；历史保留）。
-    pub fn set_translation_mode(&mut self, enabled: bool) {
-        self.translation_mode = enabled;
-    }
-
-    /// 新会话开始时只清掉「当前句」，**保留历史**（停止/重启管线不清空已识别字幕）。
-    pub fn reset_current(&mut self) {
-        self.current.clear();
-        self.sent_bytes = 0;
-        self.current_translation.clear();
-        self.translation_sent_bytes = 0;
-        self.language = None;
-        self.source_language = None;
-        self.last_finalized_sentence_id = None;
-    }
-
-    /// 打字输入句：提交即进历史（不经过 ASR 的 `sentence_id` 去重）。
-    pub fn push_typed(&mut self, text: String, language: String) {
-        if text.is_empty() {
-            return;
-        }
-        self.push_line(SubtitleLine {
-            language,
-            text,
-            source: String::new(),
-            source_language: String::new(),
-            sentence_id: None,
-        });
-    }
-
-    fn push_line(&mut self, line: SubtitleLine) {
-        self.history.push(line);
-        if self.history.len() > MAX_SUBTITLES {
-            self.history.remove(0);
-        }
-    }
-
-    /// 把一条 ASR 事件并入字幕状态（纯逻辑，便于单测）。
-    ///
-    /// 普通模式：
-    /// - 非空文本：刷新当前句，记录已送 TTS 的字节前缀与语言；
-    /// - 空文本 + 句终：ASR 重置信号，清空当前句（同时忘掉上一句 id）；
-    /// - 句终：当前句（连同语言代码）落进历史；**同一 `sentence_id` 重复下发只记一次**，
-    ///   不同 id 的相同文本是两次真实发音，必须各自保留；超过 `MAX_SUBTITLES` 丢最旧的。
-    ///
-    /// 翻译模式：ASR 只负责刷新源文与「已送翻译」的源文前缀，句终由
-    /// [`Self::apply_translation`] 负责（D26）。
-    fn apply_asr(
-        &mut self,
-        text: &str,
-        is_sentence_end: bool,
-        sent: usize,
-        language: Option<String>,
-        sentence_id: Option<u64>,
-    ) {
-        if self.translation_mode {
-            self.apply_source(text, sent, language);
-            return;
-        }
-
-        if text.is_empty() {
-            if is_sentence_end {
-                self.current.clear();
-                self.sent_bytes = 0;
-                self.language = None;
-                self.last_finalized_sentence_id = None;
-            }
-        } else {
-            self.current.clear();
-            self.current.push_str(text);
-            self.sent_bytes = clamp_prefix_len(&self.current, sent);
-            // 语言在本句首个 chunk 送出前是未知的；一旦判定就沿用本句
-            if language.is_some() {
-                self.language = language;
-            }
-        }
-
-        if is_sentence_end && !self.current.is_empty() {
-            let text = std::mem::take(&mut self.current);
-            self.sent_bytes = 0;
-            let language = self.language.take().unwrap_or_default();
-            let duplicated =
-                sentence_id.is_some() && self.last_finalized_sentence_id == sentence_id;
-            if let Some(id) = sentence_id {
-                self.last_finalized_sentence_id = Some(id);
-            }
-            if !duplicated {
-                self.push_line(SubtitleLine {
-                    language,
-                    text,
-                    source: String::new(),
-                    source_language: String::new(),
-                    sentence_id,
-                });
-            }
-        }
-    }
-
-    /// 翻译模式：刷新当前句源文，`sent` 是已送翻译的源文字节前缀。
-    fn apply_source(&mut self, text: &str, sent: usize, language: Option<String>) {
-        if text.is_empty() {
-            return;
-        }
-        self.current.clear();
-        self.current.push_str(text);
-        self.sent_bytes = clamp_prefix_len(&self.current, sent);
-        if language.is_some() {
-            self.source_language = language;
-        }
-    }
-
-    /// 翻译模式：并入一条译文事件；`is_sentence_end` 时把当前句（原文 + 译文）落进历史。
-    ///
-    /// 去重、上限与普通模式一致；`language` 是目标语言，`source_language` 来自此前的源文事件。
-    fn apply_translation(
-        &mut self,
-        text: &str,
-        sent: usize,
-        is_sentence_end: bool,
-        language: String,
-        sentence_id: Option<u64>,
-    ) {
-        if !text.is_empty() {
-            self.current_translation.clear();
-            self.current_translation.push_str(text);
-            self.translation_sent_bytes = clamp_prefix_len(&self.current_translation, sent);
-            self.language = Some(language.clone());
-        }
-
-        if !is_sentence_end {
-            return;
-        }
-
-        let duplicated = sentence_id.is_some() && self.last_finalized_sentence_id == sentence_id;
-        if let Some(id) = sentence_id {
-            self.last_finalized_sentence_id = Some(id);
-        }
-        let translation = std::mem::take(&mut self.current_translation);
-        let source = std::mem::take(&mut self.current);
-        let source_language = self.source_language.take().unwrap_or_default();
-        let target_language = self.language.take().unwrap_or(language);
-        self.sent_bytes = 0;
-        self.translation_sent_bytes = 0;
-
-        if !duplicated && !translation.is_empty() {
-            self.push_line(SubtitleLine {
-                language: target_language,
-                text: translation,
-                source,
-                source_language,
-                sentence_id,
-            });
-        }
-    }
-}
-
 /// 页签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -246,16 +43,18 @@ pub enum Tab {
     Audio,
     Asr,
     Tts,
+    Vrchat,
     Translate,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Realtime,
         Tab::Audio,
         Tab::Asr,
         Tab::Tts,
+        Tab::Vrchat,
         Tab::Translate,
         Tab::Settings,
     ];
@@ -266,6 +65,7 @@ impl Tab {
             Self::Audio => "音频",
             Self::Asr => "语音识别",
             Self::Tts => "语音合成",
+            Self::Vrchat => "VRChat",
             Self::Translate => "翻译",
             Self::Settings => "设置",
         }
@@ -285,6 +85,8 @@ pub struct KaolsApp {
     pub paths: AppPaths,
     /// 后台运行时：用它 spawn `PipelineSession`。
     pub runtime: tokio::runtime::Runtime,
+    /// VRChat OSC 聊天框后台服务。
+    pub chatbox: ChatboxService,
     pub tab: Tab,
     pub state: SessionState,
     /// 正在运行的实时会话（`None` = 未启动）。
@@ -368,10 +170,16 @@ impl KaolsApp {
         } else {
             Tab::Realtime
         };
+        let initial_chatbox = match &config {
+            ConfigState::Loaded(config) => ChatboxSettings::from_config(config),
+            ConfigState::Invalid { .. } => ChatboxSettings::default(),
+        };
+        let chatbox = ChatboxService::spawn(runtime.handle(), initial_chatbox);
 
         let mut app = Self {
             paths,
             runtime,
+            chatbox,
             tab,
             state: SessionState::Idle,
             session: None,
@@ -452,6 +260,8 @@ impl KaolsApp {
                 self.output_device = config.audio.output_device.clone();
                 self.voice_drafts = editor::drafts_from_config(config);
                 self.tts_dialect = config.tts.dialect.clone();
+                self.chatbox
+                    .update_settings(ChatboxSettings::from_config(config));
             }
             ConfigState::Invalid { .. } => {
                 self.api_key_input.clear();
@@ -459,6 +269,7 @@ impl KaolsApp {
                 self.output_device = None;
                 self.voice_drafts.clear();
                 self.tts_dialect = language::DEFAULT_CHINESE_DIALECT.to_string();
+                self.chatbox.update_settings(ChatboxSettings::default());
             }
         }
     }
@@ -770,6 +581,26 @@ impl KaolsApp {
         self.finish_config_write(result, "已保存翻译设置");
     }
 
+    /// 更新 VRChat 页负责的 `[vrchat.osc]` 字段（D3/D33）。
+    ///
+    /// `[vrchat.*]` 不进配置指纹，改设置立即生效、不重启实时管线。
+    pub fn update_vrchat_settings(&mut self, enabled: bool, port: u16, display: VrchatDisplay) {
+        let result =
+            self.write_config(|text| config_edit::set_vrchat_osc(text, enabled, port, display));
+        self.finish_config_write(result, "已保存 VRChat 设置");
+    }
+
+    /// 立即发送一条 VRChat 测试消息（不走 1 秒文本节流）。
+    pub fn send_test_message(&self) {
+        let enabled = matches!(
+            &self.config,
+            ConfigState::Loaded(config) if config.vrchat.osc.enabled
+        );
+        if enabled {
+            self.chatbox.send_test();
+        }
+    }
+
     /// 读原文 → 定点修改 → 校验并写回。
     fn write_config(
         &mut self,
@@ -862,11 +693,14 @@ impl KaolsApp {
 
         let runtime = self.runtime.handle().clone();
         let events_for_run = tx.clone();
+        let chatbox_for_run = self.chatbox.event_sender();
+        let chatbox_for_error = chatbox_for_run.clone();
         let repaint = ctx.clone();
         runtime.spawn(async move {
             if let Err(err) = crate::pipeline::session::run(
                 config,
                 events_for_run,
+                Some(chatbox_for_run),
                 repaint.clone(),
                 handle,
                 typed_rx,
@@ -875,6 +709,7 @@ impl KaolsApp {
             {
                 let detail = format!("{err:#}");
                 // best-effort: 界面可能已退出，事件丢弃即可
+                let _ = chatbox_for_error.send(PipelineEvent::StateChanged(SessionState::Failed));
                 let _ = tx.send(PipelineEvent::Error {
                     context: "实时管线启动/运行失败".to_string(),
                     detail,
@@ -1071,6 +906,7 @@ impl KaolsApp {
             if let Some(session) = &self.session {
                 session.stop();
             }
+            self.chatbox.shutdown();
             info!("收到关闭请求，正在退出");
             return true;
         }
@@ -1131,6 +967,7 @@ impl KaolsApp {
             Tab::Audio => gui::audio_tab::show(self, ui),
             Tab::Asr => gui::asr_tab::show(self, ui),
             Tab::Tts => gui::tts_tab::show(self, ui),
+            Tab::Vrchat => gui::vrchat_tab::show(self, ui),
             Tab::Translate => gui::translate_tab::show(self, ui),
             Tab::Settings => gui::settings_tab::show(self, ui),
         }
@@ -1396,6 +1233,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subtitles::MAX_SUBTITLES;
 
     fn apply(
         state: &mut SubtitleState,
@@ -1748,6 +1586,29 @@ show_source = true
         )
         .unwrap();
         assert_eq!(config_signature(&base), config_signature(&show_changed));
+    }
+
+    #[test]
+    fn config_signature_ignores_vrchat_osc_settings() {
+        // OSC 开关/端口/显示模式由独立后台任务实时读取，不应触发 D20 重启。
+        let toml = r#"
+[api]
+key = "sk-test"
+
+[vrchat.osc]
+enabled = false
+port = 9000
+display = "bilingual"
+"#;
+        let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
+        let changed = crate::config::AppConfig::from_toml_str(
+            &toml
+                .replace("enabled = false", "enabled = true")
+                .replace("port = 9000", "port = 9001")
+                .replace(r#"display = "bilingual""#, r#"display = "translation""#),
+        )
+        .unwrap();
+        assert_eq!(config_signature(&base), config_signature(&changed));
     }
 
     #[test]

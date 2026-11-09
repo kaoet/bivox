@@ -13,6 +13,7 @@ pub mod app;
 pub mod asr;
 pub mod audio;
 pub mod cache;
+pub mod chatbox;
 pub mod client;
 pub mod config;
 pub mod config_edit;
@@ -21,8 +22,10 @@ pub mod gui;
 pub mod http;
 pub mod language;
 pub mod log_sink;
+pub mod osc;
 pub mod paths;
 pub mod pipeline;
 #[cfg(windows)]
 pub mod single_instance;
+pub mod subtitles;
 pub mod voice;

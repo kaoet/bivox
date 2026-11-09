@@ -144,3 +144,19 @@
 # granularity = "clause"
 # 字幕是否显示原文行；关掉只显示译文（GUI 改后立即生效，不重启会话）
 # show_source = true
+
+[vrchat.osc]
+# 是否把实时字幕发送到 VRChat 的 OSC 聊天框（默认关闭）。
+# 使用前需在 VRChat 中开启 OSC：Action Menu → Options → OSC → Enabled。
+# 发送地址固定为本机 127.0.0.1；端口需与 VRChat 的 OSC 接收端口一致（默认 9000）。
+# 文本发送间隔固定 1 秒；typing 指示器不占文本限流；句终后约 30 秒由 VRChat 自然过期。
+# enabled = false
+
+# 若用 VRChat 启动参数改过接收端口（--osc=inPort:senderIP:outPort），这里填相同的 inPort。
+# port = 9000
+
+# 翻译模式下的显示内容（仅翻译模式生效；非翻译模式始终显示 ASR 原文）：
+#   "source"      = 只显示原文
+#   "bilingual"   = 显示原文和译文（译文在前、原文在后）
+#   "translation" = 只显示译文
+# display = "bilingual"
