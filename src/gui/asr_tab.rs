@@ -12,8 +12,8 @@
 use eframe::egui;
 
 use crate::app::{ConfigState, KaolsApp};
-use crate::config::{normalize_hotwords, DEFAULT_ASR_MODEL, MAX_ASR_HOTWORDS};
-use crate::language::{language_display_name, ASR_LANGUAGES};
+use crate::config::{DEFAULT_ASR_MODEL, MAX_ASR_HOTWORDS, normalize_hotwords};
+use crate::language::{ASR_LANGUAGES, language_display_name};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
@@ -17,9 +17,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Interval, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::client::AsrEvent;
@@ -251,8 +251,8 @@ impl AudioStreamState {
 mod tests {
     use super::*;
     use futures_util::SinkExt;
-    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 

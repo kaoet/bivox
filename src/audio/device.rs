@@ -3,9 +3,9 @@
 //! 设备名规则（决策 D12，见 docs/decisions.md）：GUI 只保存**完整设备名**，查找时按字符串
 //! **精确相等**匹配；找不到就报错让用户在设置页重选，不做模糊匹配、也不静默回退到默认设备。
 
-use anyhow::{anyhow, Result};
-use cpal::traits::{DeviceTrait, HostTrait};
+use anyhow::{Result, anyhow};
 use cpal::Device;
+use cpal::traits::{DeviceTrait, HostTrait};
 
 pub struct AudioDeviceManager {
     host: cpal::Host,

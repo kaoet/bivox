@@ -161,7 +161,7 @@ impl AudioPlaybackEngine {
                 return Err(anyhow::anyhow!(
                     "暂不支持的输出音频格式: {:?}",
                     sample_format
-                ))
+                ));
             }
         };
 

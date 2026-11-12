@@ -13,10 +13,10 @@
 //!
 //! 注意两种响应外壳：`/files*` 用 `data`，`/services/.../customization` 用 `output`。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, RequestBuilder};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::http::{parse_response, payload};
 
 // 保持 `voice::api::ApiError` / `voice::api::is_resource_missing_error` 这些既有路径可用，
 // 具体定义在 `crate::http`（ASR 热词接口也共用同一套错误判定）。
-pub use crate::http::{is_resource_missing_error, ApiError};
+pub use crate::http::{ApiError, is_resource_missing_error};
 
 /// 音色复刻服务使用的固定模型名（不是 TTS 模型）。
 pub const VOICE_ENROLLMENT_MODEL: &str = "voice-enrollment";
@@ -430,8 +430,8 @@ fn parse_remote_voice(item: &Value) -> RemoteVoice {
 mod tests {
     use super::*;
     use crate::voice::mock_http::{MockHttpServer, MockResponse, RecordedRequest};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_api(server: &MockHttpServer) -> BailianVoiceApi {
         BailianVoiceApi::new("sk-test", format!("{}/api/v1", server.base_url())).unwrap()
@@ -465,10 +465,12 @@ mod tests {
             Some("Bearer sk-test"),
             "必须携带 Bearer 鉴权头"
         );
-        assert!(request
-            .header("content-type")
-            .unwrap_or_default()
-            .starts_with("multipart/form-data"));
+        assert!(
+            request
+                .header("content-type")
+                .unwrap_or_default()
+                .starts_with("multipart/form-data")
+        );
         let body = request.body_text();
         assert!(body.contains("name=\"files\""), "文件字段名应为 files");
         assert!(body.contains("kaoet.wav"), "multipart 应带文件名");

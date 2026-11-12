@@ -6,10 +6,10 @@
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 
 /// 第一个实例持有的守卫：进程存活期间必须一直持有（drop 时关闭 Mutex）。

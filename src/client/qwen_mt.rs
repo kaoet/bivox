@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// 建立连接超时。
@@ -274,8 +274,8 @@ fn snippet(body: &str) -> String {
 mod tests {
     use super::*;
     use crate::voice::mock_http::{MockHttpServer, MockResponse};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_client(server: &MockHttpServer) -> QwenMtClient {
         QwenMtClient::new(

@@ -2,8 +2,8 @@ use super::resampler::MonoResampler;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::Sender;
 
 pub struct AudioCapture {
@@ -88,7 +88,7 @@ impl AudioCapture {
                 return Err(anyhow::anyhow!(
                     "暂不支持的声卡采样格式: {:?}",
                     sample_format
-                ))
+                ));
             }
         };
 

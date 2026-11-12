@@ -10,7 +10,7 @@
 //!
 //! 逻辑放这里（而不是 bin 里）是为了能用 `voice::mock_http` 做单元测试。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::voice::api::{self, BailianVoiceApi, RemoteVoice};
 
@@ -100,8 +100,8 @@ pub async fn delete_all_remote_voices(
 mod tests {
     use super::*;
     use crate::voice::mock_http::{MockHttpServer, MockResponse, RecordedRequest};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn api(server: &MockHttpServer) -> BailianVoiceApi {
         BailianVoiceApi::new("sk-test", format!("{}/api/v1", server.base_url())).unwrap()

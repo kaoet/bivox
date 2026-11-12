@@ -487,9 +487,11 @@ mod tests {
         // 模拟 ASR 重连：上一句只发了一半，之后收到空文本 + 句终作为重置信号，
         // 新会话的首句不应与旧状态错位/漏字。
         let mut chunker = TextChunker::new(6);
-        assert!(chunker
-            .process_stream("上一句只识别了一半", false)
-            .is_empty());
+        assert!(
+            chunker
+                .process_stream("上一句只识别了一半", false)
+                .is_empty()
+        );
 
         assert!(chunker.process_stream("", true).is_empty());
 

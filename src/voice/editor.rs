@@ -6,11 +6,11 @@
 
 use std::collections::HashSet;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::config::{
-    is_valid_sample_rate, AppConfig, CustomVoiceConfig, CustomVoiceSample, DEFAULT_SAMPLE_RATE,
-    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+    AppConfig, CustomVoiceConfig, CustomVoiceSample, DEFAULT_SAMPLE_RATE, MAX_SAMPLE_RATE,
+    MIN_SAMPLE_RATE, is_valid_sample_rate,
 };
 
 /// 一个自定义音色的编辑草稿。
@@ -236,29 +236,35 @@ audio = "C:/voices/b-ja.wav"
         let err = |drafts: &[VoiceDraft]| drafts_to_entries(drafts).unwrap_err().to_string();
 
         assert!(err(&[draft("", vec![sample("zh", "a.wav")])]).contains("键名不能为空"));
-        assert!(err(&[
-            draft("a", vec![sample("zh", "a.wav")]),
-            draft("a", vec![sample("ja", "b.wav")])
-        ])
-        .contains("重复"));
+        assert!(
+            err(&[
+                draft("a", vec![sample("zh", "a.wav")]),
+                draft("a", vec![sample("ja", "b.wav")])
+            ])
+            .contains("重复")
+        );
         assert!(err(&[draft("a", vec![])]).contains("至少需要一个声线样本"));
         assert!(err(&[draft("a", vec![sample("", "a.wav")])]).contains("缺少语言"));
         assert!(err(&[draft("a", vec![sample("xx", "a.wav")])]).contains("不在声音复刻支持列表"));
-        assert!(err(&[draft(
-            "a",
-            vec![sample("zh", "a.wav"), sample("zh", "b.wav")]
-        )])
-        .contains("重复"));
+        assert!(
+            err(&[draft(
+                "a",
+                vec![sample("zh", "a.wav"), sample("zh", "b.wav")]
+            )])
+            .contains("重复")
+        );
         assert!(err(&[draft("a", vec![sample("zh", "  ")])]).contains("缺少样例音频"));
-        assert!(err(&[draft(
-            "a",
-            vec![SampleDraft {
-                language: "zh".to_string(),
-                audio: "a.wav".to_string(),
-                rate: 2.5,
-            }]
-        )])
-        .contains("语速"));
+        assert!(
+            err(&[draft(
+                "a",
+                vec![SampleDraft {
+                    language: "zh".to_string(),
+                    audio: "a.wav".to_string(),
+                    rate: 2.5,
+                }]
+            )])
+            .contains("语速")
+        );
     }
 
     #[test]

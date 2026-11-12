@@ -10,7 +10,7 @@ use eframe::egui;
 
 use crate::config::{DEFAULT_SAMPLE_RATE, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use crate::language::CLONING_LANGUAGES;
-use crate::voice::editor::{config_audio_path, VoiceDraft};
+use crate::voice::editor::{VoiceDraft, config_audio_path};
 
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 

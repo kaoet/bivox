@@ -560,12 +560,16 @@ mod tests {
             .unwrap();
         assert_eq!(hash, "hash-new", "应返回对应的音频哈希");
         assert_eq!(found.voice_id, "voice-new", "应取同模型下最新的一条");
-        assert!(cache
-            .find_with_hash_by_audio_path("model-z", "samples/kaoet.wav")
-            .is_none());
-        assert!(cache
-            .find_with_hash_by_audio_path(MODEL_A, "samples/other.wav")
-            .is_none());
+        assert!(
+            cache
+                .find_with_hash_by_audio_path("model-z", "samples/kaoet.wav")
+                .is_none()
+        );
+        assert!(
+            cache
+                .find_with_hash_by_audio_path(MODEL_A, "samples/other.wav")
+                .is_none()
+        );
     }
 
     #[test]

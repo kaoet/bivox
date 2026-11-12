@@ -5,7 +5,7 @@
 //! - 不做 prefix 过滤、不提供创建/更新（创建与更新由主程序会话启动时自动完成）；
 //! - 只按 `vocabulary_id` 精确列出/删除，逻辑放在这里以便用 mock HTTP 单测。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::asr::api::{BailianAsrApi, RemoteVocabulary};
 use crate::http::is_resource_missing_error;
@@ -61,8 +61,8 @@ mod tests {
     use super::*;
     use crate::voice::mock_http::{MockHttpServer, MockResponse, RecordedRequest};
     use serde_json::Value;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn api(server: &MockHttpServer) -> BailianAsrApi {
         BailianAsrApi::new("sk-test", format!("{}/api/v1", server.base_url())).unwrap()

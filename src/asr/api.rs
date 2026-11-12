@@ -17,9 +17,9 @@
 //! 不传 `lang`——识别时同时带 `language_hints` 会导致只有语种匹配的词条生效，
 //! 本项目是多语种场景，省略 `lang` 让词条对所有语言生效。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -444,8 +444,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_until_ready_polls_until_ok() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_server = calls.clone();

@@ -12,7 +12,7 @@ use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use log::{debug, warn};
-use rosc::{encoder, OscMessage, OscPacket, OscType};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use tokio::sync::{mpsc, watch};
 
 use crate::chatbox::{self, ChatboxText};

@@ -4,10 +4,10 @@
 //! 阻塞一次翻译会让打字变慢（D5 的同类约束）。因此这里用无界通道把任务送给
 //! 后台任务，再把结果送回会话的 `select`；worker 单 in-flight，天然保持 TTS 顺序。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::client::qwen_mt::{QwenMtClient, TranslateRequest};

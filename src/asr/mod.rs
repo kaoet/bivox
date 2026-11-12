@@ -337,8 +337,8 @@ mod tests {
     use super::*;
     use crate::voice::mock_http::{MockHttpServer, MockResponse};
     use serde_json::Value;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const MODEL: &str = "qwen-audio-3.1-asr-flash-streaming";
 

@@ -10,7 +10,7 @@ use eframe::egui;
 use crate::app::{ConfigState, KaolsApp};
 use crate::config::TranslateGranularity;
 use crate::gui::widgets;
-use crate::language::{language_display_name, TRANSLATION_LANGUAGES};
+use crate::language::{TRANSLATION_LANGUAGES, language_display_name};
 
 /// 目标语言下拉的显示文本：中文名 + 代码，避免只显示代码时看不懂。
 fn language_label(code: &str) -> String {

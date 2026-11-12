@@ -13,7 +13,7 @@ pub mod editor;
 #[cfg(test)]
 pub(crate) mod mock_http;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use futures_util::future::join_all;
 use std::collections::{BTreeMap, HashMap};
@@ -629,8 +629,8 @@ mod tests {
     use super::*;
     use crate::voice::mock_http::{MockHttpServer, MockResponse, RecordedRequest};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
