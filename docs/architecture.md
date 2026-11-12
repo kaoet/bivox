@@ -59,7 +59,7 @@ VRChat OSC 聊天框（D33）：
 关键取舍：
 
 - **低延迟优先**：不等整句识别结束，ASR 文本一稳定就分块送 TTS；语言判定在每句首个 chunk 前完成并冻结。
-- **本地只做“轻”处理**：能量 VAD、语言脚本统计、文本分块都是纯本地、无网络、可单测的逻辑；识别与合成全部交给云端。
+- **本地只做“轻”处理**：Silero VAD（ONNX 推理，模型随 exe 分发）、语言脚本统计、文本分块都是纯本地、无网络的逻辑；识别与合成全部交给云端。
 - **UI 与后台解耦**：后台只通过事件通道汇报，UI 不直接碰音频流或网络任务（D6）。
 
 ---
@@ -92,7 +92,9 @@ src/
 │   ├── capture.rs       cpal 采集 → 单声道 16k PCM16 → 100ms chunk
 │   ├── playback.rs      cpal 播放队列 + 重采样
 │   ├── resampler.rs     rubato FFT 重采样封装
-│   └── vad.rs           EnergyVad（帧级）+ SpeechGate（发送状态机）
+│   ├── silero.rs        Silero VAD 模型加载 + 帧级语音概率（ONNX Runtime）
+│   ├── vad.rs           VAD 门控状态机（起音/保持/发送决策）+ 帧检测器 trait
+│   └── vad_thread.rs    独立 VAD 线程（采集 chunk → 门控 → ASR）
 ├── client/
 │   ├── ws.rs            鉴权建连、Ping 保活、指数退避重连的公共骨架
 │   ├── qwen_asr.rs      Qwen-Audio 实时流式识别
@@ -223,7 +225,7 @@ main()
   - `running`：后台任务的“继续运行”标志，初值 `true`；
   - `stop_requested`：区分“用户主动停止”与“服务异常自行退出”。
 - 「停止」：GUI 置 `Stopping`，请求 handle 停止，并立即清空当前字幕句；后台调度循环最多 100ms 内退出。已在命令通道里、尚未开始朗读的打字输入句随会话丢弃（字幕历史保留）。
-- 会话收尾顺序：复位 VAD → drop 采集（释放麦克风）→ 关闭 TTS 输入通道 → 最多等待 ASR/TTS 任务 3s → 若非用户主动停止，补发 `Error` → 发 `StateChanged(Idle)`。
+- 会话收尾顺序：复位 VAD 状态 → drop 采集（释放麦克风）→ 等 VAD 线程退出（≤3s）→ 关闭 TTS 输入通道 → 最多等待 ASR/TTS 任务 3s → 若非用户主动停止，补发 `Error` → 发 `StateChanged(Idle)`。
 - 收到 `Idle`/`Failed` 后 GUI 清空 `session`、配置指纹与 VAD 指示，并清当前字幕句；若 `restart_pending` 且未在关窗，则用新配置自动重启（D20）。
 - 关窗：首次收到 close request 时 `CancelClose`、置 `closing`、请求停止会话；下一帧刷新日志并真正 `Close`。这样保证后台任务与音频设备先释放（D13）。
 
@@ -266,10 +268,10 @@ main()
 | | `custom_voices` | 空 | 键名 → { `name`, `samples[]`（每个样本含 `language` / `audio` / `rate`） } |
 | `[audio]` | `input_device` / `output_device` | 空 = 系统默认 | 完整设备名 |
 | `[vad]` | `enabled` | `true` | 关闭后全量上传 |
-| | `margin_db` | `9.0` | 起音阈值 = 噪声底 + 该值 |
-| | `hangover_ms` | `500` | 语音结束拖尾保持 |
+| | `threshold` | `0.5` | Silero 起音概率阈值（0–1）；负阈值自动取 `threshold - 0.15` |
+| | `min_silence_ms` | `500` | 低于负阈值持续该时长判定语音结束 |
 | | `tail_ms` | `1000` | 句末补发的静音，用于触发服务端 sentence_end |
-| | `debug` | `false` | 打印每个 chunk 的 VAD 决策 |
+| | `debug` | `false` | 打印每个 chunk 的 VAD 概率/阈值/发送决策 |
 | `[chunking]` | `words` | `6` | 投机分块阈值 |
 | `[translate]` | `enabled` | `false` | 翻译模式开关 |
 | | `target` | `en` | 目标语言（16 种 TTS 语言之一） |
@@ -310,7 +312,7 @@ rate = 1.0
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
 - `[asr] hotwords`：最多 50 条（固定使用超级热词权重 50，官方限制每词表最多 50 个超级热词）；含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时 ≤7 个空格分隔片段；归一化时去空白、丢空条目、按首次出现去重；
 - 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
-- `[chunking] words > 0`；`[vad] margin_db` 必须是有限数；
+- `[chunking] words > 0`；`[vad] threshold` 必须是 (0, 1) 内的有限数，`min_silence_ms` / `tail_ms` 不超过 5000；
 - `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`；
 - `[vrchat.osc] port` 必须在 1–65535 之间（`0` 拒绝）。
 
@@ -387,7 +389,7 @@ pipeline::session::emit ──(PipelineEvent 克隆, unbounded)──▶ Chatbox
 - 双向流式：一边把（可经 VAD 门控的）PCM 二进制帧发上去，一边读 JSON 事件。
 - `result-generated` 中取 `payload.output.sentence`：忽略 `heartbeat=true` 与空文本，其余转成 `AsrEvent { text, is_sentence_end, sentence_id }` 送入会话调度。
 - 用户停止/音频通道关闭时发 `finish-task`；服务端提前返回 `task-finished` 视为异常断线并重连。
-- 重连前：丢弃积压音频、向下游发“空文本 + 句终”的重置信号、重置 VAD 门控的瞬态（保留噪声底估计）。
+- 重连前：丢弃积压音频、向下游发“空文本 + 句终”的重置信号，并置位 VAD 线程的 `vad_reset` 标志（模型 state/起音/尾部在下一块音频前复位）。
 
 ---
 
@@ -477,24 +479,34 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 若 TTS 采样率（22050）与设备采样率不同，`push_pcm16` 时重采样；回调只负责从队列取数、复制到各声道，队列空补 0。
 - `flush()` 在每句结束时补齐重采样器内部余量。
 
-### 10.3 VAD 与发送门控（`audio/vad.rs`）
+### 10.3 VAD 与发送门控（`audio/silero.rs` / `audio/vad.rs` / `audio/vad_thread.rs`）
 
-目的：只上传语音段，降低 ASR 费用，同时避免服务端任务因长时间没有音频而超时。
+目的：只上传语音段，降低 ASR 费用，同时避免服务端任务因长时间没有音频而超时（D34）。
 
-**能量 VAD（逐 20ms 帧）**
+**Silero VAD（16k / 32ms 帧）**
 
-- 计算 RMS dBFS；自适应噪声底（下降快、上浮慢）；
-- 起音阈值 = 噪声底 + `margin_db`，并有绝对下限；连续 `onset_frames` 帧超阈值才算语音；
-- 维持阈值比起音阈值低 3dB（迟滞），`hangover_ms` 内仍视为语音；
-- 启动前 300ms 只标定噪声底、不判定。
+- 模型为官方 `silero_vad_16k_op15.onnx`（MIT，1.23MiB），编译期 `include_bytes!` 内嵌进 exe，运行时由 ONNX Runtime 从内存加载；模型来源/版本/SHA256 见 `assets/silero/README.md`。
+- 每帧恰好 512 采样（32ms）；输入 `input[1,576]`（64 采样 context + 512 新帧）、`state[2,1,128]`、`sr`；输出该帧语音概率与下一帧 state。
+- 采集仍是 100ms chunk：门控内部按 512 分帧，跨 chunk 保留不足一帧的采样余量（1600 = 3×512 + 64）。
+- 实测（release，单线程）：单帧约 0.13ms；会话启动加载会话约 36ms。单帧推理不在 cpal 实时回调里执行。
 
 **发送门控（`SpeechGate`）**
 
+- 起音：连续 2 帧概率 ≥ `threshold`（默认 0.5，即 64ms 去抖）；
+- 保持：概率 ≥ `threshold - 0.15`（负阈值迟滞）；
+- 结束：低于负阈值持续 `min_silence_ms`（默认 500ms）；
 - 语音中：发送当前 chunk；起音瞬间补发 `pre_roll_ms`（默认 300ms）历史音频，避免切掉首字；
 - 语音刚结束：继续补 `tail_ms`（默认 1000ms）静音，帮助服务端 VAD 吐出 `sentence_end`（服务端约需 800ms 静音）；
 - 完全空闲：每 `keepalive_ms`（默认 10s）补一小段静音，避免 run-task 任务约 23s 无音频被服务端失败；
 - 每个 chunk 更新共享 `active_flag`（顶栏 VAD 指示器）。
-- 配置 `[vad] enabled=false` 时跳过门控，全量上传；重连时 `reset_transient()` 清空 pre-roll/tail/keepalive 状态，但保留噪声底估计。
+- 配置 `[vad] enabled=false` 时跳过门控，全量上传。
+
+**独立 VAD 线程**
+
+- `vad_thread` 用 `std::thread("silero-vad")` 持有检测器与门控：收采集原始 chunk，输出应上传的 chunk 给 ASR 任务；cpal 实时回调只做重采样/攒块，ASR 任务只发 WebSocket。
+- 断线重连：ASR 置位 `vad_reset`，VAD 线程在下一块音频前 `reset_transient()`（模型 state、起音/拖尾、pre-roll、keepalive）。
+- 推理失败：门控降级为全量上传（不再丢音频），会话轮询到 `vad_degraded` 后发一次 `PipelineEvent::Warning`（GUI 告警横幅，指示器灰）；停止后重新开始会话可重试。
+- 收尾：先 drop 采集释放麦克风，再等 VAD 线程退出（≤3s），最后等 ASR/TTS 任务。
 
 ---
 

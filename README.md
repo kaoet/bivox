@@ -6,16 +6,16 @@
 
 - 纯 GUI（egui/eframe），**便携模式**：配置、缓存、日志都在 exe 同目录，整个文件夹拷走即用；
 - **单实例**：同一目录只允许开一个窗口，重复启动会激活已有窗口；
-- 本地 VAD 门控、实时字幕（语言代码 + TTS 进度分色）、多语言自定义（复刻）音色；
+- 本地 **Silero VAD** 门控（ONNX 模型随 exe 内嵌，不额外分发文件）、实时字幕（语言代码 + TTS 进度分色）、多语言自定义（复刻）音色；
 - 可选 VRChat OSC 聊天框输出：把实时字幕（可含译文）同步到 VRChat 的 ChatBox。
 
-**系统要求**：Windows 10/11 x64、可用的百炼 API Key、联网。发布包不含安装器，解压即用。
+**系统要求**：Windows 10/11 x64、可用的百炼 API Key、联网。发布包不含安装器，解压即用；ONNX Runtime 已静态链接进 exe，无需安装额外运行库。
 
 ---
 
 ## 快速开始
 
-1. 解压发布包（`kaols.exe` + `README.md`）到一个**可写目录**（例如 `D:\Apps\kaols`）；
+1. 解压发布包（`kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`）到一个**可写目录**（例如 `D:\Apps\kaols`）；
 2. 双击 `kaols.exe`：首次启动会在 exe 同目录生成 `config.toml`，并自动落在「设置」页；
 3. 在「设置」页填入百炼 API Key（[控制台](https://bailian.console.aliyun.com/)），点「保存 API Key」；
 4. 回到「实时」页点「开始」，对着麦克风说话即可看到字幕并听到合成语音。
@@ -167,10 +167,10 @@ voice = "qiaoxiaojiao_v3.1"    # 系统音色名 / 复刻 voice_id / custom:<键
 # output_device = "CABLE Input (VB-Audio Virtual Cable)"   # 不填 = 系统默认
 
 [vad]
-enabled = true                 # 只上传语音段，省 ASR 费用
-margin_db = 9.0
-hangover_ms = 500
-tail_ms = 1000
+enabled = true                 # 只上传语音段，省 ASR 费用（Silero 神经网络 VAD）
+threshold = 0.5                # 起音概率阈值（0–1，越大越不敏感）
+min_silence_ms = 500           # 低于负阈值（threshold-0.15）持续该时长判定说完
+tail_ms = 1000                 # 句末补发静音，触发服务端 sentence_end
 
 [chunking]
 words = 6                      # 投机分块阈值
@@ -190,7 +190,7 @@ words = 6                      # 投机分块阈值
 
 - `[api] workspace_host` 只填**纯 host**，不要带 `wss://`、路径或端口；省略该字段则使用百炼通用域名。
 - `[audio]` 设备名按**完整名称精确匹配**：设备改名/被拔掉会明确报错，不会静默回退到默认设备。
-- `[vad] debug = true` 可打印每个音频块的 VAD 电平与发送决策，用于现场标定阈值（仅排障用）。
+- `[vad] debug = true` 可打印每个 chunk 的 Silero 概率、阈值与发送决策（仅排障用）；本地 VAD 不需要按麦克风/房间标定。
 - `[translate]` 的 `enabled` / `target` / `granularity` / `show_source` 也可在「翻译」页直接修改；`model` 只读。
 - `[vrchat.osc]` 的 `enabled` / `port` / `display` 也可在「VRChat」页直接修改；该段不进配置指纹，改设置不重启实时管线，文本固定 1 秒更新一次。
 - `[cache] file` 默认 `cache.json`（相对配置文件目录），同时保存音色复刻记录与 ASR 预编译热词的 `vocabulary_id`；删除它会导致下次重新复刻音色、重建热词列表。
@@ -262,6 +262,8 @@ rate = 1.0
 
 - **启动提示未配置 API Key**：在「设置」页填写后保存，或编辑 `config.toml` 的 `[api] key` 后点「重新加载配置」。
 - **设备打不开/找不到**：到「音频」页重新选择设备（完整名称会保存到配置）；设备改名或被拔掉时不会自动回退默认设备。
+- **说话没反应 / 顶栏 VAD 不亮**：确认麦克风有输入；本地 VAD 是 Silero 概率门控（默认阈值 0.5），轻声一般也能触发，环境噪声很大时可尝试 `[vad] threshold = 0.45`；`[vad] debug = true` 可看每个 chunk 的概率。
+- **顶部黄色「运行告警」提示本地 VAD 推理失败**：已降级为全量上传（识别不受影响，但会增加 ASR 费用）；停止后重新开始会话可重试；持续复现请附日志反馈。
 - **连接/鉴权失败**：检查 Key 是否有效、`[api] workspace_host` 是否填对（业务空间专属域名只填 host）；底部日志面板有服务端错误码。
 - **GPU 初始化失败 / 远程桌面黑屏**：发布版默认使用 wgpu（DX12）；可从源码用 `renderer-glow`（OpenGL）变体构建兜底，构建方式见 `CONTRIBUTING.md`。
 - **自定义音色失败**：检查样例音频路径、时长/大小/格式，以及账号下音色是否仍存在；日志里会标出是哪一步失败。
@@ -281,6 +283,14 @@ rate = 1.0
 
 ---
 
+## 第三方组件与许可
+
+- **Silero VAD**（<https://github.com/snakers4/silero-vad>，MIT）：内嵌的 `silero_vad_16k_op15.onnx` 语音活动检测模型；
+- **ONNX Runtime**（<https://github.com/microsoft/onnxruntime>，MIT）：Silero 的 CPU 推理运行时，已静态链接进 `kaols.exe`，无需额外安装或 DLL；
+- 发布包附带 `THIRD_PARTY_NOTICES.md`，包含上述 MIT 许可全文；其余 Rust 依赖的许可信息见仓库 `Cargo.lock` 与各 crate 仓库。
+
+---
+
 ## 开发、测试与发布
 
 从源码构建、运行测试、调试（含 egui_mcp 运行期观测）与发布打包的完整说明见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
@@ -290,9 +300,9 @@ rate = 1.0
 | 文档 | 内容 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 模块划分、数据流与关键算法 |
-| [docs/decisions.md](docs/decisions.md) | `D1`–`D33` 设计决定与理由 |
+| [docs/decisions.md](docs/decisions.md) | `D1`–`D34` 设计决定与理由 |
 | [AGENTS.md](AGENTS.md) | AI 编码代理的阅读入口 |
 
 百炼调试 CLI `admin` 仅用于本地开发调试（列出/删除账号下的远程复刻音色与预编译热词列表），**不随发布包分发**，用法见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
-> 发布包只包含本 `README.md`，上述文档不会随 zip 分发。
+> 发布包只包含本 `README.md` 与 `THIRD_PARTY_NOTICES.md`，上述开发文档不会随 zip 分发。

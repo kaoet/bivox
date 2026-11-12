@@ -1,83 +1,79 @@
-//! 本地粗粒度 VAD 与发送门控。
+//! 本地 Silero VAD 门控与发送状态机。
 //!
-//! 目的：把"静音也全程上传"变成"只上传语音 + 少量保活/尾部静音"，
-//! 在保持识别体验不变的前提下降低 ASR 费用。
+//! - [`SileroDetector`](crate::audio::silero::SileroDetector)：16k / 32ms 帧级语音概率；
+//! - [`SpeechGate`]：按采集 chunk 驱动的发送状态机，决定每个 chunk 该不该发给服务端。
 //!
-//! - [`EnergyVad`]：自适应噪声底 + 迟滞的能量 VAD（无第三方依赖，适配近场麦克风）
-//! - [`SpeechGate`]：按采集 chunk 驱动的发送状态机
-//!   （pre-roll / hangover / tail / keepalive），决定每个 chunk 该不该发给服务端
-//!
-//! 设计约束（来自实测）：
-//! - ASR run-task 任务在**没有任何音频**约 23s 后会被服务端 `task-failed`，
-//!   WS Ping 与 heartbeat 参数都救不了，只有音频能续；
-//! - 因此静音期必须每 <23s 补一小段静音（默认 10s 补 100ms，约 1% 开销）；
-//! - 服务端 VAD 需要看到约 `max_sentence_silence`(默认 800ms) 的静音才会吐出
-//!   `sentence_end`，所以语音结束后要补足尾部静音（hangover + tail 合计约 1.5s）。
+//! 设计约束（来自实测，见 docs/architecture.md §10.3）：
+//! - 服务端 ASR run-task 在**没有任何音频**约 23s 后会被 `task-failed`，
+//!   因此静音期必须每 `keepalive_ms` 补一小段静音；
+//! - 服务端 VAD 需要约 800ms 静音才会吐出 `sentence_end`，
+//!   所以语音结束后要补足尾部静音（`tail_ms`）；
+//! - Silero 每帧固定 512 采样（16k / 32ms）、模型内部需要 64 采样 context；
+//!   采集仍是 100ms chunk，由本模块把 chunk 拆成 32ms 帧并跨 chunk 携带余量。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 16kHz 单声道 PCM16：每毫秒 32 字节
+use anyhow::Result;
+
+use crate::audio::silero::SileroDetector;
+
+/// 16kHz 单声道 PCM16：每毫秒 32 字节。
 const BYTES_PER_MS: usize = 32;
-/// 数字静音/低于该电平时按该值处理，避免 log(0)
-const MIN_DBFS: f32 = -90.0;
-/// 噪声底向下跟随速度（低于噪声底时）
-const NOISE_DOWN_ALPHA: f32 = 0.25;
-/// 噪声底向上上浮速度（高于噪声底但当前不是语音时，缓慢上浮）
-const NOISE_UP_ALPHA: f32 = 0.002;
-/// 语音维持阈值比起音阈值低多少 dB（迟滞，避免句中出现短暂低能量时中断）
-const SUSTAIN_HYSTERESIS_DB: f32 = 3.0;
-/// 启动后的噪声底标定窗口：前 300ms 只测量不判定，避免未知底噪导致误触发
-const WARMUP_MS: u32 = 300;
+/// 起音需要连续多少帧概率 ≥ `threshold`（2 帧 = 64ms，过滤咔哒声）。
+const ONSET_FRAMES: u32 = 2;
+/// 负阈值相对起音阈值的回差（Silero 官方默认：`threshold - 0.15`）。
+const NEG_MARGIN: f32 = 0.15;
 
-/// 帧级语音检测器参数
-#[derive(Debug, Clone)]
-pub struct VadConfig {
-    /// 帧长（毫秒）。默认 20ms；起音判定粒度即该值
-    pub frame_ms: u32,
-    /// 起音阈值 = 噪声底 + margin_db
-    pub margin_db: f32,
-    /// 阈值绝对下限（dBFS），避免极安静环境下阈值过低
-    pub min_threshold_dbfs: f32,
-    /// 连续多少帧超过起音阈值才判定为语音（默认 2 帧 = 40ms）
-    pub onset_frames: u32,
-    /// 语音结束后维持多少毫秒才判定结束
-    pub hangover_ms: u32,
+/// 帧级语音概率检测器（生产实现是 Silero；单测用假实现）。
+pub trait FrameDetector {
+    /// 每帧采样数（Silero 固定 512）。
+    fn frame_samples(&self) -> usize;
+    /// 处理一帧 PCM16，返回该帧为语音的概率（0.0–1.0）。
+    fn process_frame(&mut self, frame: &[i16]) -> Result<f32>;
+    /// 重置瞬态（断线重连时调用）。
+    fn reset(&mut self);
 }
 
-impl Default for VadConfig {
-    fn default() -> Self {
-        Self {
-            frame_ms: 20,
-            margin_db: 9.0,
-            min_threshold_dbfs: -55.0,
-            onset_frames: 2,
-            hangover_ms: 500,
-        }
+impl FrameDetector for Box<dyn FrameDetector + Send> {
+    fn frame_samples(&self) -> usize {
+        (**self).frame_samples()
+    }
+
+    fn process_frame(&mut self, frame: &[i16]) -> Result<f32> {
+        (**self).process_frame(frame)
+    }
+
+    fn reset(&mut self) {
+        (**self).reset();
     }
 }
 
 /// 门控状态机参数
 #[derive(Debug, Clone)]
 pub struct GateConfig {
-    pub vad: VadConfig,
-    /// 起音时向前补发的历史音频（毫秒），避免切掉首字声母
+    /// 起音概率阈值（0–1）。负阈值自动取 `threshold - 0.15`。
+    pub threshold: f32,
+    /// 低于负阈值持续多久判定语音结束（毫秒）。
+    pub min_silence_ms: u32,
+    /// 起音时向前补发的历史音频（毫秒），避免切掉首字声母。
     pub pre_roll_ms: u32,
-    /// 语音结束后额外补发的静音（毫秒），用于触发服务端 sentence_end
+    /// 语音结束后额外补发的静音（毫秒），用于触发服务端 `sentence_end`。
     pub tail_ms: u32,
-    /// 完全空闲时补发保活静音的间隔（毫秒）；必须小于任务约 23s 的音频空闲超时
+    /// 完全空闲时补发保活静音的间隔（毫秒）；必须小于任务约 23s 的音频空闲超时。
     pub keepalive_ms: u32,
-    /// 打印每 chunk 的检测/发送决策，用于现场标定阈值
+    /// 打印每 chunk 的检测/发送决策，用于现场排障。
     pub debug: bool,
-    /// 可选：把「当前是否处于语音段」发布到共享标志（GUI 顶栏的 VAD 指示器用）
+    /// 可选：把「当前是否处于语音段」发布到共享标志（GUI 顶栏的 VAD 指示器用）。
     pub active_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GateConfig {
     fn default() -> Self {
         Self {
-            vad: VadConfig::default(),
+            threshold: 0.5,
+            min_silence_ms: 500,
             pre_roll_ms: 300,
             tail_ms: 1000,
             keepalive_ms: 10_000,
@@ -87,230 +83,114 @@ impl Default for GateConfig {
     }
 }
 
-/// 帧级语音检测器接口（便于将来替换为 webrtc-vad / Silero 等实现）
-pub trait VoiceDetector {
-    /// 处理一帧 PCM16（LE）音频，返回该帧是否处于语音段（含 hangover 维持）
-    fn process_frame(&mut self, frame: &[u8]) -> bool;
-    /// 当前是否处于语音段
-    fn is_active(&self) -> bool;
-    /// 重置瞬态（起音/拖尾状态、pre-roll 等），保留噪声底估计
-    fn reset_transient(&mut self);
-    /// 最近一帧的电平（dBFS），用于调试
-    fn last_frame_dbfs(&self) -> f32;
-    /// 当前噪声底估计（dBFS），用于调试
-    fn noise_dbfs(&self) -> f32;
-    /// 当前起音阈值（dBFS），用于调试
-    fn threshold_dbfs(&self) -> f32;
-}
-
-/// 自适应能量 VAD：
-/// 用"噪声底 + margin"作为动态阈值，连续多帧超过阈值才判定语音，
-/// 语音结束后维持 hangover 才判定结束。
-pub struct EnergyVad {
-    margin_db: f32,
-    min_threshold_dbfs: f32,
-    onset_frames: u32,
-    hangover_frames: u32,
-    noise_dbfs: f32,
-    last_frame_dbfs: f32,
-    active: bool,
-    above_frames: u32,
-    below_frames: u32,
-    /// 启动标定剩余帧数；期间强制返回非语音
-    warmup_frames_left: u32,
-    /// 标定窗口内的最小电平
-    warmup_min_db: f32,
-}
-
-impl EnergyVad {
-    pub fn new(config: &VadConfig) -> Self {
-        let hangover_frames = (config.hangover_ms / config.frame_ms.max(1)).max(1);
-        Self {
-            margin_db: config.margin_db,
-            min_threshold_dbfs: config.min_threshold_dbfs,
-            onset_frames: config.onset_frames.max(1),
-            hangover_frames,
-            // 初始噪声底给一个保守值，标定完成后由输入替换
-            noise_dbfs: -60.0,
-            last_frame_dbfs: MIN_DBFS,
-            active: false,
-            above_frames: 0,
-            below_frames: 0,
-            warmup_frames_left: (WARMUP_MS / config.frame_ms.max(1)).max(1),
-            warmup_min_db: f32::MAX,
-        }
-    }
-
-    /// 一帧 PCM16 的 RMS 电平（dBFS）
-    pub fn frame_dbfs(frame: &[u8]) -> f32 {
-        let mut sum = 0.0f64;
-        let mut count = 0u32;
-        for pair in frame.as_chunks::<2>().0 {
-            let sample = i16::from_le_bytes(*pair) as f64 / 32768.0;
-            sum += sample * sample;
-            count += 1;
-        }
-        if count == 0 {
-            return MIN_DBFS;
-        }
-        let rms = (sum / count as f64).sqrt();
-        if rms <= 1e-9 {
-            MIN_DBFS
-        } else {
-            ((20.0 * rms.log10()) as f32).clamp(MIN_DBFS, 0.0)
-        }
-    }
-
-    fn onset_threshold_dbfs(&self) -> f32 {
-        (self.noise_dbfs + self.margin_db).max(self.min_threshold_dbfs)
-    }
-
-    fn update_noise_floor(&mut self, frame_dbfs: f32) {
-        if frame_dbfs < self.noise_dbfs {
-            // 环境变安静：快速跟随
-            self.noise_dbfs += NOISE_DOWN_ALPHA * (frame_dbfs - self.noise_dbfs);
-        } else if !self.active {
-            // 语音段内不向上学习，避免把说话声学成噪声底
-            self.noise_dbfs += NOISE_UP_ALPHA * (frame_dbfs - self.noise_dbfs);
-        }
-    }
-}
-
-impl VoiceDetector for EnergyVad {
-    fn process_frame(&mut self, frame: &[u8]) -> bool {
-        if frame.len() < 2 {
-            return self.active;
-        }
-        let frame_dbfs = Self::frame_dbfs(frame);
-        self.last_frame_dbfs = frame_dbfs;
-
-        // 启动标定：只记录最小电平，不判定语音
-        if self.warmup_frames_left > 0 {
-            self.warmup_min_db = self.warmup_min_db.min(frame_dbfs);
-            self.warmup_frames_left -= 1;
-            if self.warmup_frames_left == 0 {
-                self.noise_dbfs = self.warmup_min_db.clamp(MIN_DBFS, -20.0);
-            }
-            return false;
-        }
-
-        self.update_noise_floor(frame_dbfs);
-
-        let onset_threshold = self.onset_threshold_dbfs();
-        let sustain_threshold = onset_threshold - SUSTAIN_HYSTERESIS_DB;
-
-        if self.active {
-            if frame_dbfs > sustain_threshold {
-                self.below_frames = 0;
-            } else {
-                self.below_frames += 1;
-                if self.below_frames >= self.hangover_frames {
-                    self.active = false;
-                    self.above_frames = 0;
-                    self.below_frames = 0;
-                }
-            }
-        } else if frame_dbfs > onset_threshold {
-            self.above_frames += 1;
-            if self.above_frames >= self.onset_frames {
-                self.active = true;
-                self.below_frames = 0;
-            }
-        } else {
-            self.above_frames = 0;
-        }
-
-        self.active
-    }
-
-    fn is_active(&self) -> bool {
-        self.active
-    }
-
-    fn reset_transient(&mut self) {
-        self.active = false;
-        self.above_frames = 0;
-        self.below_frames = 0;
-    }
-
-    fn last_frame_dbfs(&self) -> f32 {
-        self.last_frame_dbfs
-    }
-
-    fn noise_dbfs(&self) -> f32 {
-        self.noise_dbfs
-    }
-
-    fn threshold_dbfs(&self) -> f32 {
-        self.onset_threshold_dbfs()
-    }
-}
+/// 生产用门控：Silero 检测器（具体类型，便于会话直接持有）。
+pub type SileroGate = SpeechGate<SileroDetector>;
+/// 类型擦除门控：会话可注入 Silero，单测/ASR 集成测试可注入假检测器。
+pub type AnyGate = SpeechGate<Box<dyn FrameDetector + Send>>;
 
 /// 采集 chunk 的发送门控状态机。
 ///
 /// 输入是采集端 100ms 的 PCM16 chunk（也兼容其它长度），输出是需要实际发往
 /// ASR 的 chunk 列表：
 /// - 语音段：原样发送（起音时额外补发 pre-roll）
-/// - 语音刚结束：发送 hangover 期间的静音 + `tail_ms` 的零静音
+/// - 语音刚结束：发送 `tail_ms` 的零静音（触发服务端 `sentence_end`）
 /// - 完全空闲：每 `keepalive_ms` 发送一个与输入等长的零静音
-pub struct SpeechGate<D: VoiceDetector = EnergyVad> {
+pub struct SpeechGate<D: FrameDetector> {
     config: GateConfig,
     detector: D,
+    frame_samples: usize,
+    min_silence_frames: u32,
+    neg_threshold: f32,
+    /// 跨 chunk 的采样余量（不足一帧时留到下一个 chunk）。
+    carry: Vec<i16>,
+    active: bool,
+    above_frames: u32,
+    below_frames: u32,
     pre_roll: VecDeque<Vec<u8>>,
     pre_roll_bytes: usize,
     pre_roll_limit_bytes: usize,
     tail_ms_left: u32,
     idle_ms_since_send: u32,
+    /// 推理失败后降级为「全量上传」，避免静默丢音频。
+    degraded: bool,
+    last_prob: f32,
 }
 
-impl SpeechGate<EnergyVad> {
-    pub fn new(config: GateConfig) -> Self {
-        let detector = EnergyVad::new(&config.vad);
-        Self::with_detector(config, detector)
+impl SpeechGate<SileroDetector> {
+    /// 创建生产用门控（加载内嵌的 Silero 模型）。
+    pub fn new(config: GateConfig) -> Result<Self> {
+        Ok(Self::with_detector(config, SileroDetector::new()?))
     }
 }
 
-impl<D: VoiceDetector> SpeechGate<D> {
+impl<D: FrameDetector> SpeechGate<D> {
     pub fn with_detector(config: GateConfig, detector: D) -> Self {
+        let frame_samples = detector.frame_samples().max(1);
+        let frame_ms = ((frame_samples as u64 * 1000) / 16_000).max(1) as u32;
+        let min_silence_frames = config.min_silence_ms.div_ceil(frame_ms).max(1);
+        let neg_threshold = (config.threshold - NEG_MARGIN).max(0.01);
         let pre_roll_limit_bytes = config.pre_roll_ms.max(1) as usize * BYTES_PER_MS;
         Self {
             config,
             detector,
+            frame_samples,
+            min_silence_frames,
+            neg_threshold,
+            carry: Vec::new(),
+            active: false,
+            above_frames: 0,
+            below_frames: 0,
             pre_roll: VecDeque::new(),
             pre_roll_bytes: 0,
             pre_roll_limit_bytes,
             tail_ms_left: 0,
             idle_ms_since_send: 0,
+            degraded: false,
+            last_prob: 0.0,
         }
     }
 
-    /// 处理一个采集 chunk，返回需要发送给 ASR 的 chunk 列表（可能为空）
+    /// 处理一个采集 chunk，返回需要发送给 ASR 的 chunk 列表（可能为空）。
     pub fn process_chunk(&mut self, chunk: Vec<u8>) -> Vec<Vec<u8>> {
         if chunk.is_empty() {
             return Vec::new();
         }
+        if self.degraded {
+            return vec![chunk];
+        }
         let chunk_ms = (chunk.len() / BYTES_PER_MS).max(1) as u32;
-        let frame_bytes = (self.config.vad.frame_ms.max(1) as usize) * BYTES_PER_MS;
 
-        // 1. 逐 20ms 帧检测本 chunk 内是否出现语音/起音
+        // 1. 拆成 32ms 帧，逐帧更新概率状态机
         let mut onset = false;
         let mut any_active = false;
-        let mut was_active = self.detector.is_active();
-        for frame in chunk.chunks(frame_bytes) {
-            let active = self.detector.process_frame(frame);
-            if active && !was_active {
+        for pair in chunk.chunks_exact(2) {
+            self.carry.push(i16::from_le_bytes([pair[0], pair[1]]));
+            if self.carry.len() < self.frame_samples {
+                continue;
+            }
+            let frame: Vec<i16> = self.carry.drain(..self.frame_samples).collect();
+            let prob = match self.detector.process_frame(&frame) {
+                Ok(p) => p,
+                Err(err) => {
+                    log::error!("本地 VAD 推理失败，降级为全量上传: {err:#}");
+                    self.degraded = true;
+                    self.carry.clear();
+                    self.publish_active(false);
+                    return vec![chunk];
+                }
+            };
+            self.last_prob = prob;
+            let was_active = self.active;
+            self.update_state(prob);
+            if self.active && !was_active {
                 onset = true;
             }
-            any_active |= active;
-            was_active = active;
+            any_active |= self.active;
         }
+        self.publish_active(self.active);
 
         // 2. 决定本 chunk 是否发送
         let mut out = Vec::new();
-        // 把「当前是否在语音段」发布给 GUI（含 hangover 结束后自动变回 false）
-        if let Some(flag) = &self.config.active_flag {
-            flag.store(self.detector.is_active(), Ordering::Relaxed);
-        }
         if any_active {
             if onset {
                 // 起音：补发 pre-roll（历史 chunk），再发当前 chunk
@@ -341,10 +221,10 @@ impl<D: VoiceDetector> SpeechGate<D> {
                 "idle"
             };
             log::warn!(
-                "🎚️ VAD db={:.1} noise={:.1} thr={:.1} {} -> emitted {}chunk(s), tail_left={}ms",
-                self.detector.last_frame_dbfs(),
-                self.detector.noise_dbfs(),
-                self.detector.threshold_dbfs(),
+                "🎚️ VAD p={:.3} thr={:.2} neg={:.2} {} -> emitted {}chunk(s), tail_left={}ms",
+                self.last_prob,
+                self.config.threshold,
+                self.neg_threshold,
                 state,
                 out.len(),
                 self.tail_ms_left
@@ -356,15 +236,52 @@ impl<D: VoiceDetector> SpeechGate<D> {
         out
     }
 
-    /// 断线重连后重置瞬态（保留噪声底估计）
+    /// 断线重连后重置瞬态（模型状态、起音/拖尾、pre-roll 等）。
     pub fn reset_transient(&mut self) {
-        self.detector.reset_transient();
+        self.detector.reset();
+        self.carry.clear();
+        self.active = false;
+        self.above_frames = 0;
+        self.below_frames = 0;
         self.pre_roll.clear();
         self.pre_roll_bytes = 0;
         self.tail_ms_left = 0;
         self.idle_ms_since_send = 0;
+        self.last_prob = 0.0;
+        self.publish_active(false);
+    }
+
+    /// 推理是否已失败并降级为全量上传（供会话上报 GUI 告警）。
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    fn update_state(&mut self, prob: f32) {
+        if self.active {
+            if prob >= self.neg_threshold {
+                self.below_frames = 0;
+            } else {
+                self.below_frames += 1;
+                if self.below_frames >= self.min_silence_frames {
+                    self.active = false;
+                    self.above_frames = 0;
+                    self.below_frames = 0;
+                }
+            }
+        } else if prob >= self.config.threshold {
+            self.above_frames += 1;
+            if self.above_frames >= ONSET_FRAMES {
+                self.active = true;
+                self.below_frames = 0;
+            }
+        } else {
+            self.above_frames = 0;
+        }
+    }
+
+    fn publish_active(&self, active: bool) {
         if let Some(flag) = &self.config.active_flag {
-            flag.store(false, Ordering::Relaxed);
+            flag.store(active, Ordering::Relaxed);
         }
     }
 
@@ -382,31 +299,19 @@ impl<D: VoiceDetector> SpeechGate<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::AtomicUsize;
 
-    const FRAME_SAMPLES: usize = 320; // 20ms @16k
+    const FRAME_SAMPLES: usize = 512; // 32ms
 
-    fn silence_frame() -> Vec<u8> {
+    fn silence_chunk() -> Vec<u8> {
         vec![0u8; FRAME_SAMPLES * 2]
     }
 
-    fn tone_frame(amplitude: i16) -> Vec<u8> {
+    fn voice_chunk() -> Vec<u8> {
         let mut out = Vec::with_capacity(FRAME_SAMPLES * 2);
-        for i in 0..FRAME_SAMPLES {
-            let phase = 2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0;
-            let sample = (phase.sin() * amplitude as f32) as i16;
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
-        out
-    }
-
-    fn silence_chunk() -> Vec<u8> {
-        vec![0u8; 5 * FRAME_SAMPLES * 2] // 100ms
-    }
-
-    fn tone_chunk(amplitude: i16) -> Vec<u8> {
-        let mut out = Vec::new();
-        for _ in 0..5 {
-            out.extend_from_slice(&tone_frame(amplitude));
+        for _ in 0..FRAME_SAMPLES {
+            out.extend_from_slice(&1000i16.to_le_bytes());
         }
         out
     }
@@ -415,146 +320,184 @@ mod tests {
         chunk.iter().all(|byte| *byte == 0)
     }
 
-    fn test_gate_config() -> GateConfig {
+    fn gate_config(pre_roll_ms: u32, tail_ms: u32, keepalive_ms: u32) -> GateConfig {
         GateConfig {
-            vad: VadConfig {
-                hangover_ms: 100,
-                onset_frames: 2,
-                ..Default::default()
-            },
-            pre_roll_ms: 100,
-            tail_ms: 200,
-            keepalive_ms: 500,
+            threshold: 0.5,
+            min_silence_ms: 64, // 2 帧
+            pre_roll_ms,
+            tail_ms,
+            keepalive_ms,
             debug: false,
             active_flag: None,
         }
     }
 
+    /// 按预设概率序列返回（用完后回落到 fallback）。
+    struct Scripted {
+        probs: VecDeque<f32>,
+        fallback: f32,
+    }
+
+    impl Scripted {
+        fn new(probs: &[f32]) -> Self {
+            Self {
+                probs: probs.iter().copied().collect(),
+                fallback: 0.0,
+            }
+        }
+    }
+
+    impl FrameDetector for Scripted {
+        fn frame_samples(&self) -> usize {
+            FRAME_SAMPLES
+        }
+
+        fn process_frame(&mut self, _frame: &[i16]) -> Result<f32> {
+            Ok(self.probs.pop_front().unwrap_or(self.fallback))
+        }
+
+        fn reset(&mut self) {
+            self.probs.clear();
+        }
+    }
+
+    struct Counting {
+        calls: StdArc<AtomicUsize>,
+        prob: f32,
+    }
+
+    impl FrameDetector for Counting {
+        fn frame_samples(&self) -> usize {
+            FRAME_SAMPLES
+        }
+
+        fn process_frame(&mut self, _frame: &[i16]) -> Result<f32> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.prob)
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    struct Failing;
+
+    impl FrameDetector for Failing {
+        fn frame_samples(&self) -> usize {
+            FRAME_SAMPLES
+        }
+
+        fn process_frame(&mut self, _frame: &[i16]) -> Result<f32> {
+            anyhow::bail!("boom")
+        }
+
+        fn reset(&mut self) {}
+    }
+
     #[test]
-    fn energy_vad_detects_tone_and_hangover() {
-        let mut vad = EnergyVad::new(&VadConfig {
-            hangover_ms: 100,
-            onset_frames: 2,
-            ..Default::default()
-        });
+    fn onset_requires_two_frames_and_sends_pre_roll() {
+        let flag = StdArc::new(AtomicBool::new(false));
+        let mut config = gate_config(32, 0, 10_000);
+        config.active_flag = Some(flag.clone());
+        let mut gate = SpeechGate::with_detector(config, Scripted::new(&[0.9, 0.9]));
 
-        // 启动标定窗口 300ms（15 帧）内强制非语音
-        for _ in 0..15 {
-            assert!(!vad.process_frame(&silence_frame()));
-        }
-
-        // 起音需要连续 2 帧超过阈值
-        assert!(!vad.process_frame(&tone_frame(3000)), "起音需要连续 2 帧");
-        assert!(vad.process_frame(&tone_frame(3000)));
-        assert!(vad.is_active());
-
-        // hangover 100ms = 5 帧：前 4 帧仍 active，第 5 帧结束
-        for _ in 0..4 {
-            assert!(vad.process_frame(&silence_frame()));
-        }
         assert!(
-            !vad.process_frame(&silence_frame()),
-            "超过 hangover 后应结束"
+            gate.process_chunk(silence_chunk()).is_empty(),
+            "单帧不应起音"
         );
-        assert!(!vad.is_active());
+        assert!(!flag.load(Ordering::Relaxed));
+
+        let out = gate.process_chunk(voice_chunk());
+        assert_eq!(out.len(), 2, "起音应补 pre-roll + 当前 chunk");
+        assert!(is_silent(&out[0]), "pre-roll 是上一个静音 chunk");
+        assert!(!is_silent(&out[1]));
+        assert!(flag.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn energy_vad_ignores_short_click() {
-        let mut vad = EnergyVad::new(&VadConfig {
-            onset_frames: 2,
-            ..Default::default()
-        });
-        for _ in 0..15 {
-            assert!(!vad.process_frame(&silence_frame()));
-        }
-        // 单帧突发（20ms，低于 40ms 起音要求）不应触发
-        assert!(!vad.process_frame(&tone_frame(8000)));
-        for _ in 0..5 {
-            assert!(!vad.process_frame(&silence_frame()));
-        }
-        assert!(!vad.is_active());
-    }
-
-    #[test]
-    fn gate_gates_silence_and_sends_keepalive() {
-        let mut gate = SpeechGate::new(test_gate_config());
-        let mut emitted = 0;
-        for _ in 0..20 {
-            let out = gate.process_chunk(silence_chunk());
-            assert!(out.iter().all(|chunk| is_silent(chunk)));
-            emitted += out.len();
-        }
-        // 500ms 保活间隔：20 个 100ms chunk 应发 4 个保活静音
-        assert_eq!(emitted, 4);
-    }
-
-    #[test]
-    fn gate_sends_pre_roll_speech_hangover_and_tail() {
-        let mut gate = SpeechGate::new(test_gate_config());
-        let mut per_chunk = Vec::new();
-
-        // 3 个静音 chunk：启动标定，不发送
-        for _ in 0..3 {
-            per_chunk.push(gate.process_chunk(silence_chunk()).len());
-        }
-
-        // 2 个语音 chunk：第一个起音（补 pre-roll），第二个正常发送
-        per_chunk.push(gate.process_chunk(tone_chunk(3000)).len());
-        per_chunk.push(gate.process_chunk(tone_chunk(3000)).len());
-
-        // 1 个静音 chunk：仍在 hangover 内，按语音发送
-        per_chunk.push(gate.process_chunk(silence_chunk()).len());
-        // 2 个静音 chunk：进入 tail
-        per_chunk.push(gate.process_chunk(silence_chunk()).len());
-        per_chunk.push(gate.process_chunk(silence_chunk()).len());
-        // 4 个静音 chunk：tail 结束后的空闲，未到 500ms 保活
-        for _ in 0..4 {
-            per_chunk.push(gate.process_chunk(silence_chunk()).len());
-        }
-        // 第 5 个空闲 chunk 触发保活
-        per_chunk.push(gate.process_chunk(silence_chunk()).len());
-
+    fn min_silence_ends_speech() {
+        let mut gate = SpeechGate::with_detector(
+            gate_config(32, 0, 10_000),
+            Scripted::new(&[0.9, 0.9, 0.0, 0.0, 0.0]),
+        );
+        assert!(gate.process_chunk(silence_chunk()).is_empty());
+        assert_eq!(gate.process_chunk(voice_chunk()).len(), 2);
         assert_eq!(
-            per_chunk,
-            vec![0, 0, 0, 2, 1, 1, 1, 1, 0, 0, 0, 0, 1],
-            "pre-roll/hangover/tail/keepalive 发送节奏"
+            gate.process_chunk(silence_chunk()).len(),
+            1,
+            "第一帧静音仍在保持期"
         );
-    }
-
-    #[test]
-    fn gate_recovers_speech_during_tail() {
-        let mut gate = SpeechGate::new(test_gate_config());
-        // 启动标定
-        for _ in 0..3 {
-            gate.process_chunk(silence_chunk());
-        }
-        // 一句语音
-        gate.process_chunk(tone_chunk(3000));
-        // tail 期间（第 1 个静音 chunk）
-        let tail_out = gate.process_chunk(silence_chunk());
-        assert_eq!(tail_out.len(), 1);
-        assert!(is_silent(&tail_out[0]));
-
-        // tail 期间重新开口：应恢复发送真实音频而不是继续丢弃
-        let speech_out = gate.process_chunk(tone_chunk(3000));
-        assert!(!speech_out.is_empty());
         assert!(
-            speech_out.iter().any(|chunk| !is_silent(chunk)),
-            "tail 期间重新起音必须发送真实语音"
+            gate.process_chunk(silence_chunk()).is_empty(),
+            "超过 min_silence 后应结束"
         );
+        assert!(!gate.active);
     }
 
     #[test]
-    fn reset_transient_clears_pending_state() {
-        let mut gate = SpeechGate::new(test_gate_config());
-        for _ in 0..3 {
-            gate.process_chunk(silence_chunk());
+    fn tail_sends_zero_chunks_after_speech() {
+        let mut gate = SpeechGate::with_detector(
+            gate_config(32, 64, 10_000),
+            Scripted::new(&[0.9, 0.9, 0.0, 0.0, 0.0, 0.0]),
+        );
+        assert!(gate.process_chunk(silence_chunk()).is_empty());
+        assert_eq!(gate.process_chunk(voice_chunk()).len(), 2);
+        assert_eq!(gate.process_chunk(silence_chunk()).len(), 1);
+        let tail1 = gate.process_chunk(silence_chunk());
+        assert_eq!(tail1.len(), 1);
+        assert!(is_silent(&tail1[0]), "tail 应是零静音");
+        let tail2 = gate.process_chunk(silence_chunk());
+        assert_eq!(tail2.len(), 1);
+        assert!(is_silent(&tail2[0]));
+        assert!(gate.process_chunk(silence_chunk()).is_empty(), "tail 结束");
+    }
+
+    #[test]
+    fn idle_sends_keepalive_every_interval() {
+        let mut gate = SpeechGate::with_detector(gate_config(32, 0, 96), Scripted::new(&[]));
+        let mut emitted = Vec::new();
+        for _ in 0..6 {
+            emitted.push(gate.process_chunk(silence_chunk()).len());
         }
-        gate.process_chunk(tone_chunk(3000));
+        assert_eq!(emitted, vec![0, 0, 1, 0, 0, 1]);
+        assert!(gate.process_chunk(silence_chunk()).len() == 0);
+    }
+
+    #[test]
+    fn chunks_are_framed_across_boundaries() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let mut gate = SpeechGate::with_detector(
+            gate_config(32, 0, 10_000),
+            Counting {
+                calls: calls.clone(),
+                prob: 0.0,
+            },
+        );
+        // 1600 采样 = 3×512 帧 + 64 采样余量；下一 chunk 继续消费余量
+        gate.process_chunk(vec![0u8; 1600 * 2]);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        gate.process_chunk(vec![0u8; 1600 * 2]);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn reset_transient_clears_state() {
+        let mut gate =
+            SpeechGate::with_detector(gate_config(32, 0, 10_000), Scripted::new(&[0.9, 0.9]));
+        gate.process_chunk(voice_chunk());
+        gate.process_chunk(voice_chunk());
+        assert!(gate.active);
         gate.reset_transient();
-        // 重置后第一个静音 chunk 不应再发 tail
-        let out = gate.process_chunk(silence_chunk());
-        assert!(out.is_empty());
+        assert!(!gate.active);
+        assert!(gate.process_chunk(silence_chunk()).is_empty());
+    }
+
+    #[test]
+    fn inference_failure_degrades_to_passthrough() {
+        let mut gate = SpeechGate::with_detector(gate_config(32, 0, 10_000), Failing);
+        let chunk = voice_chunk();
+        let out = gate.process_chunk(chunk.clone());
+        assert_eq!(out, vec![chunk.clone()], "失败后应原样上传");
+        let out = gate.process_chunk(chunk.clone());
+        assert_eq!(out, vec![chunk], "降级后持续全量上传");
     }
 }

@@ -1,7 +1,8 @@
 # 发布打包脚本
 #
 # 产物：dist\kaols-<version>-win64.zip
-#   只包含 kaols.exe + README.md（不含 config.toml / config.example.toml / 调试工具 / 缓存 / 日志）。
+#   只包含 kaols.exe + README.md + THIRD_PARTY_NOTICES.md
+#   （不含 config.toml / config.example.toml / 调试工具 / 缓存 / 日志；ONNX Runtime 已静态链接进 exe）
 #
 # 用法：
 #   .\scripts\package.ps1             # 构建 release 并打包
@@ -36,6 +37,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 Copy-Item $exe $stage
 Copy-Item (Join-Path $root "README.md") $stage
+Copy-Item (Join-Path $root "THIRD_PARTY_NOTICES.md") $stage
 
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
@@ -46,4 +48,4 @@ Write-Host "打包完成：$zip"
 Write-Host "  版本：$version"
 Write-Host "  kaols.exe：$exeMb MB"
 Write-Host "  zip：$sizeMb MB"
-Write-Host "  内容：kaols.exe + README.md（无 config.toml、无密钥）"
+Write-Host "  内容：kaols.exe + README.md + THIRD_PARTY_NOTICES.md（无 config.toml、无密钥、无 DLL）"

@@ -117,15 +117,14 @@
 # output_device = "CABLE Input (VB-Audio Virtual Cable)"
 
 [vad]
-# 本地 VAD 门控：只上传语音段，节省 ASR 费用（默认开启）
-# enabled = true
-# 起音阈值 = 噪声底 + margin_db（dB）
-# margin_db = 9.0
-# 语音结束后拖尾保持（毫秒）
-# hangover_ms = 500
+# 本地 VAD 门控：基于 Silero 神经网络模型，只上传语音段，节省 ASR 费用（默认开启）
+# 起音概率阈值（0~1，越大越不敏感）；负阈值自动取 threshold - 0.15
+# threshold = 0.5
+# 低于负阈值持续该时长后判定语音结束（毫秒）
+# min_silence_ms = 500
 # 句末补发的尾部静音（毫秒），用于触发服务端 sentence_end
 # tail_ms = 1000
-# 打印每个 chunk 的 VAD 电平/阈值/发送决策，用于现场标定
+# 打印每个 chunk 的 VAD 概率/阈值/发送决策，用于现场排障
 # debug = false
 
 [chunking]

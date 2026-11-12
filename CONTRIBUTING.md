@@ -2,7 +2,7 @@
 
 本文件面向**开发与贡献者**（以及需要维护本仓库的 AI 编码代理），是项目开发流程、编码规范与发布流程的**唯一权威来源**。
 
-- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D33`）
+- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D34`）
 - 模块、数据流与算法：[`docs/architecture.md`](docs/architecture.md)
 - 用户使用说明：[`README.md`](README.md)
 - AI 代理入口：[`AGENTS.md`](AGENTS.md)（只做导航，不重复本文件规则）
@@ -14,7 +14,7 @@
 ## 1. 环境要求
 
 - Windows 10/11 x64；
-- Rust（rustup 安装），MSRV **1.95**（egui 0.37 要求），当前开发工具链为 **rustc 1.99.1**；
+- Rust（rustup 安装），MSRV **1.95**（egui 0.37 要求），edition **2024**，当前开发工具链为 **rustc 1.99.1**；
 - Visual Studio Build Tools（含 MSVC 链接器与 Windows SDK；安装时勾选“使用 C++ 的桌面开发”/C++ 生成工具）；
 - PowerShell（`scripts/` 下是 `.ps1` 脚本）；
 - 运行实时功能需要百炼 API Key。
@@ -52,6 +52,7 @@ cargo test                # 全部单元测试
 注意：
 
 - `cargo run` 不带 `dev-run.ps1` 时，`target\debug\` 下需要有可用的 `config.toml`；
+- 首次构建会从 pyke CDN 下载 ONNX Runtime 预编译包并**静态链接**进 exe（需要网络；离线构建用 `ORT_LIB_LOCATION` / `ORT_LIB_PATH` 指向已解压的 ORT 包）；`ort` 版本钉死在 `Cargo.toml`；
 - 本机的 `config.toml`、`cache.json`、`logs/`、`crash.log`、`dist/`、`target/` 都不提交（`.gitignore` 已覆盖）；
 - release 构建配置在 `Cargo.toml`（`lto = "thin"`、`strip = true`、`codegen-units = 1`），exe 图标由 `build.rs` 写入。
 
@@ -92,7 +93,7 @@ cargo test -- --nocapture
 - GUI 底部日志面板：内存保留最近 5000 行，面板渲染最近 500 行；
 - `logs\kaols-YYYY-MM-DD.log`：按天文件，保留 7 天；
 - `crash.log`：panic 钩子写入（含 backtrace），界面也会显示崩溃横幅；
-- `[vad] debug = true`：每个音频块打印 VAD 电平、噪声底、阈值与发送决策，用于标定阈值。
+- `[vad] debug = true`：每个音频块打印 Silero 概率、阈值与发送决策，用于排障（本地 VAD 不需要按麦克风/房间标定）。
 
 ### egui_mcp：让 agent/开发者在真实窗口中操作与截图
 
@@ -199,7 +200,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 - `config.toml` 是唯一配置事实源；GUI 只能写：`[api] key`、`[audio]` 设备、`[asr] model` / `[asr] languages` / `[asr] hotwords`（「语音识别」页）、`[tts] voice` / `[tts] dialect` / `[tts.custom_voices]`、`[translate] enabled` / `target` / `granularity` / `show_source`（「翻译」页）、`[vrchat.osc] enabled` / `port` / `display`（「VRChat」页）；`[vad]` / `[chunking]` 等仍只读；
 - 写回使用 `toml_edit` 定点修改：写前用 `AppConfig::from_toml_str` 校验、写前备份 `config.toml.bak`、无改动不写盘；
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
-- 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md`；
+- 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
 - 不要提交 `config.toml`、`config.toml.bak`、`cache.json`、`logs/`、`crash.log`。
 
 ### 音色、缓存与热词
@@ -221,7 +222,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 - 项目尚未发布：配置/缓存文件里不要引入版本号，不要写旧格式兼容代码；文件格式变化时让旧文件解析失败并自动备份重建即可；
 - 不要为“旧配置/旧数据不再兼容”写测试，也不要在文档中描述迁移/兼容说明；
-- 依赖版本遵循 [`docs/decisions.md`](docs/decisions.md) D1/D15（eframe/egui 钉 `=0.37.0`，cpal 0.18），不要随意升级 GUI/音频依赖。
+- 依赖版本遵循 [`docs/decisions.md`](docs/decisions.md) D1/D15（eframe/egui 钉 `=0.37.0`，cpal 0.18，ort 钉 `=2.0.0-rc.15`），不要随意升级 GUI/音频/推理依赖。
 
 ---
 
@@ -273,8 +274,9 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
    ```
 
 4. 检查产物 `dist\kaols-<version>-win64.zip`：
-   - 只包含 `kaols.exe` + `README.md`；
+   - 只包含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
    - 不含 `config.toml`、`config.example.toml`、`cache.json`、日志、`admin` 调试工具；
+   - ONNX Runtime 已静态链接进 exe，**不要**再往 zip 里放 DLL；
 5. 冒烟检查（人工）：
    - 干净目录解压，首次启动生成配置并落在设置页；
    - 填 Key 后实时会话能开始/停止，设备正确打开与释放；

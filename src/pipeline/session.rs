@@ -7,8 +7,8 @@
 //!   确保麦克风/扬声器被释放。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,14 +18,16 @@ use tokio::task::JoinHandle;
 use crate::audio::capture::AudioCapture;
 use crate::audio::device::AudioDeviceManager;
 use crate::audio::playback::AudioPlaybackEngine;
+use crate::audio::silero::SileroDetector;
 use crate::audio::vad;
+use crate::audio::vad_thread;
+use crate::client::AsrEvent;
 use crate::client::qwen_asr::QwenAsrClient;
 use crate::client::qwen_mt::QwenMtClient;
 use crate::client::qwen_tts::{QwenTtsClient, QwenTtsConfig, TtsChunkRequest};
-use crate::client::AsrEvent;
 use crate::config::{AppConfig, TranslateGranularity};
 use crate::events::{PipelineEvent, SessionState};
-use crate::language::{canonical_language, LanguageTracker};
+use crate::language::{LanguageTracker, canonical_language};
 use crate::pipeline::chunker::{ChunkPolicy, TextChunker};
 use crate::pipeline::translator::{self, TranslationDone, TranslationJob};
 use crate::voice::ActiveVoice;
@@ -54,6 +56,10 @@ pub struct PipelineSessionHandle {
     stop_requested: Arc<AtomicBool>,
     /// 本地 VAD 当前是否处于语音段（由 `SpeechGate` 更新，GUI 只读）。
     vad_active: Arc<AtomicBool>,
+    /// 本地 VAD 是否已因推理失败降级为全量上传（GUI 告警用）。
+    vad_degraded: Arc<AtomicBool>,
+    /// 请求 VAD 线程在下一块音频前重置瞬态（断线重连时由 ASR 置位）。
+    vad_reset: Arc<AtomicBool>,
     /// 打字输入命令通道（GUI 提交，会话调度循环消费）。
     typed_tx: UnboundedSender<TypedInput>,
 }
@@ -64,6 +70,8 @@ impl PipelineSessionHandle {
             running: Arc::new(AtomicBool::new(true)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             vad_active: Arc::new(AtomicBool::new(false)),
+            vad_degraded: Arc::new(AtomicBool::new(false)),
+            vad_reset: Arc::new(AtomicBool::new(false)),
             typed_tx,
         }
     }
@@ -78,9 +86,26 @@ impl PipelineSessionHandle {
         self.vad_active.load(Ordering::Relaxed)
     }
 
-    /// 会话停止/失败后把指示器复位。
+    /// 本地 VAD 是否已降级为全量上传。
+    pub fn vad_degraded(&self) -> bool {
+        self.vad_degraded.load(Ordering::Relaxed)
+    }
+
+    /// 传给 VAD 线程的重置标志。
+    fn vad_reset_flag(&self) -> Arc<AtomicBool> {
+        self.vad_reset.clone()
+    }
+
+    /// 传给 VAD 线程的降级标志。
+    fn vad_degraded_flag(&self) -> Arc<AtomicBool> {
+        self.vad_degraded.clone()
+    }
+
+    /// 会话停止/失败后把指示器与降级状态复位。
     pub fn reset_vad(&self) {
         self.vad_active.store(false, Ordering::Relaxed);
+        self.vad_degraded.store(false, Ordering::Relaxed);
+        self.vad_reset.store(false, Ordering::Relaxed);
     }
 
     /// 请求停止（用户点「停止」或关窗时调用；后台任务会在一个轮询周期内退出）。
@@ -182,27 +207,39 @@ pub async fn run(
     let (tx_mic, rx_mic) = mpsc::channel::<Vec<u8>>(100);
     let capture = AudioCapture::start(&in_dev, tx_mic)?;
 
+    // VAD 线程：原始 chunk 先经 Silero 门控，再交给 ASR 任务上传。
+    // 不放在 cpal 实时回调（禁止推理）与 ASR 任务（避免阻塞 socket 读写）里，见 D34。
+    let (tx_gated, rx_gated) = mpsc::channel::<Vec<u8>>(100);
+    let (asr_audio_rx, mut vad_worker_thread) = if config.vad.enabled {
+        let gate = vad::SpeechGate::with_detector(
+            vad::GateConfig {
+                threshold: config.vad.threshold,
+                min_silence_ms: config.vad.min_silence_ms,
+                tail_ms: config.vad.tail_ms,
+                debug: config.vad.debug,
+                // 把语音段状态发布给 GUI 顶栏的 VAD 指示器
+                active_flag: Some(handle.vad_active.clone()),
+                ..Default::default()
+            },
+            SileroDetector::new()?,
+        );
+        let worker = vad_thread::spawn(
+            gate,
+            rx_mic,
+            tx_gated,
+            handle.vad_reset_flag(),
+            handle.vad_degraded_flag(),
+        )?;
+        (rx_gated, Some(worker))
+    } else {
+        (rx_mic, None)
+    };
+
     let inference_ws_url = config.inference_ws_url();
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     // ASR 任务
     let (tx_asr, mut rx_asr) = mpsc::channel(100);
-    let asr_gate = if config.vad.enabled {
-        Some(vad::SpeechGate::new(vad::GateConfig {
-            vad: vad::VadConfig {
-                margin_db: config.vad.margin_db,
-                hangover_ms: config.vad.hangover_ms,
-                ..Default::default()
-            },
-            tail_ms: config.vad.tail_ms,
-            debug: config.vad.debug,
-            // 把语音段状态发布给 GUI 顶栏的 VAD 指示器
-            active_flag: Some(handle.vad_active.clone()),
-            ..Default::default()
-        }))
-    } else {
-        None
-    };
     {
         let events = events.clone();
         let repaint = repaint.clone();
@@ -213,6 +250,8 @@ pub async fn run(
         let ws_url = inference_ws_url.clone();
         let language_hints = config.asr.languages.clone();
         let vocabulary_id = hotwords.vocabulary_id.clone();
+        let vad_enabled = config.vad.enabled;
+        let vad_reset = handle.vad_reset_flag();
         tasks.push(tokio::spawn(async move {
             if let Err(err) = QwenAsrClient::run_duplex(
                 api_key,
@@ -220,8 +259,8 @@ pub async fn run(
                 ws_url,
                 language_hints,
                 vocabulary_id,
-                asr_gate,
-                rx_mic,
+                if vad_enabled { Some(vad_reset) } else { None },
+                asr_audio_rx,
                 tx_asr,
                 running,
             )
@@ -322,6 +361,8 @@ pub async fn run(
     let mut typed_rx_open = true;
     // 上一次推给界面的 VAD 状态（避免每 100ms 都发事件）
     let mut last_vad_active = false;
+    // 本地 VAD 降级为全量上传时只告警一次
+    let mut vad_degraded_reported = false;
 
     enum Incoming {
         Typed(Option<TypedInput>),
@@ -368,6 +409,15 @@ pub async fn run(
                 if vad_active != last_vad_active {
                     last_vad_active = vad_active;
                     emit(PipelineEvent::VadActive(vad_active));
+                }
+                if handle.vad_degraded() && !vad_degraded_reported {
+                    vad_degraded_reported = true;
+                    log::error!("本地 VAD 推理失败，已降级为全量上传音频");
+                    emit(PipelineEvent::Warning {
+                        context: "本地 VAD 推理失败".to_string(),
+                        detail: "已降级为全量上传音频（会增加 ASR 费用）；停止后重新开始会话可重试"
+                            .to_string(),
+                    });
                 }
             }
             Incoming::Typed(None) => {
@@ -827,6 +877,14 @@ pub async fn run(
     handle.abort_background();
     handle.reset_vad();
     drop(capture);
+    if let Some(worker) = vad_worker_thread.take() {
+        if !join_thread_with_timeout(worker, SHUTDOWN_TIMEOUT) {
+            log::warn!(
+                "等待本地 VAD 线程收尾超时（{}s）",
+                SHUTDOWN_TIMEOUT.as_secs()
+            );
+        }
+    }
     drop(rx_mt);
     drop(translation);
     drop(tx_tts);
@@ -856,6 +914,19 @@ pub async fn run(
 
     emit(PipelineEvent::StateChanged(SessionState::Idle));
     Ok(())
+}
+
+/// 等待后台线程退出，最多 `timeout`；超时返回 `false`（std 线程无法强杀，只能尽力）。
+fn join_thread_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = handle.join();
+    true
 }
 
 fn describe_voice(voice: &ActiveVoice) -> String {

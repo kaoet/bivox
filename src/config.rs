@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,11 +55,11 @@ pub const MAX_ASCII_HOTWORD_WORDS: usize = 7;
 /// 百炼音色前缀最大长度（官方：数字+英文字母，不超过 10 个字符）。
 pub const MAX_VOICE_PREFIX_LEN: usize = 10;
 
-/// 本地 VAD 默认起音余量（dB）。
-pub const DEFAULT_VAD_MARGIN_DB: f32 = 9.0;
+/// 本地 VAD 默认起音概率阈值（Silero 官方默认）。
+pub const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
 
-/// 本地 VAD 默认拖尾保持时长（毫秒）。
-pub const DEFAULT_VAD_HANGOVER_MS: u32 = 500;
+/// 本地 VAD 默认静音结束时长（毫秒）：低于负阈值持续该时长判定语音结束。
+pub const DEFAULT_VAD_MIN_SILENCE_MS: u32 = 500;
 
 /// 本地 VAD 默认句末补发静音时长（毫秒）。
 pub const DEFAULT_VAD_TAIL_MS: u32 = 1000;
@@ -382,23 +382,23 @@ pub struct AudioConfig {
     pub output_device: Option<String>,
 }
 
-/// `[vad]`：本地 VAD 发送门控。
+/// `[vad]`：本地 Silero VAD 发送门控。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VadConfig {
     /// 是否启用本地 VAD 门控（关闭后全量上传音频）。
     pub enabled: bool,
 
-    /// 起音阈值 = 噪声底 + 该 dB 值。
-    pub margin_db: f32,
+    /// 起音概率阈值（0–1）；负阈值自动取 `threshold - 0.15`。
+    pub threshold: f32,
 
-    /// 语音结束后的拖尾保持时长（毫秒）。
-    pub hangover_ms: u32,
+    /// 低于负阈值持续多久判定语音结束（毫秒）。
+    pub min_silence_ms: u32,
 
     /// 语音结束后补发的尾部静音时长（毫秒），用于触发服务端 sentence_end。
     pub tail_ms: u32,
 
-    /// 打印每个 chunk 的 VAD 电平/阈值/发送决策，用于现场标定阈值。
+    /// 打印每个 chunk 的 VAD 概率/阈值/发送决策，用于现场排障。
     pub debug: bool,
 }
 
@@ -406,8 +406,8 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            margin_db: DEFAULT_VAD_MARGIN_DB,
-            hangover_ms: DEFAULT_VAD_HANGOVER_MS,
+            threshold: DEFAULT_VAD_THRESHOLD,
+            min_silence_ms: DEFAULT_VAD_MIN_SILENCE_MS,
             tail_ms: DEFAULT_VAD_TAIL_MS,
             debug: false,
         }
@@ -519,8 +519,15 @@ impl AppConfig {
         if self.chunking.words == 0 {
             bail!("配置项 [chunking] words 必须大于 0");
         }
-        if !self.vad.margin_db.is_finite() {
-            bail!("配置项 [vad] margin_db 必须是有效数字");
+        if !self.vad.threshold.is_finite() || self.vad.threshold <= 0.0 || self.vad.threshold >= 1.0
+        {
+            bail!("配置项 [vad] threshold 必须是 (0, 1) 内的有效数字");
+        }
+        if self.vad.min_silence_ms > 5_000 {
+            bail!("配置项 [vad] min_silence_ms 不能超过 5000");
+        }
+        if self.vad.tail_ms > 5_000 {
+            bail!("配置项 [vad] tail_ms 不能超过 5000");
         }
         Ok(())
     }
@@ -865,8 +872,8 @@ mod tests {
         assert!(config.audio.input_device.is_none());
         assert!(config.audio.output_device.is_none());
         assert!(config.vad.enabled);
-        assert_eq!(config.vad.margin_db, DEFAULT_VAD_MARGIN_DB);
-        assert_eq!(config.vad.hangover_ms, DEFAULT_VAD_HANGOVER_MS);
+        assert_eq!(config.vad.threshold, DEFAULT_VAD_THRESHOLD);
+        assert_eq!(config.vad.min_silence_ms, DEFAULT_VAD_MIN_SILENCE_MS);
         assert_eq!(config.vad.tail_ms, DEFAULT_VAD_TAIL_MS);
         assert!(!config.vad.debug);
         assert_eq!(config.chunking.words, DEFAULT_CHUNK_WORDS);
@@ -925,8 +932,8 @@ output_device = "CABLE Input"
 
 [vad]
 enabled = false
-margin_db = 6.5
-hangover_ms = 300
+threshold = 0.42
+min_silence_ms = 320
 tail_ms = 800
 debug = true
 
@@ -972,8 +979,8 @@ words = 10
         assert_eq!(config.audio.input_device.as_deref(), Some("Microphone"));
         assert_eq!(config.audio.output_device.as_deref(), Some("CABLE Input"));
         assert!(!config.vad.enabled);
-        assert_eq!(config.vad.margin_db, 6.5);
-        assert_eq!(config.vad.hangover_ms, 300);
+        assert_eq!(config.vad.threshold, 0.42);
+        assert_eq!(config.vad.min_silence_ms, 320);
         assert_eq!(config.vad.tail_ms, 800);
         assert!(config.vad.debug);
         assert_eq!(config.chunking.words, 10);
@@ -1005,6 +1012,20 @@ words = 10
         .unwrap();
         assert!(config.audio.input_device.is_none());
         assert!(config.audio.output_device.is_none());
+    }
+
+    #[test]
+    fn invalid_vad_threshold_is_rejected() {
+        for bad in ["0.0", "1.0", "1.5", "-0.2"] {
+            let err = AppConfig::from_toml_str(&format!(
+                "[api]\nkey = \"sk-test\"\n[vad]\nthreshold = {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[vad] threshold"),
+                "threshold={bad} 应被拒绝: {err:#}"
+            );
+        }
     }
 
     #[test]

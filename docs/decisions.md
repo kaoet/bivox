@@ -33,8 +33,8 @@
 
 **决定**
 
-- 发布物只有一个 `kaols.exe`；zip 只含 `kaols.exe` + `README.md`。
-- **不**打包 `config.toml`、`config.example.toml`、`cache.json`、日志、调试工具。
+- 发布物只有一个 `kaols.exe`；zip 只含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`。
+- **不**打包 `config.toml`、`config.example.toml`、`cache.json`、日志、调试工具；ONNX Runtime 静态链接进 exe，不带 DLL（D34）。
 - 升级方式：覆盖 exe 与 README，旁边的配置/缓存/日志保持不动。
 - release 构建不弹控制台（`windows_subsystem = "windows"`），debug 保留控制台便于排错。
 - exe 文件图标由 `build.rs` + `assets/kaols.ico` 嵌入；窗口图标在 `src/app.rs` 程序化生成（不引入图片解码依赖）。
@@ -43,6 +43,7 @@
 
 - 无需安装器、无需管理员权限；目录整体拷贝即迁移。
 - 避免把开发机密钥带进发布包。
+- MIT（Silero 模型 / ONNX Runtime）要求随分发附带版权与许可声明，因此发布包附带 `THIRD_PARTY_NOTICES.md`。
 
 ---
 
@@ -272,7 +273,8 @@
 **决定**
 
 - `eframe`/`egui` 固定为 `=0.37.0`，不自动跨小版本升级；`Cargo.lock` 提交。
-- Rust 版本受 egui 0.37 约束（MSRV ≥ 1.95）；当前开发工具链为 rustc 1.99.1。
+- Rust 版本受 egui 0.37 约束（MSRV ≥ 1.95）；当前开发工具链为 rustc 1.99.1；edition 为 **2024**（let chain 可用）。
+- `ort` 固定为 `=2.0.0-rc.15`（对应 ONNX Runtime 1.31）：构建期从 pyke 预编译包下载并**静态链接** ONNX Runtime（首次构建需要网络；离线构建用 `ORT_LIB_LOCATION`/`ORT_LIB_PATH` 指向已解压的 ORT 包）。升级需重新验证模型加载、单帧耗时与发布包启动。
 - `cpal` 固定 0.18：设备名走 `description()?.name()`、采样率返回 `u32`、`build_*_stream` 接收 `StreamConfig` 值；同时避免旧版 `windows` crate 与 wgpu DX12 的版本冲突。
 - 升级任何 GUI/音频/网络依赖时，必须同时验证构建、测试与 GUI 冒烟，而不是只改版本号。
 
@@ -374,15 +376,15 @@
 **决定**
 
 - 顶栏开始/停止按钮左侧显示 `VAD ● 状态`：
-  - **激活**（绿）：本地 VAD 当前处于语音段（含 hangover 维持）；
-  - **静音**（灰）：管线运行中但未检测到语音，或管线未运行；
+  - **激活**（绿）：本地 VAD 当前处于语音段（含 `min_silence_ms` 保持期）；
+  - **静音**（灰）：管线运行中但未检测到语音，或管线未运行，或 VAD 推理失败已降级；
   - **关闭**（灰）：`[vad] enabled = false`。
-- 数据来源：`SpeechGate` 处理每个采集 chunk 时更新共享 `Arc<AtomicBool>`；会话调度循环每 100ms 轮询，变化时发 `PipelineEvent::VadActive` 并重绘（静音期没有 ASR 事件也能更新）。
+- 数据来源：VAD 线程处理每个采集 chunk 时更新共享 `Arc<AtomicBool>`；会话调度循环每 100ms 轮询，变化时发 `PipelineEvent::VadActive` 并重绘（静音期没有 ASR 事件也能更新）。
 - 停止/失败时复位为静音。
 
 **理由**
 
-- 让用户直接看到本地门控是否在工作，便于标定阈值和排查“没上传音频”。
+- 让用户直接看到本地门控是否在工作，便于排查“没上传音频”与呼吸误触。
 
 ---
 
@@ -702,6 +704,33 @@
 - 30 秒自然过期是 VRChat 的兜底行为；放弃 5 秒清空可减少无意义消息，停止/关闭仍显式清空避免残留。
 - 截断保尾是因为句尾信息量最大；复用 `SubtitleState` 归约语义避免 D16/D26 字幕行为在聊天框侧漂移。
 - 双语从“译文优先”改为软 5:4：两侧都有内容时更均匀，避免长译文把源文压到只剩一两行；未用额度可借用，因此不会为了凑 5/4 浪费已有空间。
+
+---
+
+## D34 本地 VAD 改为 Silero（ONNX Runtime，独立线程）
+
+**决定**
+
+- 删除能量 VAD；本地语音活动检测固定使用 Silero VAD 官方 ONNX 模型 `silero_vad_16k_op15.onnx`（MIT），放在 `assets/silero/`，编译期 `include_bytes!` 内嵌进 exe；来源/版本/SHA256 见该目录 README。
+- 推理后端为 `ort`（ONNX Runtime，`=2.0.0-rc.15`）。ort 的预编译包把 ONNX Runtime **静态链接**进 exe，因此发布物仍保持 D2 的单 exe（不随包分发 DLL）；若以后改为动态链接，必须同时修订 D2 并在 zip 中附带运行库。
+- 线程模型：VAD 不放 cpal 实时回调（实时线程禁止推理），也不放 ASR 任务（避免阻塞 socket 读写）。由独立 `std::thread("silero-vad")` 收采集 chunk、跑 Silero + 门控，再把应上传 chunk 交给 ASR。
+- 断线重连：ASR 置位 `vad_reset`，VAD 线程在下一块音频前 `reset_transient()`（模型 state、起音/拖尾、pre-roll、keepalive）。
+- 门控语义（细化 D21）：连续 2 帧概率 ≥ `threshold` 起音；概率 ≥ `threshold - 0.15` 维持；低于负阈值持续 `min_silence_ms` 结束；保留 pre-roll 300ms、tail 1000ms、keepalive 10s。
+- 配置 `[vad]` 变为 `enabled` / `threshold`（默认 0.5）/ `min_silence_ms`（默认 500）/ `tail_ms`（默认 1000）/ `debug`；不做向后兼容（项目未发布，见 AGENTS.md「配置变更」）。VAD 参数进配置指纹，改后重启会话（D20）。
+- 推理失败：门控降级为全量上传并上报一次 `Warning`（GUI 横幅、指示器灰），不静默丢音频；启动时模型加载失败按既有启动错误链终止会话。
+- 构建环境：Rust edition 升级为 **2024**（rustc 1.99.1）；依赖与门禁仍按 D15。
+
+**理由**
+
+- 实测同一只耳机麦克风：12.96s 纯呼吸录音 Silero 最大概率 0.080、0 帧 ≥0.3；27s 说话录音（轻声/正常/大声）p50=1.000、≥0.5 共 24.4s，起音延迟约 64ms。
+- 旧能量法在同段呼吸录音上 `margin_db=28` 仍误触 30.6%、`margin_db=9` 误触 85.2%，说明"高能量非语音"无法靠调阈值稳定分开。
+- 判别模型不需要按麦克风/房间标定；release 单帧约 0.13ms（32ms 帧），独立线程后不占实时回调与网络任务。
+
+**边界**
+
+- 模型文件与 SHA256 必须与 `assets/silero/README.md` 一致；升级模型时同步更新该 README。
+- `ort` 仍是 RC 版本，必须钉死并跑完整门禁；升级 ort 需重新验证模型加载、单帧耗时与发布包启动（D15）。
+- 收尾顺序与超时按 architecture §3.5/§10.3 执行；VAD 线程不设实时优先级。
 
 ---
 

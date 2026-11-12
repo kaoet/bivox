@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
 use crate::config::{
-    AppConfig, TranslateGranularity, VrchatDisplay, CUSTOM_VOICE_PREFIX, DEFAULT_ASR_LANGUAGE,
-    DEFAULT_ASR_MODEL, DEFAULT_VOICE,
+    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_ASR_LANGUAGE, DEFAULT_ASR_MODEL, DEFAULT_VOICE,
+    TranslateGranularity, VrchatDisplay,
 };
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
@@ -20,7 +20,7 @@ use crate::language;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::osc::{ChatboxService, ChatboxSettings};
 use crate::paths::AppPaths;
-use crate::pipeline::session::{PipelineSessionHandle, TypedInput, MAX_TYPED_INPUT_CHARS};
+use crate::pipeline::session::{MAX_TYPED_INPUT_CHARS, PipelineSessionHandle, TypedInput};
 use crate::subtitles::SubtitleState;
 use crate::voice::editor::{self, VoiceDraft};
 
@@ -1025,8 +1025,8 @@ fn config_signature(config: &AppConfig) -> String {
         config.audio.input_device,
         config.audio.output_device,
         config.vad.enabled,
-        config.vad.margin_db,
-        config.vad.hangover_ms,
+        config.vad.threshold,
+        config.vad.min_silence_ms,
         config.vad.tail_ms,
         config.vad.debug,
         config.chunking.words,
