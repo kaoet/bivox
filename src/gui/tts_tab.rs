@@ -6,9 +6,9 @@
 //! - `tts_current_voice`：顶部「当前音色」选择（现有音色 / 自定义音色）；
 //! - `tts_voice_editor`：自定义音色的样本编辑、拖拽排序与语速滑条。
 //!
-//! 顶部选择「当前音色」与中文方言：现有音色（输入框，填内置音色名或任意 voice_id）
-//! 或自定义音色（下拉，写 `custom:<键名>`），右上角「保存」同时写回 `[tts] voice`、
-//! `[tts] dialect` 与 `[tts.custom_voices]`。
+//! 顶部编辑合成模型、选择「当前音色」与中文方言：现有音色（输入框，填内置音色名或任意 voice_id）
+//! 或自定义音色（下拉，写 `custom:<键名>`），右上角「保存」同时写回 `[tts] model`、`voice`、
+//! `dialect` 与 `custom_voices`。
 //! 下方左栏是自定义音色草稿列表，右栏编辑选中音色：显示名、配置键名、语言声线、样例音频
 //! 与每个样本的语速。
 //! 草稿只在点「保存」后写回（`[tts.custom_voices]`，同时校验并备份）；
@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use eframe::egui;
 
 use crate::app::KaolsApp;
-use crate::config::DEFAULT_SAMPLE_RATE;
+use crate::config::{DEFAULT_SAMPLE_RATE, DEFAULT_TTS_MODEL};
 use crate::gui::{tts_current_voice, tts_voice_editor, widgets};
 use crate::language::CLONING_LANGUAGES;
 use crate::voice::editor::{SampleDraft, VoiceDraft};
@@ -60,8 +60,27 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     }
     ui.label(
         egui::RichText::new(
-            "上方选择「当前音色」与中文方言；下方编辑自定义音色。改动后点右上角「保存」一次写回 \
-             config.toml（运行中会自动重启实时管线），或点「放弃更改」还原。",
+            "上方选择合成模型、当前音色与中文方言；下方编辑自定义音色。改动后点右上角「保存」\
+             一次保存（运行中会自动重启实时管线），或点「放弃更改」还原。",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.label("合成模型");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.tts_model)
+                .desired_width(380.0)
+                .hint_text(DEFAULT_TTS_MODEL),
+        );
+        if ui.button("恢复默认").clicked() {
+            app.tts_model = DEFAULT_TTS_MODEL.to_string();
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "更换模型会重新解析音色，并影响复刻缓存；运行中保存会自动重启实时管线。",
         )
         .weak(),
     );

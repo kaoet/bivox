@@ -10,7 +10,8 @@ use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
 use crate::config::{
-    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
+    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VAD_MIN_SILENCE_MS, DEFAULT_VAD_TAIL_MS,
+    DEFAULT_VAD_THRESHOLD, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
 };
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
@@ -106,6 +107,10 @@ pub struct KaolsApp {
     pub api_key_input: String,
     /// 启动实时会话时发现未配置 API Key 的提示（设置页顶部显示）。
     pub api_key_notice: Option<String>,
+    /// 设置页「高级设置」草稿：接入域名 / 缓存文件 / 分块词数。
+    pub settings_workspace_host: String,
+    pub settings_cache_file: String,
+    pub settings_chunk_words: usize,
     /// 实时页底部「打字输入」的输入框内容。
     pub typed_input: String,
     /// 打字输入的行内错误（超长、会话未开始等）。
@@ -133,6 +138,16 @@ pub struct KaolsApp {
     pub voice_custom_key: String,
     /// 语音合成页「中文方言」草稿（保存前只改这里，`config` 不变）。
     pub tts_dialect: String,
+    /// 语音合成页合成模型草稿。
+    pub tts_model: String,
+    /// 翻译页翻译模型草稿（「应用模型」按钮写回）。
+    pub translate_model: String,
+    /// 音频页 VAD 参数草稿（点「保存 VAD 设置」写回）。
+    pub vad_enabled: bool,
+    pub vad_threshold: f32,
+    pub vad_min_silence_ms: u32,
+    pub vad_tail_ms: u32,
+    pub vad_debug: bool,
     /// 语音识别页的 ASR 模型草稿。
     pub asr_model: String,
     /// 语音识别页的有序语言列表草稿。
@@ -185,6 +200,9 @@ impl KaolsApp {
             selected_voice: None,
             api_key_input: String::new(),
             api_key_notice: None,
+            settings_workspace_host: String::new(),
+            settings_cache_file: String::new(),
+            settings_chunk_words: 0,
             typed_input: String::new(),
             typed_input_error: None,
             input_devices: Vec::new(),
@@ -199,6 +217,13 @@ impl KaolsApp {
             voice_input: String::new(),
             voice_custom_key: String::new(),
             tts_dialect: String::new(),
+            tts_model: String::new(),
+            translate_model: String::new(),
+            vad_enabled: true,
+            vad_threshold: DEFAULT_VAD_THRESHOLD,
+            vad_min_silence_ms: DEFAULT_VAD_MIN_SILENCE_MS,
+            vad_tail_ms: DEFAULT_VAD_TAIL_MS,
+            vad_debug: false,
             asr_model: String::new(),
             asr_languages: Vec::new(),
             asr_hotwords: String::new(),
@@ -269,13 +294,28 @@ impl KaolsApp {
 
     /// 把配置里的 Key / 设备 / 音色草稿同步到界面状态（加载、重载、写回成功后调用）。
     fn sync_from_config(&mut self) {
-        self.api_key_input = self.config.api.key.clone().unwrap_or_default();
+        self.sync_settings_inputs();
         self.input_device = self.config.audio.input_device.clone();
         self.output_device = self.config.audio.output_device.clone();
+        self.vad_enabled = self.config.vad.enabled;
+        self.vad_threshold = self.config.vad.threshold;
+        self.vad_min_silence_ms = self.config.vad.min_silence_ms;
+        self.vad_tail_ms = self.config.vad.tail_ms;
+        self.vad_debug = self.config.vad.debug;
         self.voice_drafts = editor::drafts_from_config(&self.config);
+        self.tts_model = self.config.tts.model.clone();
         self.tts_dialect = self.config.tts.dialect.clone();
+        self.translate_model = self.config.translate.model.clone();
         self.chatbox
             .update_settings(ChatboxSettings::from_config(&self.config));
+    }
+
+    /// 同步设置页草稿：API Key 与高级设置。
+    fn sync_settings_inputs(&mut self) {
+        self.api_key_input = self.config.api.key.clone().unwrap_or_default();
+        self.settings_workspace_host = self.config.api.workspace_host.clone();
+        self.settings_cache_file = self.config.cache.file.to_string_lossy().into_owned();
+        self.settings_chunk_words = self.config.chunking.words;
     }
 
     /// 从配置同步语音合成页顶部「当前音色」的草稿值。
@@ -335,12 +375,20 @@ impl KaolsApp {
         self.tts_dialect.trim() != self.config.tts.dialect
     }
 
-    /// 语音合成页是否有未保存改动（音色草稿 + 当前音色 + 中文方言）。
-    pub fn tts_tab_dirty(&self) -> bool {
-        self.voice_drafts_dirty() || self.voice_input_dirty() || self.tts_dialect_dirty()
+    /// 合成模型草稿是否与配置文件不同。
+    pub fn tts_model_dirty(&self) -> bool {
+        self.tts_model.trim() != self.config.tts.model
     }
 
-    /// 保存语音合成页的全部改动：`[tts.custom_voices]` 草稿 + 顶部「当前音色」+ 中文方言。
+    /// 语音合成页是否有未保存改动（模型 + 音色草稿 + 当前音色 + 中文方言）。
+    pub fn tts_tab_dirty(&self) -> bool {
+        self.tts_model_dirty()
+            || self.voice_drafts_dirty()
+            || self.voice_input_dirty()
+            || self.tts_dialect_dirty()
+    }
+
+    /// 保存语音合成页的全部改动：合成模型、`[tts.custom_voices]` 草稿、当前音色与中文方言。
     ///
     /// 三部分合并成一次原子写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启。
     pub fn save_tts_tab(&mut self) {
@@ -362,6 +410,7 @@ impl KaolsApp {
     }
 
     fn try_save_tts_tab(&self) -> anyhow::Result<()> {
+        let model_dirty = self.tts_model_dirty();
         let drafts_dirty = self.voice_drafts_dirty();
         let voice_dirty = self.voice_input_dirty();
         let dialect_dirty = self.tts_dialect_dirty();
@@ -370,6 +419,14 @@ impl KaolsApp {
         let original = config_edit::read(&self.paths.config_file)?;
         let mut config = AppConfig::load(&self.paths.config_file)
             .context("磁盘上的配置已无效，无法保存语音合成设置")?;
+
+        if model_dirty {
+            let model = self.tts_model.trim();
+            if model.is_empty() {
+                anyhow::bail!("合成模型不能为空");
+            }
+            config.tts.model = model.to_string();
+        }
 
         if drafts_dirty {
             let entries = editor::drafts_to_entries(&self.voice_drafts)?;
@@ -527,25 +584,95 @@ impl KaolsApp {
         }
     }
 
-    /// 保存 API Key；输入框留空表示清除配置项（写回 `None`，而不是空字符串）。
-    pub fn save_api_key(&mut self) {
+    /// 设置页是否有未保存改动（API Key + 高级设置）。
+    pub fn settings_tab_dirty(&self) -> bool {
+        let key = self.api_key_input.trim();
+        let configured_key = self.config.api.key.as_deref().unwrap_or("");
+        key != configured_key
+            || self.settings_workspace_host.trim() != self.config.api.workspace_host
+            || self.settings_cache_file.trim() != self.config.cache.file.to_string_lossy()
+            || self.settings_chunk_words != self.config.chunking.words
+    }
+
+    /// 整页保存设置：API Key、接入域名、缓存文件、分块词数。
+    ///
+    /// API Key 留空表示清除该配置项；其它字段由序列化器省略默认值。
+    pub fn save_settings_tab(&mut self) {
         let key = self.api_key_input.trim().to_string();
-        let clear = key.is_empty();
+        let host = self.settings_workspace_host.trim().to_string();
+        let cache_file = self.settings_cache_file.trim().to_string();
+        let chunk_words = self.settings_chunk_words;
         let result = self.write_config(|config| {
-            config.api.key = (!clear).then(|| key.clone());
+            config.api.key = (!key.is_empty()).then_some(key);
+            config.api.workspace_host = host;
+            config.cache.file = std::path::PathBuf::from(cache_file);
+            config.chunking.words = chunk_words;
             Ok(())
         });
-        self.finish_config_write(
-            result,
-            if clear {
-                "已清除 API Key"
-            } else {
-                "已保存 API Key"
-            },
-        );
+        self.finish_config_write(result, "已保存设置");
         if self.config_write_error.is_none() {
             self.api_key_notice = None;
         }
+    }
+
+    /// 放弃设置页的整页改动。
+    pub fn reset_settings_tab(&mut self) {
+        self.sync_settings_inputs();
+    }
+
+    /// 翻译模型草稿是否与配置不同。
+    pub fn translate_model_dirty(&self) -> bool {
+        self.translate_model.trim() != self.config.translate.model
+    }
+
+    /// 保存翻译模型；其余翻译字段仍由翻译页即时保存。
+    pub fn save_translate_model(&mut self) {
+        let model = self.translate_model.trim().to_string();
+        if model.is_empty() {
+            self.config_write_error = Some("翻译模型不能为空".to_string());
+            return;
+        }
+        let result = self.write_config(|config| {
+            config.translate.model = model;
+            Ok(())
+        });
+        self.finish_config_write(result, "已保存翻译模型");
+    }
+
+    /// 音频页 VAD 草稿是否与配置不同。
+    pub fn vad_settings_dirty(&self) -> bool {
+        self.vad_enabled != self.config.vad.enabled
+            || self.vad_threshold != self.config.vad.threshold
+            || self.vad_min_silence_ms != self.config.vad.min_silence_ms
+            || self.vad_tail_ms != self.config.vad.tail_ms
+            || self.vad_debug != self.config.vad.debug
+    }
+
+    /// 保存音频页 VAD 参数；改后按 D20 热重启实时管线。
+    pub fn save_vad_settings(&mut self) {
+        let enabled = self.vad_enabled;
+        let threshold = self.vad_threshold;
+        let min_silence_ms = self.vad_min_silence_ms;
+        let tail_ms = self.vad_tail_ms;
+        let debug = self.vad_debug;
+        let result = self.write_config(|config| {
+            config.vad.enabled = enabled;
+            config.vad.threshold = threshold;
+            config.vad.min_silence_ms = min_silence_ms;
+            config.vad.tail_ms = tail_ms;
+            config.vad.debug = debug;
+            Ok(())
+        });
+        self.finish_config_write(result, "已保存 VAD 设置");
+    }
+
+    /// 放弃音频页 VAD 草稿。
+    pub fn reset_vad_settings(&mut self) {
+        self.vad_enabled = self.config.vad.enabled;
+        self.vad_threshold = self.config.vad.threshold;
+        self.vad_min_silence_ms = self.config.vad.min_silence_ms;
+        self.vad_tail_ms = self.config.vad.tail_ms;
+        self.vad_debug = self.config.vad.debug;
     }
 
     /// 更新 `[audio]` 设备（`None` = 系统默认）；设备名是完整名称（D12）。
@@ -568,12 +695,16 @@ impl KaolsApp {
         target: &str,
         granularity: TranslateGranularity,
         show_source: bool,
+        model: &str,
     ) {
+        let target = target.trim().to_string();
+        let model = model.trim().to_string();
         let result = self.write_config(|config| {
             config.translate.enabled = enabled;
-            config.translate.target = target.trim().to_string();
+            config.translate.target = target;
             config.translate.granularity = granularity;
             config.translate.show_source = show_source;
+            config.translate.model = model;
             Ok(())
         });
         self.finish_config_write(result, "已保存翻译设置");

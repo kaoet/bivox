@@ -1,15 +1,16 @@
-//! 翻译页：翻译模式开关、目标语言、粒度、是否显示原文（D27）。
+//! 翻译页：翻译模式开关、目标语言、粒度、是否显示原文、翻译模型（D27）。
 //!
-//! 字段语义见 `src/config.rs`；`model` 当前只读。改值即走 `config_edit` 写回：
+//! 字段语义见 `src/config.rs`。改值即走类型化写回：
 //! - `show_source` 只影响渲染，不参与配置指纹，改后立即生效、不重启；
 //! - 其余字段变化会触发 D20：停旧会话 → 用新配置自动重启，当前句会丢失。
 
 use eframe::egui;
 
 use crate::app::KaolsApp;
-use crate::config::TranslateGranularity;
-use crate::gui::widgets;
+use crate::config::{DEFAULT_TRANSLATE_MODEL, TranslateGranularity};
 use crate::language::{TRANSLATION_LANGUAGES, language_display_name};
+
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 /// 目标语言下拉的显示文本：中文名 + 代码，避免只显示代码时看不懂。
 fn language_label(code: &str) -> String {
@@ -42,6 +43,33 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.checkbox(&mut enabled, "启用翻译模式");
     ui.add_space(6.0);
 
+    ui.horizontal(|ui| {
+        ui.label("翻译模型");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.translate_model)
+                .desired_width(380.0)
+                .hint_text(DEFAULT_TRANSLATE_MODEL),
+        );
+        let can_apply = app.translate_model_dirty() && !app.translate_model.trim().is_empty();
+        if ui
+            .add_enabled(can_apply, egui::Button::new("应用模型"))
+            .clicked()
+        {
+            app.save_translate_model();
+        }
+        if ui.button("恢复默认").clicked() {
+            app.translate_model = DEFAULT_TRANSLATE_MODEL.to_string();
+            app.save_translate_model();
+        }
+        if app.translate_model_dirty() {
+            ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+        }
+    });
+    ui.label(
+        egui::RichText::new("模型需与百炼兼容接口一致；运行中应用会自动重启实时管线。").weak(),
+    );
+    ui.add_space(6.0);
+
     // 未启用翻译时，目标语言与粒度没有意义，禁用（显示原文仍可改）。
     ui.add_enabled_ui(enabled, |ui| {
         ui.horizontal(|ui| {
@@ -72,15 +100,12 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     ui.checkbox(&mut show_source, "字幕同时显示原文（弱色小字）");
 
-    ui.add_space(10.0);
-    widgets::kv_row(ui, "翻译模型", &configured.model);
-    ui.label(egui::RichText::new("翻译模型当前只读，后续会补到本页编辑。").weak());
-
     let restart_fields_changed = enabled != configured.enabled
         || target != configured.target
         || granularity != configured.granularity;
 
     if restart_fields_changed || show_source != configured.show_source {
-        app.update_translate_settings(enabled, &target, granularity, show_source);
+        let model = app.translate_model.clone();
+        app.update_translate_settings(enabled, &target, granularity, show_source, &model);
     }
 }

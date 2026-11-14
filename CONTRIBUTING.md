@@ -199,7 +199,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 ### 配置与便携模式
 
-- `config.toml` 是唯一配置事实源；GUI 修改 `AppConfig` 后整体写回，只序列化非默认值；当前 GUI 尚未暴露的字段保持配置原值。
+- `config.toml` 是唯一配置事实源；GUI 覆盖全部字段，修改 `AppConfig` 后整体写回，只序列化非默认值。
 - 写回流程：读原文件 → 解析为 `AppConfig` → 类型化修改 → 校验磁盘原配置和新文本 → 备份 `config.toml.bak` → 写盘；无改动不写盘。
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
 - 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；

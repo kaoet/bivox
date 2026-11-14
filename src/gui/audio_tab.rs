@@ -1,14 +1,16 @@
-//! 音频页：音频输入/输出设备等音频相关设置。
+//! 音频页：音频输入/输出设备与本地 VAD 参数。
 //!
 //! 设备规则（D12）：只保存**完整设备名**，启动时按名称精确匹配；设备改名或被拔掉时
 //! 明确报错让用户重选，不做模糊匹配、也不静默回退到默认设备。
 //!
-//! 更大的 VAD / 采样等参数暂未提供图形化编辑，后续再搬到本页。
+//! VAD 参数保存后按 D20 热重启实时管线。
 
 use eframe::egui;
 
 use crate::app::KaolsApp;
 use crate::gui::widgets;
+
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 /// 从配置里取出当前设备设置（`None` = 系统默认）。
 fn current_devices(app: &KaolsApp) -> (Option<String>, Option<String>) {
@@ -77,5 +79,66 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     }
 
     ui.add_space(10.0);
-    ui.label(egui::RichText::new("VAD、采样率等参数暂未提供图形化编辑，后续会补到本页。").weak());
+    show_vad_settings(app, ui);
+}
+
+/// 本地 Silero VAD 发送门控参数。
+fn show_vad_settings(app: &mut KaolsApp, ui: &mut egui::Ui) {
+    ui.separator();
+    ui.label(egui::RichText::new("本地 VAD").strong());
+    ui.checkbox(&mut app.vad_enabled, "启用本地 VAD（关闭后音频全量上传）");
+
+    ui.add_enabled_ui(app.vad_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("起音阈值");
+            ui.add(
+                egui::DragValue::new(&mut app.vad_threshold)
+                    .range(0.01..=0.99)
+                    .speed(0.01)
+                    .max_decimals(2),
+            );
+            ui.label(egui::RichText::new("(0, 1)；低于 threshold - 0.15 视为静音").weak());
+        });
+        ui.horizontal(|ui| {
+            ui.label("静音结束时长");
+            ui.add(
+                egui::DragValue::new(&mut app.vad_min_silence_ms)
+                    .range(0..=5000)
+                    .speed(10.0)
+                    .suffix(" ms"),
+            );
+            ui.label(egui::RichText::new("低于负阈值持续多久判定说完").weak());
+        });
+        ui.horizontal(|ui| {
+            ui.label("句末补发静音");
+            ui.add(
+                egui::DragValue::new(&mut app.vad_tail_ms)
+                    .range(0..=5000)
+                    .speed(10.0)
+                    .suffix(" ms"),
+            );
+            ui.label(egui::RichText::new("用于触发服务端 sentence_end").weak());
+        });
+        ui.checkbox(&mut app.vad_debug, "打印每个 chunk 的 VAD 决策（排障用）");
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let dirty = app.vad_settings_dirty();
+        if ui
+            .add_enabled(dirty, egui::Button::new("保存 VAD 设置"))
+            .clicked()
+        {
+            app.save_vad_settings();
+        }
+        if ui
+            .add_enabled(dirty, egui::Button::new("放弃更改"))
+            .clicked()
+        {
+            app.reset_vad_settings();
+        }
+        if dirty {
+            ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+        }
+    });
 }
