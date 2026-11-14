@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::process::ExitCode;
 
+use anyhow::Context;
 use eframe::egui;
 use log::{error, info, warn};
 use tokio::sync::mpsc;
@@ -67,6 +68,13 @@ impl Tab {
             Self::Settings => "设置",
         }
     }
+}
+
+/// 设备名去空白；空字符串等价于系统默认。
+fn normalize_device(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// 应用状态。
@@ -358,10 +366,10 @@ impl KaolsApp {
         let voice_dirty = self.voice_input_dirty();
         let dialect_dirty = self.tts_dialect_dirty();
         let wanted_voice = self.voice_draft_value();
-        let config = &self.config;
 
         let original = config_edit::read(&self.paths.config_file)?;
-        let mut updated = original.clone();
+        let mut config = AppConfig::load(&self.paths.config_file)
+            .context("磁盘上的配置已无效，无法保存语音合成设置")?;
 
         if drafts_dirty {
             let entries = editor::drafts_to_entries(&self.voice_drafts)?;
@@ -374,19 +382,29 @@ impl KaolsApp {
                     }
                 }
             }
-            updated = config_edit::set_custom_voices(&updated, &entries)?;
 
             // 没有显式改当前音色时：生效自定义音色被删除/改名 → 自动回退
-            if !voice_dirty {
-                if let Some(current) = config.custom_voice_name() {
-                    if !entries.iter().any(|(key, _)| key == current) {
-                        let fallback = entries
-                            .first()
-                            .map(|(first, _)| format!("{CUSTOM_VOICE_PREFIX}{first}"))
-                            .unwrap_or_else(|| DEFAULT_VOICE.to_string());
-                        updated = config_edit::set_active_voice(&updated, &fallback)?;
+            let current = config.custom_voice_name().map(str::to_string);
+            let fallback = if voice_dirty {
+                None
+            } else {
+                current.and_then(|current| {
+                    if entries.iter().any(|(key, _)| key == &current) {
+                        None
+                    } else {
+                        Some(
+                            entries
+                                .first()
+                                .map(|(first, _)| format!("{CUSTOM_VOICE_PREFIX}{first}"))
+                                .unwrap_or_else(|| DEFAULT_VOICE.to_string()),
+                        )
                     }
-                }
+                })
+            };
+
+            config.tts.custom_voices = entries.into_iter().collect();
+            if let Some(fallback) = fallback {
+                config.tts.voice = fallback;
             }
         }
 
@@ -394,14 +412,14 @@ impl KaolsApp {
             if wanted_voice.is_empty() {
                 anyhow::bail!("当前音色不能为空");
             }
-            updated = config_edit::set_active_voice(&updated, &wanted_voice)?;
+            config.tts.voice = wanted_voice;
         }
 
         if dialect_dirty {
-            updated = config_edit::set_tts_dialect(&updated, &self.tts_dialect)?;
+            config.tts.dialect = self.tts_dialect.trim().to_string();
         }
 
-        config_edit::save(&self.paths.config_file, &original, &updated)
+        config_edit::save(&self.paths.config_file, &original, &config)
     }
 
     /// 放弃语音合成页的全部改动：自定义音色草稿 + 顶部「当前音色」。
@@ -483,9 +501,12 @@ impl KaolsApp {
         crate::config::validate_hotwords(&hotwords)?;
 
         let original = config_edit::read(&self.paths.config_file)?;
-        let updated = config_edit::set_asr(&original, model, &self.asr_languages, &hotwords)?;
-        config_edit::save(&self.paths.config_file, &original, &updated)?;
-        Ok(())
+        let mut config = AppConfig::load(&self.paths.config_file)
+            .context("磁盘上的配置已无效，无法保存语音识别设置")?;
+        config.asr.model = model.to_string();
+        config.asr.languages = self.asr_languages.clone();
+        config.asr.hotwords = hotwords;
+        config_edit::save(&self.paths.config_file, &original, &config)
     }
 
     /// 放弃语音识别页的全部改动，恢复为配置文件里的值。
@@ -510,8 +531,10 @@ impl KaolsApp {
     pub fn save_api_key(&mut self) {
         let key = self.api_key_input.trim().to_string();
         let clear = key.is_empty();
-        let result = self
-            .write_config(|text| config_edit::set_api_key(text, (!clear).then_some(key.as_str())));
+        let result = self.write_config(|config| {
+            config.api.key = (!clear).then(|| key.clone());
+            Ok(())
+        });
         self.finish_config_write(
             result,
             if clear {
@@ -527,8 +550,10 @@ impl KaolsApp {
 
     /// 更新 `[audio]` 设备（`None` = 系统默认）；设备名是完整名称（D12）。
     pub fn update_audio_devices(&mut self, input: Option<String>, output: Option<String>) {
-        let result = self.write_config(|text| {
-            config_edit::set_audio_devices(text, input.as_deref(), output.as_deref())
+        let result = self.write_config(|config| {
+            config.audio.input_device = normalize_device(input);
+            config.audio.output_device = normalize_device(output);
+            Ok(())
         });
         self.finish_config_write(result, "已保存音频设备");
     }
@@ -544,8 +569,12 @@ impl KaolsApp {
         granularity: TranslateGranularity,
         show_source: bool,
     ) {
-        let result = self.write_config(|text| {
-            config_edit::set_translate(text, enabled, target, granularity, show_source)
+        let result = self.write_config(|config| {
+            config.translate.enabled = enabled;
+            config.translate.target = target.trim().to_string();
+            config.translate.granularity = granularity;
+            config.translate.show_source = show_source;
+            Ok(())
         });
         self.finish_config_write(result, "已保存翻译设置");
     }
@@ -554,8 +583,12 @@ impl KaolsApp {
     ///
     /// `[vrchat.*]` 不进配置指纹，改设置立即生效、不重启实时管线。
     pub fn update_vrchat_settings(&mut self, enabled: bool, port: u16, display: VrchatDisplay) {
-        let result =
-            self.write_config(|text| config_edit::set_vrchat_osc(text, enabled, port, display));
+        let result = self.write_config(|config| {
+            config.vrchat.osc.enabled = enabled;
+            config.vrchat.osc.port = port;
+            config.vrchat.osc.display = display;
+            Ok(())
+        });
         self.finish_config_write(result, "已保存 VRChat 设置");
     }
 
@@ -566,14 +599,16 @@ impl KaolsApp {
         }
     }
 
-    /// 读原文 → 定点修改 → 校验并写回。
+    /// 读原文 → 解析为类型化配置 → 修改 → 最小化序列化并写回。
     fn write_config(
         &mut self,
-        edit: impl FnOnce(&str) -> anyhow::Result<String>,
+        edit: impl FnOnce(&mut AppConfig) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let original = config_edit::read(&self.paths.config_file)?;
-        let updated = edit(&original)?;
-        config_edit::save(&self.paths.config_file, &original, &updated)
+        let mut config = AppConfig::load(&self.paths.config_file)
+            .context("磁盘上的配置已无效，已拒绝写回（请先修正或删除配置文件）")?;
+        edit(&mut config)?;
+        config_edit::save(&self.paths.config_file, &original, &config)
     }
 
     fn finish_config_write(&mut self, result: anyhow::Result<()>, success_message: &str) {

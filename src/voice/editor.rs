@@ -2,7 +2,7 @@
 //!
 //! GUI 流程：`drafts_from_config` 读出草稿 → 界面直接改草稿（含每个样本的语速）→
 //! `drafts_to_entries` 校验并生成 `(配置键名, CustomVoiceConfig)` 列表 →
-//! `config_edit::set_custom_voices` 写回（写前校验 + `.bak`）。
+//! 合并进 `AppConfig` 后由 `config_edit::save` 写回（写前校验 + `.bak`）。
 
 use std::collections::HashSet;
 

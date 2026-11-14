@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use toml::{Table, Value};
 
 use crate::language::{self, is_asr_language, is_cloning_language};
 
@@ -498,6 +499,205 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// 序列化为最小 TOML：只写与默认值不同的字段，空表不输出。
+    ///
+    /// 序列化前会先对副本做归一化和校验，避免把带空白/非法值写到磁盘。
+    pub fn to_toml_string(&self) -> Result<String> {
+        let mut config = self.clone();
+        config.normalize();
+        config.validate()?;
+        toml::to_string(&config.to_toml_table()).context("序列化配置为 TOML 失败")
+    }
+
+    /// 构建只含非默认值的 TOML 表。
+    fn to_toml_table(&self) -> Table {
+        let default = Self::default();
+        let mut root = Table::new();
+
+        let mut api = Table::new();
+        if let Some(key) = &self.api.key {
+            api.insert("key".to_string(), Value::String(key.clone()));
+        }
+        if self.api.workspace_host != default.api.workspace_host {
+            api.insert(
+                "workspace_host".to_string(),
+                Value::String(self.api.workspace_host.clone()),
+            );
+        }
+        insert_table(&mut root, "api", api);
+
+        let mut asr = Table::new();
+        if self.asr.model != default.asr.model {
+            asr.insert("model".to_string(), Value::String(self.asr.model.clone()));
+        }
+        if self.asr.languages != default.asr.languages {
+            asr.insert("languages".to_string(), string_array(&self.asr.languages));
+        }
+        if !self.asr.hotwords.is_empty() {
+            asr.insert("hotwords".to_string(), string_array(&self.asr.hotwords));
+        }
+        insert_table(&mut root, "asr", asr);
+
+        let mut tts = Table::new();
+        if self.tts.model != default.tts.model {
+            tts.insert("model".to_string(), Value::String(self.tts.model.clone()));
+        }
+        if self.tts.voice != default.tts.voice {
+            tts.insert("voice".to_string(), Value::String(self.tts.voice.clone()));
+        }
+        if self.tts.dialect != default.tts.dialect {
+            tts.insert(
+                "dialect".to_string(),
+                Value::String(self.tts.dialect.clone()),
+            );
+        }
+        if !self.tts.custom_voices.is_empty() {
+            let mut voices = Table::new();
+            let mut names: Vec<&String> = self.tts.custom_voices.keys().collect();
+            names.sort();
+            for name in names {
+                let voice = &self.tts.custom_voices[name];
+                let mut voice_table = Table::new();
+                if let Some(display_name) = &voice.name {
+                    voice_table.insert("name".to_string(), Value::String(display_name.clone()));
+                }
+
+                let mut samples = Vec::with_capacity(voice.samples.len());
+                for sample in &voice.samples {
+                    let mut sample_table = Table::new();
+                    sample_table.insert(
+                        "language".to_string(),
+                        Value::String(sample.language.clone()),
+                    );
+                    sample_table.insert(
+                        "audio".to_string(),
+                        Value::String(sample.audio.to_string_lossy().into_owned()),
+                    );
+                    // 默认语速不写，缺省即 1.0。
+                    if sample.rate != DEFAULT_SAMPLE_RATE {
+                        sample_table.insert("rate".to_string(), float_value(sample.rate));
+                    }
+                    samples.push(Value::Table(sample_table));
+                }
+                voice_table.insert("samples".to_string(), Value::Array(samples));
+                voices.insert(name.clone(), Value::Table(voice_table));
+            }
+            tts.insert("custom_voices".to_string(), Value::Table(voices));
+        }
+        insert_table(&mut root, "tts", tts);
+
+        let mut cache = Table::new();
+        if self.cache.file != default.cache.file {
+            cache.insert(
+                "file".to_string(),
+                Value::String(self.cache.file.to_string_lossy().into_owned()),
+            );
+        }
+        insert_table(&mut root, "cache", cache);
+
+        let mut audio = Table::new();
+        if let Some(device) = &self.audio.input_device {
+            audio.insert("input_device".to_string(), Value::String(device.clone()));
+        }
+        if let Some(device) = &self.audio.output_device {
+            audio.insert("output_device".to_string(), Value::String(device.clone()));
+        }
+        insert_table(&mut root, "audio", audio);
+
+        let mut vad = Table::new();
+        if self.vad.enabled != default.vad.enabled {
+            vad.insert("enabled".to_string(), Value::Boolean(self.vad.enabled));
+        }
+        if self.vad.threshold != default.vad.threshold {
+            vad.insert("threshold".to_string(), float_value(self.vad.threshold));
+        }
+        if self.vad.min_silence_ms != default.vad.min_silence_ms {
+            vad.insert(
+                "min_silence_ms".to_string(),
+                Value::Integer(i64::from(self.vad.min_silence_ms)),
+            );
+        }
+        if self.vad.tail_ms != default.vad.tail_ms {
+            vad.insert(
+                "tail_ms".to_string(),
+                Value::Integer(i64::from(self.vad.tail_ms)),
+            );
+        }
+        if self.vad.debug != default.vad.debug {
+            vad.insert("debug".to_string(), Value::Boolean(self.vad.debug));
+        }
+        insert_table(&mut root, "vad", vad);
+
+        let mut chunking = Table::new();
+        if self.chunking.words != default.chunking.words {
+            chunking.insert(
+                "words".to_string(),
+                Value::Integer(i64::try_from(self.chunking.words).unwrap_or(i64::MAX)),
+            );
+        }
+        insert_table(&mut root, "chunking", chunking);
+
+        let mut translate = Table::new();
+        if self.translate.enabled != default.translate.enabled {
+            translate.insert(
+                "enabled".to_string(),
+                Value::Boolean(self.translate.enabled),
+            );
+        }
+        if self.translate.target != default.translate.target {
+            translate.insert(
+                "target".to_string(),
+                Value::String(self.translate.target.clone()),
+            );
+        }
+        if self.translate.model != default.translate.model {
+            translate.insert(
+                "model".to_string(),
+                Value::String(self.translate.model.clone()),
+            );
+        }
+        if self.translate.granularity != default.translate.granularity {
+            translate.insert(
+                "granularity".to_string(),
+                Value::String(self.translate.granularity.label().to_string()),
+            );
+        }
+        if self.translate.show_source != default.translate.show_source {
+            translate.insert(
+                "show_source".to_string(),
+                Value::Boolean(self.translate.show_source),
+            );
+        }
+        insert_table(&mut root, "translate", translate);
+
+        let mut osc = Table::new();
+        if self.vrchat.osc.enabled != default.vrchat.osc.enabled {
+            osc.insert(
+                "enabled".to_string(),
+                Value::Boolean(self.vrchat.osc.enabled),
+            );
+        }
+        if self.vrchat.osc.port != default.vrchat.osc.port {
+            osc.insert(
+                "port".to_string(),
+                Value::Integer(i64::from(self.vrchat.osc.port)),
+            );
+        }
+        if self.vrchat.osc.display != default.vrchat.osc.display {
+            osc.insert(
+                "display".to_string(),
+                Value::String(self.vrchat.osc.display.label().to_string()),
+            );
+        }
+        if !osc.is_empty() {
+            let mut vrchat = Table::new();
+            vrchat.insert("osc".to_string(), Value::Table(osc));
+            root.insert("vrchat".to_string(), Value::Table(vrchat));
+        }
+
+        root
+    }
+
     /// 去掉各字符串字段的首尾空白，并完成语言代码等归一化。
     ///
     /// 注意：这里**保留显式空字符串**（`Some("")`），交给 [`Self::validate`]
@@ -759,6 +959,27 @@ impl AppConfig {
             "https://{}/compatible-mode/v1/chat/completions",
             self.api.workspace_host
         )
+    }
+}
+
+/// 只在表非空时插入，避免生成 `[section]` 空段。
+fn insert_table(root: &mut Table, name: &str, table: Table) {
+    if !table.is_empty() {
+        root.insert(name.to_string(), Value::Table(table));
+    }
+}
+
+/// 字符串数组 -> TOML array。
+fn string_array(values: &[String]) -> Value {
+    Value::Array(values.iter().cloned().map(Value::String).collect())
+}
+
+/// f32 按最短十进制表示转成 TOML float，避免 1.3 写成二进制尾差。
+fn float_value(value: f32) -> Value {
+    match format!("{value}").parse::<f64>() {
+        Ok(value) => Value::Float(value),
+        // best-effort: f32 的 Display 输出一定可被 f64 解析，这里只是不 panic 的兜底。
+        Err(_) => Value::Float(f64::from(value)),
     }
 }
 
@@ -1061,6 +1282,140 @@ words = 10
         assert_eq!(config.asr.model, DEFAULT_ASR_MODEL);
         assert_eq!(config.tts.voice, DEFAULT_VOICE);
         assert_eq!(config.cache.file, PathBuf::from("cache.json"));
+    }
+
+    #[test]
+    fn default_config_serializes_to_empty_string() {
+        assert_eq!(AppConfig::default().to_toml_string().unwrap(), "");
+    }
+
+    #[test]
+    fn explicit_defaults_are_omitted_on_serialization() {
+        let text = r#"
+[api]
+key = "sk-test"
+
+[translate]
+enabled = false
+target = "en"
+model = "qwen-mt-flash"
+granularity = "clause"
+show_source = true
+
+[vad]
+enabled = true
+threshold = 0.5
+min_silence_ms = 500
+tail_ms = 1000
+debug = false
+"#;
+        let config = AppConfig::from_toml_str(text).unwrap();
+        let out = config.to_toml_string().unwrap();
+
+        assert!(out.contains("[api]"));
+        assert!(out.contains("key = \"sk-test\""));
+        assert!(!out.contains("[translate]"), "{out}");
+        assert!(!out.contains("[vad]"), "{out}");
+    }
+
+    #[test]
+    fn non_default_fields_round_trip_through_minimal_toml() {
+        let text = r#"
+[api]
+key = "sk-test"
+workspace_host = "ws-test.cn-beijing.maas.aliyuncs.com"
+
+[asr]
+model = "asr-test"
+languages = ["ja", "zh"]
+hotwords = ["原神", "Kaoet"]
+
+[tts]
+model = "tts-test"
+voice = "custom:foo"
+dialect = "四川话"
+
+[tts.custom_voices.foo]
+name = "甲"
+
+[[tts.custom_voices.foo.samples]]
+language = "zh"
+audio = "a.wav"
+rate = 1.3
+
+[[tts.custom_voices.foo.samples]]
+language = "ja"
+audio = "b.wav"
+
+[cache]
+file = "cache/kaols.json"
+
+[audio]
+input_device = "Microphone"
+output_device = "CABLE Input"
+
+[vad]
+enabled = false
+threshold = 0.42
+min_silence_ms = 320
+tail_ms = 800
+debug = true
+
+[chunking]
+words = 10
+
+[translate]
+enabled = true
+target = "ja"
+model = "mt-test"
+granularity = "sentence"
+show_source = false
+
+[vrchat.osc]
+enabled = true
+port = 9001
+display = "translation"
+"#;
+        let config = AppConfig::from_toml_str(text).unwrap();
+        let out = config.to_toml_string().unwrap();
+        let round = AppConfig::from_toml_str(&out).unwrap();
+
+        assert_eq!(round.api.workspace_host, config.api.workspace_host);
+        assert_eq!(round.asr.model, "asr-test");
+        assert_eq!(
+            round.asr.languages,
+            vec!["ja".to_string(), "zh".to_string()]
+        );
+        assert_eq!(
+            round.asr.hotwords,
+            vec!["原神".to_string(), "Kaoet".to_string()]
+        );
+        assert_eq!(round.tts.model, "tts-test");
+        assert_eq!(round.tts.voice, "custom:foo");
+        assert_eq!(round.tts.dialect, "四川话");
+        assert_eq!(round.tts.custom_voices["foo"].name.as_deref(), Some("甲"));
+        assert_eq!(round.tts.custom_voices["foo"].samples.len(), 2);
+        assert!((round.tts.custom_voices["foo"].samples[0].rate - 1.3).abs() < 1e-6);
+        assert_eq!(round.tts.custom_voices["foo"].samples[1].rate, 1.0);
+        assert_eq!(round.cache.file, PathBuf::from("cache/kaols.json"));
+        assert_eq!(round.audio.input_device.as_deref(), Some("Microphone"));
+        assert!(!round.vad.enabled);
+        assert_eq!(round.vad.threshold, 0.42);
+        assert_eq!(round.vad.min_silence_ms, 320);
+        assert_eq!(round.vad.tail_ms, 800);
+        assert!(round.vad.debug);
+        assert_eq!(round.chunking.words, 10);
+        assert!(round.translate.enabled);
+        assert_eq!(round.translate.target, "ja");
+        assert_eq!(round.translate.model, "mt-test");
+        assert_eq!(round.translate.granularity, TranslateGranularity::Sentence);
+        assert!(!round.translate.show_source);
+        assert!(round.vrchat.osc.enabled);
+        assert_eq!(round.vrchat.osc.port, 9001);
+        assert_eq!(round.vrchat.osc.display, VrchatDisplay::Translation);
+
+        assert_eq!(round.to_toml_string().unwrap(), out, "序列化应稳定");
+        assert_eq!(out.matches("rate = ").count(), 1, "默认语速不应写回: {out}");
     }
 
     #[test]

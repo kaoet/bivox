@@ -76,7 +76,7 @@ src/
 ├── log_sink.rs          log 门面 → 内存环形缓冲 + 按天文件 + panic 钩子
 ├── single_instance.rs   Windows 命名 Mutex 单实例 + 激活已有窗口
 ├── config.rs            config.toml 解析、默认值、归一化、校验、URL/路径派生
-├── config_edit.rs       toml_edit 定点写回（校验 + .bak）
+├── config_edit.rs       配置读写：读取、最小化序列化、校验、`.bak` 备份
 ├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
 ├── chatbox.rs           VRChat 聊天框文本合成/typing 判断/144 UTF-16、9 显示行截断（D33）
 ├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、清空、测试消息（D33）
@@ -271,12 +271,10 @@ main()
 
 ### 4.3 配置写回
 
-`src/config_edit.rs` 提供定点修改函数：
-
-- `set_api_key`、`set_audio_devices`、`set_asr`、`set_translate`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`、`set_vrchat_osc`；
-- 统一入口 `save(path, original, updated)`：无改动直接返回；否则先校验磁盘原配置仍然合法（非法则拒绝写回），再校验新文本；成功后把原文件复制为 `config.toml.bak`，再写盘。
-
-`toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）；`set_asr` 的 `hotwords` 为空时删除该键。GUI 保存 API Key 时输入框留空 = 删除 `[api] key`（`None`），不写空字符串。
+- 调用方先读磁盘原文，用 `AppConfig::load` 得到带 `base_dir` 的类型化配置，直接修改结构字段。
+- `AppConfig::to_toml_string` 先归一化/校验副本，再只输出与默认值不同的字段；所有空表不输出，因此空配置就是空文件。
+- 统一入口 `save(path, original, config)`：无改动直接返回；否则校验磁盘原配置仍然合法（非法则拒绝写回）并校验序列化文本；成功后把原文件复制为 `config.toml.bak`，再写盘。
+- `config.toml` 由 GUI 维护，不再保留注释、字段顺序或用户手写格式。GUI 保存 API Key 时输入框留空 = 删除 `[api] key`（`None`），不写空字符串。
 
 ### 4.4 配置指纹与热更新
 
@@ -469,7 +467,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - `drafts_from_config`：配置 → `VoiceDraft`（键名、显示名、有序样本，样本含语言、音频路径与 `rate`），按显示名/键名排序；
 - 界面只改草稿，直到点「保存」才写回；每个样本一行「语速」滑条与「重置」；
 - 语音识别页的草稿与保存规则见 D32；热词不是草稿的一部分，保存后由下一次会话启动同步（D31）。
-- `drafts_to_entries` 的字段校验与 `AppConfig::validate` 使用同一组规则（键名、样本、语言、音频、`rate`）；保存前还会检查音频文件存在；写回走 `config_edit::set_custom_voices`（整体替换该表）。
+- `drafts_to_entries` 的字段校验与 `AppConfig::validate` 使用同一组规则（键名、样本、语言、音频、`rate`）；保存前还会检查音频文件存在；写回时整体替换 `AppConfig.tts.custom_voices`。
 - 音频路径策略：选中的文件在 exe 目录内 → 存相对路径；目录外 → 存绝对路径并在界面提示可能破坏便携性。
 
 ### 11.3 运行期解析与注册（`voice/mod.rs`）
@@ -555,7 +553,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **249** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **239** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -669,7 +667,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ### 17.5 验证
 
-- 单测：配置解析/校验、`set_vrchat_osc` 写回、文本合成/保尾截断/9 行、typing 跳变、OSC 编码（`/chatbox/input` 的 `sTF`、`/chatbox/typing` 的 bool）、1 秒节流与清空（注入时钟）。
+- 单测：配置解析/校验、VRChat 配置写回、文本合成/保尾截断/9 行、typing 跳变、OSC 编码（`/chatbox/input` 的 `sTF`、`/chatbox/typing` 的 bool）、1 秒节流与清空（注入时钟）。
 - 2026-11-09 真机复核：144 ASCII 显示 6 行；160 ASCII 在 144 字符处裁尾；12 个显式行只显示 L01–L09；默认 UI 每行约 24 ASCII / 15 中文 / 12 emoji；144 纯中文约 10 行，双语 144 字符会因自动换行超过 9 行而裁掉源文尾。修复后 `chatbox` 按显示宽度估算换行，客户端发的 144 中文/双语样例均为 9 行且保留尾部标记。
 - GUI：egui_mcp 验证页签、开关/模式/端口写回、测试消息发包。
 - 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、30 秒自然过期与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。
