@@ -32,9 +32,10 @@
 ## 2. 构建与运行
 
 ```bash
-cargo build --bins        # 构建两个 bin：kaols（GUI）与 admin（调试 CLI）
+cargo build --bins        # 构建三个 bin：kaols（GUI）、admin 与 vad_debug（调试 CLI）
 cargo run                 # 启动 GUI（默认 wgpu 后端，debug 版保留控制台）
 cargo run --bin admin -- voice list   # 音色与热词列表调试 CLI，见第 9 节
+cargo run --release --bin vad_debug -- --seconds 15   # VAD 调参工具，见第 10 节
 cargo test                # 全部单元测试
 ```
 
@@ -94,6 +95,7 @@ cargo test -- --nocapture
 - `logs\kaols-YYYY-MM-DD.log`：按天文件，保留 7 天；
 - `crash.log`：panic 钩子写入（含 backtrace），界面也会显示崩溃横幅；
 - `[vad] debug = true`：每个音频块打印 Silero 概率、阈值与发送决策，用于排障（本地 VAD 不需要按麦克风/房间标定）。
+- VAD 起音迟钝、句首被切：用 `vad_debug` 对比"VAD 输入"与"实际发给 ASR"的两份 WAV，并可用同一段录音重放扫参，见第 10 节。
 
 ### egui_mcp：让 agent/开发者在真实窗口中操作与截图
 
@@ -161,7 +163,7 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 ```bash
 cargo fmt              # 1. 格式化整个项目（不是只格式化本次改动的文件）
 cargo fmt --check      # 2. 退出码必须为 0
-cargo build --bins     # 3. 两个 bin 都要编译通过
+cargo build --bins     # 3. 三个 bin 都要编译通过
 cargo test             # 4. 全部测试通过
 git diff --check       # 5. 无空白符错误
 git add -A
@@ -309,3 +311,38 @@ cargo run --bin admin -- -c <path-to-config.toml> voice list
 - 逻辑在 `src/voice/admin.rs` 与 `src/asr/admin.rs`（可用 mock HTTP 测试），`src/bin/admin.rs` 只做参数解析与终端输出。
 
 如果删除的远程音色仍被 `cache.json` 引用：下次会话启动解析自定义音色时会通过 `query_voice` 校验并自动重新复刻；网络异常时会先沿用缓存（标记为未校验）。
+
+---
+
+## 10. VAD 调参工具（`vad_debug`）
+
+`vad_debug` 用于排查“句首丢字 / 起音迟钝”：它把同一路音频同时写成两份 WAV，并给出逐块的门控决策。不随发布包分发，不连 ASR、不需要 API Key。
+
+```bash
+# 录 15 秒（3 秒倒计时），结果在 target\vad-debug\<时间戳>\
+cargo run --release --bin vad_debug -- --seconds 15
+
+# 调参：起音更灵敏 + 加长 pre-roll
+cargo run --release --bin vad_debug -- --threshold 0.35 --pre-roll-ms 600
+
+# 重放同一段录音换参数再跑（不用重复说话）
+cargo run --release --bin vad_debug -- --replay target\vad-debug\<时间戳>\raw.wav --threshold 0.4
+
+cargo run --release --bin vad_debug -- --list-devices
+```
+
+输出：
+
+- `raw.wav`：麦克风原始录音，即 VAD 的输入（采集块原样拼接）；
+- `gated.wav`：经 `SpeechGate` 之后**真实发给 ASR 的字节流**（含起音补发的 pre-roll、句末 tail 与空闲 keepalive 静音）；线上 ASR 客户端就是把这些块原样上传；
+- `report.csv`：每个采集块内 32ms 帧的 Silero 概率、门控状态、发送块数与累计发送时间；
+- `chunks.txt`：每个采集块的采样数，`--replay` 据此复现与原始录音相同的切块边界。
+
+用法要点：
+
+- 参数 `--threshold` / `--min-silence-ms` / `--pre-roll-ms` / `--tail-ms` / `--keepalive-ms` 默认与生产一致；`pre_roll_ms` 与 `keepalive_ms` 目前只在 `GateConfig` 里，`config.toml` 尚未暴露（先用工具验证效果，再决定是否进配置）；
+- 判断方法：先看 `gated.wav` 里句首是否还在——在，说明丢字不是 VAD 切的（问题在 VAD 之后）；不在，再用 `--replay` 扫 `--threshold` / `--pre-roll-ms` 对比；
+- 采集块大小由声卡回调与重采样决定（本机实测 102–107ms，不一定是 100ms）：pre-roll 按**整块向上取整**保留，保证实际补发不短于配置值；tail/keepalive 按整块取整、实际可能略少；
+- `--replay` 只接受 16kHz / 单声道 / PCM16 WAV（本工具产出的 `raw.wav` 即可）；同目录有 `chunks.txt` 时按原始切块边界重放，没有则按固定 100ms；
+- 录音按 `--seconds` 录满自动收尾（数据在内存里缓冲，结束时统一落盘）；直接 Ctrl+C 会丢弃本次录音；
+- 输出目录默认 `target\vad-debug\`（已被 gitignore），`--out` 可指定；不修改生产 VAD 算法与配置 schema。

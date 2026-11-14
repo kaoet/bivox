@@ -1,7 +1,8 @@
 //! kaols：基于百炼 Qwen-Audio 的超低延迟实时语音识别与语音合成。
 //!
 //! - 二进制入口：`src/main.rs`（GUI，见 docs/architecture.md）
-//! - 独立调试工具：`src/bin/admin.rs`（已实现，百炼音色管理）
+//! - 独立调试工具：`src/bin/admin.rs`（百炼音色/热词管理）、
+//!   `src/bin/vad_debug.rs`（VAD 调参：监听麦克风或重放录音，导出 raw/gated WAV 与逐块报告）
 //!
 //! 本 crate 只支持 Windows，且只支持便携模式：所有可写文件都在 exe 同目录。
 

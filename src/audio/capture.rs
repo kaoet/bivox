@@ -3,12 +3,14 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TrySendError;
 
 pub struct AudioCapture {
     _stream: Stream,
     is_capturing: Arc<AtomicBool>,
+    dropped_chunks: Arc<AtomicU64>,
 }
 
 impl AudioCapture {
@@ -23,6 +25,8 @@ impl AudioCapture {
 
         let is_capturing = Arc::new(AtomicBool::new(true));
         let capturing_flag = is_capturing.clone();
+        let dropped_chunks = Arc::new(AtomicU64::new(0));
+        let dropped_flag = dropped_chunks.clone();
 
         // 目标为 16000Hz 16-bit PCM 单声道
         let target_sample_rate = 16000u32;
@@ -44,7 +48,11 @@ impl AudioCapture {
                 for &v in &pcm_buffer {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                let _ = tx_pcm_16k.try_send(bytes);
+                // 通道满说明下游积压已超过容量，这段音频确实丢了，计数供排障查看；
+                // 接收端已关闭属于正常收尾，不计数。
+                if let Err(TrySendError::Full(_)) = tx_pcm_16k.try_send(bytes) {
+                    dropped_flag.fetch_add(1, Ordering::Relaxed);
+                }
                 pcm_buffer.clear();
             }
         };
@@ -97,7 +105,13 @@ impl AudioCapture {
         Ok(Self {
             _stream: stream,
             is_capturing,
+            dropped_chunks,
         })
+    }
+
+    /// 因通道满（下游积压）被丢弃的 100ms 音频块数；正常收尾导致的关闭不计入。
+    pub fn dropped_chunks(&self) -> u64 {
+        self.dropped_chunks.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)] // 预留：显式停止采集；当前由 drop `AudioCapture` 停止
