@@ -1,7 +1,6 @@
 //! 翻译页：翻译模式开关、目标语言、粒度、是否显示原文（D27）。
 //!
-//! 本页只写 `config.toml` 中 `[translate]` 的 `enabled` / `target` / `granularity` /
-//! `show_source`（D3 白名单），`model` 只读展示。改值即走 `config_edit` 写回：
+//! 字段语义见 `src/config.rs`；`model` 当前只读。改值即走 `config_edit` 写回：
 //! - `show_source` 只影响渲染，不参与配置指纹，改后立即生效、不重启；
 //! - 其余字段变化会触发 D20：停旧会话 → 用新配置自动重启，当前句会丢失。
 
@@ -75,10 +74,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
 
     ui.add_space(10.0);
     widgets::kv_row(ui, "翻译模型", &configured.model);
-    ui.label(
-        egui::RichText::new("模型只读；如需更换，请手改 config.toml 后到「设置 → 重新加载配置」。")
-            .weak(),
-    );
+    ui.label(egui::RichText::new("翻译模型当前只读，后续会补到本页编辑。").weak());
 
     let restart_fields_changed = enabled != configured.enabled
         || target != configured.target

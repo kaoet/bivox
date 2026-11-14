@@ -2,7 +2,7 @@
 #
 # 产物：dist\kaols-<version>-win64.zip
 #   只包含 kaols.exe + README.md + THIRD_PARTY_NOTICES.md
-#   （不含 config.toml / config.example.toml / 调试工具 / 缓存 / 日志；ONNX Runtime 已静态链接进 exe）
+#   （不含 config.toml / 调试工具 / 缓存 / 日志；ONNX Runtime 已静态链接进 exe）
 #
 # 用法：
 #   .\scripts\package.ps1             # 构建 release 并打包

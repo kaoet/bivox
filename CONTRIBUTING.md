@@ -199,7 +199,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 ### 配置与便携模式
 
-- `config.toml` 是唯一配置事实源；GUI 只能写：`[api] key`、`[audio]` 设备、`[asr] model` / `[asr] languages` / `[asr] hotwords`（「语音识别」页）、`[tts] voice` / `[tts] dialect` / `[tts.custom_voices]`、`[translate] enabled` / `target` / `granularity` / `show_source`（「翻译」页）、`[vrchat.osc] enabled` / `port` / `display`（「VRChat」页）；`[vad]` / `[chunking]` 等仍只读；
+- `config.toml` 是唯一配置事实源；当前 GUI 写回范围以 `src/config_edit.rs` 的 `set_*` 函数为准，字段清单不在文档中重复维护；
 - 写回使用 `toml_edit` 定点修改：写前用 `AppConfig::from_toml_str` 校验、写前备份 `config.toml.bak`、无改动不写盘；
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
 - 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
@@ -208,7 +208,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 ### 音色、缓存与热词
 
 - GUI 只编辑配置里的音色与 ASR 热词结构，**不访问百炼接口、不读写 `cache.json`**；远程音色与预编译热词列表的列出/删除只走 `admin` 调试 CLI；
-- `[cache] file` 默认 `cache.json`（相对配置文件目录），同时保存音色复刻记录与 ASR 预编译热词 `vocabulary_id`（含热词快照）；删除它会导致下次重新复刻音色、重建热词列表；
+- `[cache] file`（相对配置文件目录）同时保存音色复刻记录与 ASR 预编译热词 `vocabulary_id`（含热词快照）；删除它会导致下次重新复刻音色、重建热词列表；
 - 自定义音色样本是**有序数组**，`samples[0]` 是默认声线；每个样本按（TTS 模型, 音频内容 SHA256）单独复刻/缓存；合成时按本句语言选样本，缺语言回退第一个；
 - 不要在每次合成时重新上传/复刻；同一音频在不同模型下分别缓存，切换模型不得覆盖其它模型记录。
 
@@ -234,12 +234,12 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 | 内容 | 唯一来源 | 说明 |
 |---|---|---|
-| 用户使用、配置摘要、故障排查 | `README.md` | 会随发布 zip 分发，必须自包含 |
+| 用户使用、界面说明、故障排查 | `README.md` | 会随发布 zip 分发，必须自包含 |
 | 开发流程、规范、测试、发布、调试 | 本文件 | 其它文档只引用，不复制 |
 | AI 代理入口 | `AGENTS.md` | 只做导航与阅读顺序 |
 | 模块/数据流/算法 | `docs/architecture.md` | 当前实现的“怎么做” |
 | 设计决定与理由 | `docs/decisions.md` | `D1`–`D35`，编号稳定 |
-| 配置字段与默认值 | `config.example.toml` | 编译期内嵌为首次启动模板 |
+| 配置字段、默认值与校验 | `src/config.rs` | 字段注释 + `Default`/常量 + `validate` |
 | 语言代码集合 | `src/language.rs` | README 的用户表格据此维护 |
 | 模块职责概览 | `docs/architecture.md` | 本文件不重复维护目录树 |
 | 人类任务/想法记录 | `TODO.md` | **仅人类使用；AI 编码代理不得修改或参考** |
@@ -250,7 +250,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 - 模块边界、数据流、协议、算法变化 → 更新 `docs/architecture.md`；
 - 新的长期设计取舍 → 在 `docs/decisions.md` 追加 `D<n>`（不重排旧编号），并更新相关源码注释中的 `D` 引用；
 - 命令、门禁、代码规范、发布流程变化 → 更新本文件；`AGENTS.md` 保持只引用；
-- 配置字段变化 → 更新 `config.example.toml`，README 只保留常用字段摘要；
+- 配置字段变化 → 更新 `src/config.rs` 的字段注释、`Default`/常量和 `validate`；README 只描述 GUI 行为；
 - 语言列表变化 → 更新 `src/language.rs` 与 README 的对应表格。
 
 ### 写作约定
@@ -277,7 +277,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 4. 检查产物 `dist\kaols-<version>-win64.zip`：
    - 只包含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
-   - 不含 `config.toml`、`config.example.toml`、`cache.json`、日志、`admin` 调试工具；
+   - 不含 `config.toml`、`cache.json`、日志、`admin` 调试工具；
    - ONNX Runtime 已静态链接进 exe，**不要**再往 zip 里放 DLL；
 5. 冒烟检查（人工）：
    - 干净目录解压，首次启动生成配置并正常进入主界面；未填 Key 时点「开始」跳设置页；

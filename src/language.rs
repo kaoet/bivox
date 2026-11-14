@@ -22,7 +22,7 @@ pub const ASR_LANGUAGES: &[&str] = &[
 /// 翻译模式的目标语言：与 TTS 官方支持的语言一致（翻出来必须念得出来）。
 ///
 /// 限制在 16 种而不是 qwen-mt 的 92 种，是为了目标语言的译文一定能交给 TTS；
-/// 扩语言等 TTS 覆盖扩展后再做（见 docs/translation.md §3.3）。
+/// 等 TTS 覆盖扩展后再增加。
 pub const TRANSLATION_LANGUAGES: &[&str] = CLONING_LANGUAGES;
 
 /// 拉丁字母语系（文本无法可靠区分，统一取配置列表里第一个拉丁语言）。

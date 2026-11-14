@@ -3,7 +3,7 @@
 //! 设备规则（D12）：只保存**完整设备名**，启动时按名称精确匹配；设备改名或被拔掉时
 //! 明确报错让用户重选，不做模糊匹配、也不静默回退到默认设备。
 //!
-//! 更大的 VAD / 采样等参数目前仍只支持手改 `config.toml`，后续再搬到本页。
+//! 更大的 VAD / 采样等参数暂未提供图形化编辑，后续再搬到本页。
 
 use eframe::egui;
 
@@ -77,10 +77,5 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     }
 
     ui.add_space(10.0);
-    ui.label(
-        egui::RichText::new(
-            "VAD、采样率等参数暂未提供图形化编辑，可在 exe 同目录的 config.toml 中修改后点「设置 → 重新加载配置」。",
-        )
-        .weak(),
-    );
+    ui.label(egui::RichText::new("VAD、采样率等参数暂未提供图形化编辑，后续会补到本页。").weak());
 }

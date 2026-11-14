@@ -6,13 +6,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// 首次启动写入的默认配置模板。
-///
-/// 内嵌自仓库根 `config.example.toml`（编译期 `include_str!`），因此发布包不需要
-/// 再附带该文件；模板里的 `[api] key` 保持注释，首次启动后是合法的“未配置”
-/// 状态，开始实时会话时再由 GUI 引导填写。
-pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../config.example.toml");
-
 /// 程序用到的全部路径。
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -48,12 +41,14 @@ impl AppPaths {
         }
     }
 
-    /// 配置不存在时写入内置模板；返回是否新建。
+    /// 配置不存在时写入空文件；返回是否新建。
+    ///
+    /// 空文件就是合法的默认配置（所有字段走内置默认值，Key 为未配置）。
     pub fn ensure_default_config(&self) -> std::io::Result<bool> {
         if self.config_file.exists() {
             return Ok(false);
         }
-        fs::write(&self.config_file, DEFAULT_CONFIG_TEMPLATE)?;
+        fs::write(&self.config_file, "")?;
         Ok(true)
     }
 }
@@ -76,12 +71,24 @@ mod tests {
         assert_eq!(paths.crash_log, PathBuf::from(r"C:\Apps\kaols\crash.log"));
     }
 
-    /// 模板里的 key 必须保持注释：避免把示例 key 当真实 key 写进用户配置；
-    /// 缺省 Key 现在是合法的“未配置”状态，不影响首次启动。
+    /// 只缺配置时创建一个空文件，不能写入模板/注释。
     #[test]
-    fn default_template_has_commented_api_key() {
-        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[api]"));
-        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# key ="));
-        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("\nkey = "));
+    fn ensure_default_config_writes_empty_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "kaols-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = AppPaths::from_exe_dir(dir.clone());
+
+        assert!(paths.ensure_default_config().unwrap());
+        assert_eq!(std::fs::read_to_string(&paths.config_file).unwrap(), "");
+        assert!(!paths.ensure_default_config().unwrap(), "第二次不应重建");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

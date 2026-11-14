@@ -64,7 +64,7 @@ pub fn set_audio_devices(
 /// 设置 `[translate]` 中由翻译页负责的字段（D3/D27）。
 ///
 /// `enabled` / `target` / `granularity` / `show_source` 可写；`model` 只读，
-/// 保持配置文件里的原值（手改后走「重新加载配置」生效）。
+/// 保持配置文件里的原值。
 pub fn set_translate(
     original: &str,
     enabled: bool,
@@ -625,7 +625,7 @@ languages = ["zh", "ja"]
             crate::config::TranslateGranularity::Sentence
         );
         assert!(!config.translate.show_source);
-        // model 不在 GUI 白名单里，保持模板默认值
+        // model 不在当前 GUI 写回范围里，保持配置文件里的原值
         assert_eq!(
             config.translate.model,
             crate::config::DEFAULT_TRANSLATE_MODEL

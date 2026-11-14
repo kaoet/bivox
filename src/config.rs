@@ -1,3 +1,9 @@
+//! 配置模型、默认值与校验。
+//!
+//! 本文件是配置项的唯一完整字段说明：字段注释写用途、允许值/范围与跨字段约束；
+//! 默认值由对应的 `Default` 实现或默认常量给出，不在字段注释中重复。
+//! 用户侧操作见 README，运行期行为见 docs/architecture.md。
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -81,10 +87,9 @@ pub const DEFAULT_VRCHAT_OSC_PORT: u16 = 9000;
 
 /// 应用配置，对应 `config.toml` 的顶层结构。
 ///
-/// 所有字段都有默认值，空文件就是一份合法的默认配置；`[api] key` 缺省表示
-/// “还没配置”，开始实时会话时再由 GUI 引导到设置页填写，不影响配置加载。
-/// 字段一旦显式写出，就必须是合法值（例如显式空字符串会被拒绝）。
-/// 同时开启 `deny_unknown_fields`，字段名拼错会直接解析失败，避免静默使用默认值。
+/// 所有字段都有默认值，空文件是合法的默认配置；`[api] key` 缺省表示未配置，
+/// 不算配置非法。字段一旦显式写出就必须合法（显式空字符串会被拒绝）。
+/// 启用 `deny_unknown_fields`：未知字段/拼写错误直接解析失败。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
@@ -108,12 +113,16 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
-    /// 百炼 API Key（只从配置文件读取，不读环境变量）。
+    /// 百炼 API Key，用于全部百炼 API/WebSocket 请求。
     ///
-    /// `None` = 未配置，配置本身仍然有效；显式写 `key = ""` 属于非法配置。
+    /// `None` = 未配置，配置本身有效，开始会话前由 GUI 引导填写；
+    /// 显式写空字符串非法。
     pub key: Option<String>,
 
-    /// 业务空间专属域名 Host（不含 `wss://` 与路径）。
+    /// 业务空间接入域名 Host。
+    ///
+    /// 只能填纯 host：不能带 `wss://`、路径、端口或空白；域名标签需合法且长度符合
+    /// DNS 规则。业务空间专属域名形如 `{WorkspaceId}.cn-beijing.maas.aliyuncs.com`。
     pub workspace_host: String,
 }
 
@@ -130,20 +139,24 @@ impl Default for ApiConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrConfig {
+    /// 实时识别模型 ID；必须非空。
+    ///
+    /// 更换模型会改变预编译热词列表的归属。
     pub model: String,
 
-    /// 用户可能说的语言列表（有序）：
-    /// - 首个元素是没有"上一句"时的默认语言；
-    /// - 只写一个元素 = 强提示只按该语言识别；
-    /// - 检测用户当前说哪种语言时，永远以完整列表为范围；
-    /// - 整个列表会作为 ASR API 的 `language_hints` 传递（数量上限由服务端处理）。
+    /// 有序语言列表，首项为默认语言。
+    ///
+    /// - 只列一种 = 强提示只按该语言识别；
+    /// - 语言判定以完整列表为范围，整份列表作为 ASR 的 `language_hints`；
+    /// - 取值见 [`language::ASR_LANGUAGES`]；不能为空、不能重复，归一化去空白并转小写。
     pub languages: Vec<String>,
 
-    /// 预编译热词（ASR 专用）。
+    /// 预编译热词列表，空 = 不使用热词。
     ///
-    /// 会话启动时自动上传到百炼并生成/复用预编译热词列表，识别时通过
-    /// `vocabulary_id` 引用；权重固定 50（超级热词，每个词表最多 50 个）、
-    /// 不限定词条语种（D31）。空列表 = 不使用热词，不访问网络。
+    /// 词条丢弃空项、去重保序；权重固定 50（超级热词）；最多
+    /// [`MAX_ASR_HOTWORDS`] 条；单条含非 ASCII 字符时 ≤ [`MAX_HOTWORD_CHARS`]
+    /// 字符，纯 ASCII 时 ≤ [`MAX_ASCII_HOTWORD_WORDS`] 个空格分隔片段。
+    /// 会话启动时同步为百炼预编译热词列表（D31）。
     pub hotwords: Vec<String>,
 }
 
@@ -161,18 +174,22 @@ impl Default for AsrConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TtsConfig {
+    /// 合成模型 ID；必须非空，与音色/复刻缓存绑定。
     pub model: String,
 
-    /// 系统音色名、复刻音色 voice_id，或 `custom:<配置名>`（引用 `[tts.custom_voices]`）。
+    /// 当前音色：系统音色名、复刻 voice_id，或 `custom:<配置名>`。
+    ///
+    /// `custom:` 引用必须存在于 `custom_voices`；不能为空。
     pub voice: String,
 
-    /// 中文方言（官方方言名，默认「普通话」= 不附加方言指令）。
+    /// 中文方言，取值必须是 [`language::CHINESE_DIALECTS`] 中的官方名称。
     ///
-    /// 只在本句语言判定为中文（`zh`）时通过合成请求的 `instruction` 生效；
-    /// 取值见 [`language::CHINESE_DIALECTS`]。
+    /// 只对判定为中文的句子生效；普通话不附加方言指令（D29）。
     pub dialect: String,
 
-    /// 自定义（复刻）音色表：键名用于在 `voice` 中以 `custom:<键名>` 引用。
+    /// 自定义（复刻）音色表；键名用于 `voice = "custom:<键名>"`。
+    ///
+    /// 每个音色至少一个样本，结构见 [`CustomVoiceConfig`]。
     pub custom_voices: HashMap<String, CustomVoiceConfig>,
 }
 
@@ -191,9 +208,10 @@ impl Default for TtsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
-    /// 缓存文件（相对配置文件所在目录），保存「音色 → voice_id」与「ASR 模型 → vocabulary_id」。
+    /// 本地缓存文件，供音色复刻记录与 ASR 预编译热词 ID 共用。
     ///
-    /// 显式写空字符串属于非法配置；不想覆盖默认值时直接省略该键。
+    /// 相对路径以配置文件所在目录为基准；不能为空。删除后会重新复刻音色、
+    /// 重建热词列表。
     pub file: PathBuf,
 }
 
@@ -228,24 +246,26 @@ impl TranslateGranularity {
 
 /// `[translate]`：翻译模式。
 ///
-/// 开启后：输入文本先翻成 `target` 语言，再交给 TTS 合成并以字幕显示；
-/// 关闭时完全走原有识别/合成链路（见 docs/translation.md）。
+/// 开启后输入先翻成 `target` 语言，再交给 TTS 合成并以字幕显示；
+/// 关闭时走原有识别/合成链路。运行期行为见 docs/architecture.md §15。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranslateConfig {
-    /// 是否启用翻译模式（GUI 可改）。
+    /// 是否启用翻译模式；关闭时走原有识别/合成链路。
     pub enabled: bool,
 
-    /// 目标语言代码（[`language::TRANSLATION_LANGUAGES`] 之一，默认 en）。
+    /// 目标语言代码，必须是 [`language::TRANSLATION_LANGUAGES`] 之一。
+    ///
+    /// 启用翻译时校验；别名会归一（如 `tl` → `fil`），不能为空。
     pub target: String,
 
-    /// 翻译模型（只读；手改配置后「重新加载配置」生效）。
+    /// 翻译模型 ID；必须非空。
     pub model: String,
 
-    /// 翻译粒度（GUI 可改）。
+    /// 翻译粒度，取值见 [`TranslateGranularity`]。
     pub granularity: TranslateGranularity,
 
-    /// 字幕是否同时显示原文（GUI 可改；只影响渲染，不触发会话重启）。
+    /// 字幕是否同时显示原文；只影响渲染，不触发会话重启。
     pub show_source: bool,
 }
 
@@ -275,7 +295,9 @@ pub struct VrchatOscConfig {
     /// 是否把实时字幕发送到 VRChat 的 OSC 聊天框。
     pub enabled: bool,
 
-    /// VRChat 的 OSC 接收端口（默认 9000）。
+    /// VRChat 的 OSC 接收端口，必须为 1–65535。
+    ///
+    /// 需与 VRChat 启动参数 `--osc=inPort:...` 中的 `inPort` 一致。
     pub port: u16,
 
     /// 翻译模式下的聊天框显示内容；非翻译模式固定显示 ASR 原文。
@@ -318,16 +340,15 @@ impl VrchatDisplay {
 
 /// 一个自定义（复刻）音色，可包含多种语言的声线样本。
 ///
-/// 每个样本都会按 (`[tts] model`, 音频内容) 单独复刻并缓存一个 voice_id；
-/// 合成时按判定出的语言选择对应样本，缺语言时回退到 `samples` 的第一个。
-/// 百炼音色前缀由**配置键名**自动生成，不提供自定义项。
+/// 每个样本按（TTS 模型, 音频内容）单独复刻并缓存；合成时按语言选样本，
+/// 缺语言回退到首个样本。音色前缀由配置键名自动生成。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomVoiceConfig {
-    /// 显示名（可选，默认使用配置键名）。
+    /// 显示名；省略时使用配置键名，显式空字符串非法。
     pub name: Option<String>,
 
-    /// 声线样本列表（有序）：第一个是默认声线。
+    /// 有序声线样本；至少一个，首个是默认声线。
     pub samples: Vec<CustomVoiceSample>,
 }
 
@@ -335,15 +356,20 @@ pub struct CustomVoiceConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomVoiceSample {
-    /// 该样本的语言（百炼复刻语言代码，如 zh / ja / en）。
+    /// 声音复刻语言代码，取值见 [`language::CLONING_LANGUAGES`]。
+    ///
+    /// 归一化做别名处理（如 `tl` → `fil`）；同一音色内归一后不能重复。
     pub language: String,
 
-    /// 本地样例音频路径（相对配置文件所在目录）。
+    /// 本地样例音频路径（相对配置文件所在目录或绝对路径）；不能为空。
+    ///
+    /// 音频格式/时长等要求见 README。
     pub audio: PathBuf,
 
-    /// 语速倍率（百炼 TTS `rate` 参数，0.5–2.0，默认 1.0）。
+    /// 合成语速倍率，有效范围 [`MIN_SAMPLE_RATE`]–[`MAX_SAMPLE_RATE`]。
     ///
-    /// 只有本句实际选用该样本合成时才会使用；回退到默认样本时使用默认样本的 rate。
+    /// 属于样本级：只在本句选用该样本时生效，回退样本时用回退样本的 rate；
+    /// 不参与复刻/缓存。
     pub rate: f32,
 }
 
@@ -381,10 +407,14 @@ impl CustomVoiceConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
-    /// 输入设备（麦克风）名称；`None` 表示系统默认设备。
+    /// 输入设备完整名称；`None` = 系统默认。
+    ///
+    /// 显式空字符串非法；启动时按完整名称精确匹配，改名/拔出会报错而不回退。
     pub input_device: Option<String>,
 
-    /// 输出设备（扬声器 / 虚拟声卡）名称；`None` 表示系统默认设备。
+    /// 输出设备完整名称；`None` = 系统默认。
+    ///
+    /// 显式空字符串非法；启动时按完整名称精确匹配，改名/拔出会报错而不回退。
     pub output_device: Option<String>,
 }
 
@@ -392,19 +422,21 @@ pub struct AudioConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VadConfig {
-    /// 是否启用本地 VAD 门控（关闭后全量上传音频）。
+    /// 是否启用本地 VAD 门控；关闭后全量上传音频。
     pub enabled: bool,
 
-    /// 起音概率阈值（0–1）；负阈值自动取 `threshold - 0.15`。
+    /// 起音概率阈值，必须是 (0, 1) 内的有限数。
+    ///
+    /// 低于 `threshold - 0.15` 视为静音。
     pub threshold: f32,
 
-    /// 低于负阈值持续多久判定语音结束（毫秒）。
+    /// 低于负阈值持续多久判定语音结束，0–5000 毫秒。
     pub min_silence_ms: u32,
 
-    /// 语音结束后补发的尾部静音时长（毫秒），用于触发服务端 sentence_end。
+    /// 语音结束后补发的尾部静音，0–5000 毫秒；用于触发服务端 sentence_end。
     pub tail_ms: u32,
 
-    /// 打印每个 chunk 的 VAD 概率/阈值/发送决策，用于现场排障。
+    /// 打印每个 chunk 的 VAD 概率/阈值/发送决策，用于排障。
     pub debug: bool,
 }
 
@@ -424,7 +456,7 @@ impl Default for VadConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChunkingConfig {
-    /// 投机分块词数阈值。
+    /// 投机分块词数阈值，必须大于 0。
     pub words: usize,
 }
 
@@ -1399,25 +1431,6 @@ rate = 1.25
             config.http_api_base(),
             "https://dashscope.aliyuncs.com/api/v1"
         );
-    }
-
-    /// 默认模板必须能解析；模板里的 key 仍保持注释，因此首次启动后是
-    /// “未配置 API Key”的合法状态，而不是校验失败（见 paths.rs 的模板测试）。
-    #[test]
-    fn example_config_is_valid_template_without_key() {
-        let raw = include_str!("../config.example.toml");
-
-        let config = AppConfig::from_toml_str(raw).unwrap();
-        assert!(config.api.key.is_none(), "模板不应包含真实 API Key");
-        assert_eq!(config.api.workspace_host, DEFAULT_WORKSPACE_HOST);
-
-        let with_key = raw.replace(
-            "# key = \"sk-your-dashscope-api-key-here\"",
-            "key = \"sk-test\"",
-        );
-        let config = AppConfig::from_toml_str(&with_key).unwrap();
-        assert_eq!(config.api.key.as_deref(), Some("sk-test"));
-        assert_eq!(config.api.workspace_host, DEFAULT_WORKSPACE_HOST);
     }
 
     #[test]

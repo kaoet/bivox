@@ -8,8 +8,8 @@
 
 1. [`CONTRIBUTING.md`](CONTRIBUTING.md) —— 强制门禁、代码/注释规范、测试、文档维护、发布流程；
 2. [`docs/architecture.md`](docs/architecture.md) —— 模块划分、数据流、关键算法与边界；
-3. [`docs/decisions.md`](docs/decisions.md) —— `D1`–`D33` 设计决定；改动涉及这些约束时逐条对照；
-4. 涉及用户可见行为时读 [`README.md`](README.md)；涉及配置字段时读 [`config.example.toml`](config.example.toml)；
+3. [`docs/decisions.md`](docs/decisions.md) —— `D1`–`D35` 设计决定；改动涉及这些约束时逐条对照；
+4. 涉及用户可见行为时读 [`README.md`](README.md)；涉及配置字段时读 [`src/config.rs`](src/config.rs) 的字段注释、`Default` 实现与 `validate`；
 5. 具体源码模块顶部的 `//!` 文档注释。
 
 ## 文档导航
@@ -21,7 +21,7 @@
 | [`docs/architecture.md`](docs/architecture.md) | 当前实现的模块/算法设计 |
 | [`docs/decisions.md`](docs/decisions.md) | 设计决定与理由（稳定编号 `D<n>`） |
 | [`docs/troubleshooting/windows-temp-low-integrity.md`](docs/troubleshooting/windows-temp-low-integrity.md) | Windows 上测试写 `%TEMP%` 报 os error 5 的排查、规避与修复（DSH Low 完整性标签残留） |
-| [`config.example.toml`](config.example.toml) | 配置字段与默认值的权威注释（编译期内嵌为首次启动模板） |
+| [`src/config.rs`](src/config.rs) | 配置字段、默认值与校验的唯一完整说明（字段注释 + `Default`/常量 + `validate`） |
 | [`TODO.md`](TODO.md) | 人类维护的任务与想法记录；**AI 编码代理不得修改，也应忽略其中内容** |
 | `src/**/*.rs` 的 `//!` | 模块职责与关键约束 |
 
@@ -33,7 +33,7 @@
 | 用户可见行为 | [`README.md`](README.md) |
 | 模块职责与算法 | [`docs/architecture.md`](docs/architecture.md) |
 | 设计约束与理由 | [`docs/decisions.md`](docs/decisions.md) |
-| 配置字段 | [`config.example.toml`](config.example.toml) |
+| 配置字段与默认值 | [`src/config.rs`](src/config.rs) |
 | 语言代码集合 | `src/language.rs` |
 
 ## 配置变更
