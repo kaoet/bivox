@@ -470,7 +470,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 ### 10.1 采集（`audio/capture.rs`）
 
 - 使用设备默认输入配置，支持 `f32` / `i16` 两种采样格式；其它格式明确报错。
-- 多声道混成单声道，经 rubato FFT 重采样到 16kHz，累积到 1600 个样本（100ms）后转 PCM16 LE 发送；通道满时丢弃（实时场景可接受）。
+- 多声道混成单声道，经 rubato FFT 重采样到 16kHz，累积到 ≥1600 个样本后**整块**转 PCM16 LE 发送（名义 100ms；实际块长由声卡回调粒度决定，本机两种设备实测 102–107ms）；通道满时丢弃并计数（`AudioCapture::dropped_chunks`，供排障工具查看）。
 - `AudioCapture` 持有 cpal `Stream`，drop 即停止采集。
 
 ### 10.2 播放（`audio/playback.rs`）
@@ -487,7 +487,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 - 模型为官方 `silero_vad_16k_op15.onnx`（MIT，1.23MiB），编译期 `include_bytes!` 内嵌进 exe，运行时由 ONNX Runtime 从内存加载；模型来源/版本/SHA256 见 `assets/silero/README.md`。
 - 每帧恰好 512 采样（32ms）；输入 `input[1,576]`（64 采样 context + 512 新帧）、`state[2,1,128]`、`sr`；输出该帧语音概率与下一帧 state。
-- 采集仍是 100ms chunk：门控内部按 512 分帧，跨 chunk 保留不足一帧的采样余量（1600 = 3×512 + 64）。
+- 采集块名义 100ms（实际 100–107ms）：门控内部按 512 分帧，跨 chunk 保留不足一帧的采样余量（以 1600 为例 3×512 + 64）。
 - 实测（release，单线程）：单帧约 0.13ms；会话启动加载会话约 36ms。单帧推理不在 cpal 实时回调里执行。
 
 **发送门控（`SpeechGate`）**
@@ -495,7 +495,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 起音：连续 2 帧概率 ≥ `threshold`（默认 0.5，即 64ms 去抖）；
 - 保持：概率 ≥ `threshold - 0.15`（负阈值迟滞）；
 - 结束：低于负阈值持续 `min_silence_ms`（默认 500ms）；
-- 语音中：发送当前 chunk；起音瞬间补发 `pre_roll_ms`（默认 300ms）历史音频，避免切掉首字；
+- 语音中：发送当前 chunk；起音瞬间补发 `pre_roll_ms`（默认 300ms）历史音频，避免切掉首字（采集块不一定整除毫秒，按**整块向上取整**保留，实际补发可能略多于配置值）；
 - 语音刚结束：继续补 `tail_ms`（默认 1000ms）静音，帮助服务端 VAD 吐出 `sentence_end`（服务端约需 800ms 静音）；
 - 完全空闲：每 `keepalive_ms`（默认 10s）补一小段静音，避免 run-task 任务约 23s 无音频被服务端失败；
 - 每个 chunk 更新共享 `active_flag`（顶栏 VAD 指示器）。

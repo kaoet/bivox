@@ -57,7 +57,7 @@ pub struct GateConfig {
     pub threshold: f32,
     /// 低于负阈值持续多久判定语音结束（毫秒）。
     pub min_silence_ms: u32,
-    /// 起音时向前补发的历史音频（毫秒），避免切掉首字声母。
+    /// 起音时向前补发的历史音频（毫秒，按整块向上取整，保证实际补发不短于该值）。
     pub pre_roll_ms: u32,
     /// 语音结束后额外补发的静音（毫秒），用于触发服务端 `sentence_end`。
     pub tail_ms: u32,
@@ -108,7 +108,8 @@ pub struct SpeechGate<D: FrameDetector> {
     below_frames: u32,
     pre_roll: VecDeque<Vec<u8>>,
     pre_roll_bytes: usize,
-    pre_roll_limit_bytes: usize,
+    /// `pre_roll_ms` 对应的字节数；实际保留量按整块向上取整（见 `push_pre_roll`）。
+    pre_roll_target_bytes: usize,
     tail_ms_left: u32,
     idle_ms_since_send: u32,
     /// 推理失败后降级为「全量上传」，避免静默丢音频。
@@ -129,7 +130,7 @@ impl<D: FrameDetector> SpeechGate<D> {
         let frame_ms = ((frame_samples as u64 * 1000) / 16_000).max(1) as u32;
         let min_silence_frames = config.min_silence_ms.div_ceil(frame_ms).max(1);
         let neg_threshold = (config.threshold - NEG_MARGIN).max(0.01);
-        let pre_roll_limit_bytes = config.pre_roll_ms.max(1) as usize * BYTES_PER_MS;
+        let pre_roll_target_bytes = config.pre_roll_ms.max(1) as usize * BYTES_PER_MS;
         Self {
             config,
             detector,
@@ -142,7 +143,7 @@ impl<D: FrameDetector> SpeechGate<D> {
             below_frames: 0,
             pre_roll: VecDeque::new(),
             pre_roll_bytes: 0,
-            pre_roll_limit_bytes,
+            pre_roll_target_bytes,
             tail_ms_left: 0,
             idle_ms_since_send: 0,
             degraded: false,
@@ -256,6 +257,16 @@ impl<D: FrameDetector> SpeechGate<D> {
         self.degraded
     }
 
+    /// 当前是否处于语音段（只读；供调参工具 `vad_debug` 标注发送决策）。
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// 剩余需要补发的 tail 静音毫秒数（只读；供调参工具区分 tail 与空闲保活）。
+    pub fn tail_ms_left(&self) -> u32 {
+        self.tail_ms_left
+    }
+
     fn update_state(&mut self, prob: f32) {
         if self.active {
             if prob >= self.neg_threshold {
@@ -285,10 +296,19 @@ impl<D: FrameDetector> SpeechGate<D> {
         }
     }
 
+    /// 保留最近音频供起音补发。
+    ///
+    /// 采集块大小由声卡回调与重采样决定（常见 100–107ms，不一定整除配置的毫秒数），
+    /// 所以按“整块向上取整”保留：只在“丢掉最旧一块后仍然 ≥ `pre_roll_ms`”时才丢。
+    /// 否则配置 300ms、块长 102ms 时只会保留 2 块（204ms），起音延迟稍大就会切掉首音。
     fn push_pre_roll(&mut self, chunk: Vec<u8>) {
         self.pre_roll_bytes += chunk.len();
         self.pre_roll.push_back(chunk);
-        while self.pre_roll_bytes > self.pre_roll_limit_bytes && self.pre_roll.len() > 1 {
+        while self.pre_roll.len() > 1 {
+            let front_len = self.pre_roll.front().map_or(0, Vec::len);
+            if self.pre_roll_bytes.saturating_sub(front_len) < self.pre_roll_target_bytes {
+                break;
+            }
             if let Some(front) = self.pre_roll.pop_front() {
                 self.pre_roll_bytes -= front.len();
             }
@@ -477,6 +497,21 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         gate.process_chunk(vec![0u8; 1600 * 2]);
         assert_eq!(calls.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn pre_roll_keeps_enough_whole_chunks() {
+        // 32ms 一块时 300ms 应保留 10 块（320ms）；按“字节上限”只会留 9 块（288ms）
+        let mut gate = SpeechGate::with_detector(gate_config(300, 0, 10_000), Scripted::new(&[]));
+        for _ in 0..20 {
+            assert!(gate.process_chunk(silence_chunk()).is_empty());
+        }
+        assert_eq!(
+            gate.pre_roll.len(),
+            10,
+            "应按整块向上取整保留 10 块（320ms ≥ 300ms）"
+        );
+        assert_eq!(gate.pre_roll_bytes, 10 * 1024);
     }
 
     #[test]
