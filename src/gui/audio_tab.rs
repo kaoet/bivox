@@ -7,9 +7,10 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::{KaolsApp, Tab};
 use crate::gui::widgets;
 
+const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 /// 从配置里取出当前设备设置（`None` = 系统默认）。
@@ -29,6 +30,9 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
+    if let Some(error) = app.config_write_error_for(Tab::Audio) {
+        ui.colored_label(RED, format!("保存失败：{error}"));
+    }
     ui.add_space(8.0);
 
     let (configured_input, configured_output) = current_devices(app);

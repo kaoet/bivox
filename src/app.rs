@@ -120,6 +120,8 @@ pub struct KaolsApp {
     pub output_devices: Vec<String>,
     /// 最近一次写回配置失败的原因（成功时清空）。
     pub config_write_error: Option<String>,
+    /// 最近一次写回失败所属页签（用于页内错误提示）。
+    pub config_write_error_tab: Option<Tab>,
     /// 运行中重新加载配置失败的原因（保留旧配置；成功时清空）。
     pub config_reload_error: Option<String>,
     /// 实时字幕状态（当前句 + 历史句）。
@@ -208,6 +210,7 @@ impl KaolsApp {
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             config_write_error: None,
+            config_write_error_tab: None,
             config_reload_error: None,
             subtitles: SubtitleState::default(),
             voice_drafts: Vec::new(),
@@ -252,6 +255,7 @@ impl KaolsApp {
             Ok(config) => {
                 self.config_reload_error = None;
                 self.config_write_error = None;
+                self.config_write_error_tab = None;
                 self.apply_config(config);
                 info!("已重新加载配置：{}", self.paths.config_file.display());
             }
@@ -630,6 +634,7 @@ impl KaolsApp {
         let model = self.translate_model.trim().to_string();
         if model.is_empty() {
             self.config_write_error = Some("翻译模型不能为空".to_string());
+            self.config_write_error_tab = Some(Tab::Translate);
             return;
         }
         let result = self.write_config(|config| {
@@ -746,14 +751,25 @@ impl KaolsApp {
         match result {
             Ok(()) => {
                 self.config_write_error = None;
+                self.config_write_error_tab = None;
                 self.reload_config();
                 info!("{success_message}（{}）", self.paths.config_file.display());
             }
             Err(err) => {
                 let message = format!("{err:#}");
                 self.config_write_error = Some(message.clone());
+                self.config_write_error_tab = Some(self.tab);
                 warn!("写回配置失败：{message}");
             }
+        }
+    }
+
+    /// 当前页签要显示的配置写回错误；其它页签的错误不串页展示。
+    pub fn config_write_error_for(&self, tab: Tab) -> Option<&str> {
+        if self.config_write_error_tab == Some(tab) {
+            self.config_write_error.as_deref()
+        } else {
+            None
         }
     }
 

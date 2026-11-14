@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::{KaolsApp, Tab};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
@@ -42,7 +42,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
             if reset {
                 app.reset_settings_tab();
             }
-            if let Some(error) = &app.config_write_error {
+            if let Some(error) = app.config_write_error_for(Tab::Settings) {
                 ui.colored_label(RED, format!("保存失败：{error}"));
             }
             if let Some(notice) = &app.api_key_notice {

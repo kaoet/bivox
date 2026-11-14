@@ -6,10 +6,11 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::{KaolsApp, Tab};
 use crate::config::{DEFAULT_TRANSLATE_MODEL, TranslateGranularity};
 use crate::language::{TRANSLATION_LANGUAGES, language_display_name};
 
+const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 /// 目标语言下拉的显示文本：中文名 + 代码，避免只显示代码时看不懂。
@@ -31,6 +32,9 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
+    if let Some(error) = app.config_write_error_for(Tab::Translate) {
+        ui.colored_label(RED, format!("保存失败：{error}"));
+    }
     ui.add_space(8.0);
 
     let configured = current(app);

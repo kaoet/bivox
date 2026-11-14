@@ -5,8 +5,10 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::{KaolsApp, Tab};
 use crate::config::{VrchatDisplay, VrchatOscConfig};
+
+const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 
 fn current(app: &KaolsApp) -> VrchatOscConfig {
     app.config.vrchat.osc.clone()
@@ -23,6 +25,9 @@ fn display_label(display: VrchatDisplay) -> &'static str {
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.heading("VRChat");
     ui.label(egui::RichText::new("把实时字幕发送到 VRChat 的 OSC 聊天框。").weak());
+    if let Some(error) = app.config_write_error_for(Tab::Vrchat) {
+        ui.colored_label(RED, format!("保存失败：{error}"));
+    }
     ui.add_space(8.0);
 
     let configured = current(app);
