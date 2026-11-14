@@ -16,7 +16,7 @@
 ## 快速开始
 
 1. 解压发布包（`kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`）到一个**可写目录**（例如 `D:\Apps\kaols`）；
-2. 双击 `kaols.exe`：首次启动会在 exe 同目录生成 `config.toml`，并自动落在「设置」页；
+2. 双击 `kaols.exe`：首次启动会在 exe 同目录生成 `config.toml`，正常进入主界面；未配置 API Key 时点「开始」会跳转到「设置」页；
 3. 在「设置」页填入百炼 API Key（[控制台](https://bailian.console.aliyun.com/)），点「保存 API Key」；
 4. 回到「实时」页点「开始」，对着麦克风说话即可看到字幕并听到合成语音。
 
@@ -146,7 +146,7 @@ crash.log              # 崩溃信息（如有）
 
 ```toml
 [api]
-key = "sk-..."                 # 必填
+key = "sk-..."                 # 可选；未配置时程序可正常启动，点「开始」会提示到设置页填写
 # workspace_host = "ws-xxxx.cn-beijing.maas.aliyuncs.com"  # 业务空间专属域名（纯 host）
 
 [asr]
@@ -260,7 +260,7 @@ rate = 1.0
 
 ## 故障排查
 
-- **启动提示未配置 API Key**：在「设置」页填写后保存，或编辑 `config.toml` 的 `[api] key` 后点「重新加载配置」。
+- **未配置 API Key**：点「开始」会跳转到「设置」页并提示；填写后保存即可。输入框留空保存会清除 API Key。
 - **设备打不开/找不到**：到「音频」页重新选择设备（完整名称会保存到配置）；设备改名或被拔掉时不会自动回退默认设备。
 - **说话没反应 / 顶栏 VAD 不亮**：确认麦克风有输入；本地 VAD 是 Silero 概率门控（默认阈值 0.5），轻声一般也能触发，环境噪声很大时可尝试 `[vad] threshold = 0.45`；`[vad] debug = true` 可看每个 chunk 的概率。
 - **顶部黄色「运行告警」提示本地 VAD 推理失败**：已降级为全量上传（识别不受影响，但会增加 ASR 费用）；停止后重新开始会话可重试；持续复现请附日志反馈。

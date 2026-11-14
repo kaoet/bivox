@@ -1,7 +1,6 @@
 //! GUI 应用主体：启动准备、全局状态、面板布局、事件泵、退出流程。
 
 use std::collections::VecDeque;
-use std::path::Path;
 use std::process::ExitCode;
 
 use eframe::egui;
@@ -10,13 +9,11 @@ use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
 use crate::config::{
-    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_ASR_LANGUAGE, DEFAULT_ASR_MODEL, DEFAULT_VOICE,
-    TranslateGranularity, VrchatDisplay,
+    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
 };
 use crate::config_edit;
 use crate::events::{PipelineEvent, SessionState};
 use crate::gui;
-use crate::language;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::osc::{ChatboxService, ChatboxSettings};
 use crate::paths::AppPaths;
@@ -72,14 +69,6 @@ impl Tab {
     }
 }
 
-/// 配置加载结果。
-///
-/// `Loaded` 装箱：`AppConfig` 结构较大，避免枚举尺寸被它主导（clippy::large_enum_variant）。
-pub enum ConfigState {
-    Loaded(Box<AppConfig>),
-    Invalid { error: String },
-}
-
 /// 应用状态。
 pub struct KaolsApp {
     pub paths: AppPaths,
@@ -101,11 +90,14 @@ pub struct KaolsApp {
     pub egui_ctx: Option<egui::Context>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
-    pub config: ConfigState,
+    /// 当前有效配置；启动时加载失败会直接退出，因此这里始终是合法配置。
+    pub config: AppConfig,
     /// 语音合成页左栏当前选中的自定义音色（配置键名）；`None` = 未选中。
     pub selected_voice: Option<String>,
-    /// 设置页的 API Key 草稿（点「保存」才写回 config.toml）。
+    /// 设置页的 API Key 草稿（点「保存」才写回 config.toml；留空保存 = 清除）。
     pub api_key_input: String,
+    /// 启动实时会话时发现未配置 API Key 的提示（设置页顶部显示）。
+    pub api_key_notice: Option<String>,
     /// 实时页底部「打字输入」的输入框内容。
     pub typed_input: String,
     /// 打字输入的行内错误（超长、会话未开始等）。
@@ -115,6 +107,8 @@ pub struct KaolsApp {
     pub output_devices: Vec<String>,
     /// 最近一次写回配置失败的原因（成功时清空）。
     pub config_write_error: Option<String>,
+    /// 运行中重新加载配置失败的原因（保留旧配置；成功时清空）。
+    pub config_reload_error: Option<String>,
     /// 实时字幕状态（当前句 + 历史句）。
     pub subtitles: SubtitleState,
     /// 语音合成页的音色编辑草稿（保存前只改这里，`config` 不变）。
@@ -145,9 +139,7 @@ pub struct KaolsApp {
     pub pipeline_error: Option<String>,
     /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
     pub vad_active: bool,
-    /// 本次启动是否刚刚生成了默认配置。
-    pub config_created: bool,
-    /// 启动检查发现的问题（写默认配置失败、初始化日志失败等）。
+    /// 启动检查发现的问题（日志初始化失败等非致命问题）。
     pub startup_error: Option<String>,
     /// 运行期崩溃信息（panic 钩子写入）。
     pub crash: Option<String>,
@@ -160,21 +152,13 @@ impl KaolsApp {
     fn new(
         paths: AppPaths,
         runtime: tokio::runtime::Runtime,
+        config: AppConfig,
         startup_error: Option<String>,
-        config_created: bool,
     ) -> Self {
-        let config = load_config(&paths.config_file);
-        // 配置缺失/无效时直接落在设置页，符合 D18（首次运行引导填 Key）。
-        let tab = if config_created || matches!(config, ConfigState::Invalid { .. }) {
-            Tab::Settings
-        } else {
-            Tab::Realtime
-        };
-        let initial_chatbox = match &config {
-            ConfigState::Loaded(config) => ChatboxSettings::from_config(config),
-            ConfigState::Invalid { .. } => ChatboxSettings::default(),
-        };
-        let chatbox = ChatboxService::spawn(runtime.handle(), initial_chatbox);
+        // 配置已经在 app::run 里加载并校验过；无效配置不会走到 GUI。
+        let tab = Tab::Realtime;
+        let chatbox =
+            ChatboxService::spawn(runtime.handle(), ChatboxSettings::from_config(&config));
 
         let mut app = Self {
             paths,
@@ -192,11 +176,13 @@ impl KaolsApp {
             config,
             selected_voice: None,
             api_key_input: String::new(),
+            api_key_notice: None,
             typed_input: String::new(),
             typed_input_error: None,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             config_write_error: None,
+            config_reload_error: None,
             subtitles: SubtitleState::default(),
             voice_drafts: Vec::new(),
             voice_list_scroll_to_end: false,
@@ -212,7 +198,6 @@ impl KaolsApp {
             pipeline_warning: None,
             pipeline_error: None,
             vad_active: false,
-            config_created,
             startup_error,
             crash: None,
             log: VecDeque::new(),
@@ -226,8 +211,34 @@ impl KaolsApp {
     }
 
     /// 重新从磁盘读取配置（设置页「重新加载」；写回成功后也会调用）。
+    ///
+    /// 失败时保留当前内存配置并记录错误，不把 GUI 切到“不可用”状态；
+    /// 写回路径也会重新校验磁盘文件，所以此时不会覆盖非法配置。
     pub fn reload_config(&mut self) {
-        self.config = load_config(&self.paths.config_file);
+        match AppConfig::load(&self.paths.config_file) {
+            Ok(config) => {
+                self.config_reload_error = None;
+                self.config_write_error = None;
+                self.apply_config(config);
+                info!("已重新加载配置：{}", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.config_reload_error = Some(message.clone());
+                warn!(
+                    "重新加载配置失败，保留当前配置：{message}（{}）",
+                    self.paths.config_file.display()
+                );
+            }
+        }
+    }
+
+    /// 应用一份已校验的配置，并刷新依赖它的界面状态。
+    fn apply_config(&mut self, config: AppConfig) {
+        self.config = config;
+        if self.config.api.key.is_some() {
+            self.api_key_notice = None;
+        }
         self.sync_from_config();
         self.sync_voice_inputs();
         self.sync_asr_inputs();
@@ -239,13 +250,10 @@ impl KaolsApp {
         if !selected_exists {
             self.selected_voice = None;
         }
-        info!("已重新加载配置：{}", self.paths.config_file.display());
         // 空闲时让字幕模式立刻跟随配置（运行中的会话等 D20 重启后由 start_session 设置）。
         if self.session.is_none() {
-            if let ConfigState::Loaded(config) = &self.config {
-                self.subtitles
-                    .set_translation_mode(config.translate.enabled);
-            }
+            self.subtitles
+                .set_translation_mode(self.config.translate.enabled);
         }
         // 运行中改配置（Key/设备/音色等）→ 用新配置自动重启管线
         self.maybe_restart_session();
@@ -253,46 +261,29 @@ impl KaolsApp {
 
     /// 把配置里的 Key / 设备 / 音色草稿同步到界面状态（加载、重载、写回成功后调用）。
     fn sync_from_config(&mut self) {
-        match &self.config {
-            ConfigState::Loaded(config) => {
-                self.api_key_input = config.api.key.clone().unwrap_or_default();
-                self.input_device = config.audio.input_device.clone();
-                self.output_device = config.audio.output_device.clone();
-                self.voice_drafts = editor::drafts_from_config(config);
-                self.tts_dialect = config.tts.dialect.clone();
-                self.chatbox
-                    .update_settings(ChatboxSettings::from_config(config));
-            }
-            ConfigState::Invalid { .. } => {
-                self.api_key_input.clear();
-                self.input_device = None;
-                self.output_device = None;
-                self.voice_drafts.clear();
-                self.tts_dialect = language::DEFAULT_CHINESE_DIALECT.to_string();
-                self.chatbox.update_settings(ChatboxSettings::default());
-            }
-        }
+        self.api_key_input = self.config.api.key.clone().unwrap_or_default();
+        self.input_device = self.config.audio.input_device.clone();
+        self.output_device = self.config.audio.output_device.clone();
+        self.voice_drafts = editor::drafts_from_config(&self.config);
+        self.tts_dialect = self.config.tts.dialect.clone();
+        self.chatbox
+            .update_settings(ChatboxSettings::from_config(&self.config));
     }
 
     /// 从配置同步语音合成页顶部「当前音色」的草稿值。
     pub fn sync_voice_inputs(&mut self) {
-        let ConfigState::Loaded(config) = &self.config else {
-            self.voice_mode = VoiceMode::Existing;
-            self.voice_input.clear();
-            self.voice_custom_key.clear();
-            return;
-        };
-        if let Some(name) = config.custom_voice_name() {
+        if let Some(name) = self.config.custom_voice_name().map(str::to_string) {
             self.voice_mode = VoiceMode::Custom;
-            self.voice_custom_key = name.to_string();
+            self.voice_custom_key = name;
             if self.voice_input.trim().is_empty() {
                 self.voice_input = DEFAULT_VOICE.to_string();
             }
         } else {
             self.voice_mode = VoiceMode::Existing;
-            self.voice_input = config.tts.voice.trim().to_string();
+            self.voice_input = self.config.tts.voice.trim().to_string();
             if self.voice_custom_key.is_empty() {
-                self.voice_custom_key = config
+                self.voice_custom_key = self
+                    .config
                     .tts
                     .custom_voices
                     .keys()
@@ -305,18 +296,9 @@ impl KaolsApp {
 
     /// 从配置同步「语音识别」页的草稿值（模型 / 语言列表 / 热词）。
     pub fn sync_asr_inputs(&mut self) {
-        match &self.config {
-            ConfigState::Loaded(config) => {
-                self.asr_model = config.asr.model.clone();
-                self.asr_languages = config.asr.languages.clone();
-                self.asr_hotwords = config.asr.hotwords.join("\n");
-            }
-            ConfigState::Invalid { .. } => {
-                self.asr_model = DEFAULT_ASR_MODEL.to_string();
-                self.asr_languages = vec![DEFAULT_ASR_LANGUAGE.to_string()];
-                self.asr_hotwords.clear();
-            }
-        }
+        self.asr_model = self.config.asr.model.clone();
+        self.asr_languages = self.config.asr.languages.clone();
+        self.asr_hotwords = self.config.asr.hotwords.join("\n");
         self.asr_edit_error = None;
     }
 
@@ -337,18 +319,12 @@ impl KaolsApp {
 
     /// 顶部「当前音色」是否与配置文件不同。
     pub fn voice_input_dirty(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => self.voice_draft_value() != config.tts.voice.trim(),
-            ConfigState::Invalid { .. } => true,
-        }
+        self.voice_draft_value() != self.config.tts.voice.trim()
     }
 
     /// 「中文方言」草稿是否与配置文件不同。
     pub fn tts_dialect_dirty(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => self.tts_dialect.trim() != config.tts.dialect,
-            ConfigState::Invalid { .. } => true,
-        }
+        self.tts_dialect.trim() != self.config.tts.dialect
     }
 
     /// 语音合成页是否有未保存改动（音色草稿 + 当前音色 + 中文方言）。
@@ -382,9 +358,7 @@ impl KaolsApp {
         let voice_dirty = self.voice_input_dirty();
         let dialect_dirty = self.tts_dialect_dirty();
         let wanted_voice = self.voice_draft_value();
-        let ConfigState::Loaded(config) = &self.config else {
-            anyhow::bail!("配置无效，无法保存语音合成设置");
-        };
+        let config = &self.config;
 
         let original = config_edit::read(&self.paths.config_file)?;
         let mut updated = original.clone();
@@ -457,26 +431,17 @@ impl KaolsApp {
 
     /// 语音识别页的模型是否有改动。
     pub fn asr_model_dirty(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => self.asr_model.trim() != config.asr.model,
-            ConfigState::Invalid { .. } => true,
-        }
+        self.asr_model.trim() != self.config.asr.model
     }
 
     /// 语音识别页的语言列表是否有改动。
     pub fn asr_languages_dirty(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => self.asr_languages != config.asr.languages,
-            ConfigState::Invalid { .. } => true,
-        }
+        self.asr_languages != self.config.asr.languages
     }
 
     /// 语音识别页的热词是否有改动（按归一化后的列表比较，空白行不算改动）。
     pub fn asr_hotwords_dirty(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => self.hotwords_draft_list() != config.asr.hotwords,
-            ConfigState::Invalid { .. } => true,
-        }
+        self.hotwords_draft_list() != self.config.asr.hotwords
     }
 
     /// 语音识别页是否有未保存改动。
@@ -507,9 +472,6 @@ impl KaolsApp {
     }
 
     fn try_save_asr_tab(&self) -> anyhow::Result<()> {
-        if !matches!(self.config, ConfigState::Loaded(_)) {
-            anyhow::bail!("配置无效，无法保存语音识别设置");
-        }
         let model = self.asr_model.trim();
         if model.is_empty() {
             anyhow::bail!("识别模型不能为空");
@@ -544,16 +506,23 @@ impl KaolsApp {
         }
     }
 
-    /// 保存 API Key 到 config.toml（写前校验、写前备份，见 D3）。
+    /// 保存 API Key；输入框留空表示清除配置项（写回 `None`，而不是空字符串）。
     pub fn save_api_key(&mut self) {
         let key = self.api_key_input.trim().to_string();
-        if key.is_empty() {
-            self.config_write_error = Some("API Key 不能为空".to_string());
-            warn!("保存 API Key 失败：输入为空");
-            return;
+        let clear = key.is_empty();
+        let result = self
+            .write_config(|text| config_edit::set_api_key(text, (!clear).then_some(key.as_str())));
+        self.finish_config_write(
+            result,
+            if clear {
+                "已清除 API Key"
+            } else {
+                "已保存 API Key"
+            },
+        );
+        if self.config_write_error.is_none() {
+            self.api_key_notice = None;
         }
-        let result = self.write_config(|text| config_edit::set_api_key(text, Some(&key)));
-        self.finish_config_write(result, "已保存 API Key");
     }
 
     /// 更新 `[audio]` 设备（`None` = 系统默认）；设备名是完整名称（D12）。
@@ -592,11 +561,7 @@ impl KaolsApp {
 
     /// 立即发送一条 VRChat 测试消息（不走 1 秒文本节流）。
     pub fn send_test_message(&self) {
-        let enabled = matches!(
-            &self.config,
-            ConfigState::Loaded(config) if config.vrchat.osc.enabled
-        );
-        if enabled {
+        if self.config.vrchat.osc.enabled {
             self.chatbox.send_test();
         }
     }
@@ -616,7 +581,6 @@ impl KaolsApp {
             Ok(()) => {
                 self.config_write_error = None;
                 self.reload_config();
-                self.config_created = false;
                 info!("{success_message}（{}）", self.paths.config_file.display());
             }
             Err(err) => {
@@ -631,10 +595,7 @@ impl KaolsApp {
 
     /// 音色草稿是否有未保存修改。
     pub fn voice_drafts_dirty(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => self.voice_drafts != editor::drafts_from_config(config),
-            ConfigState::Invalid { .. } => !self.voice_drafts.is_empty(),
-        }
+        self.voice_drafts != editor::drafts_from_config(&self.config)
     }
 
     /// 打开程序目录（Windows 资源管理器）。
@@ -651,10 +612,7 @@ impl KaolsApp {
 
     /// 翻译模式字幕是否同时显示原文（只影响渲染，不参与配置指纹，D26）。
     pub fn translate_show_source(&self) -> bool {
-        match &self.config {
-            ConfigState::Loaded(config) => config.translate.show_source,
-            ConfigState::Invalid { .. } => true,
-        }
+        self.config.translate.show_source
     }
 
     /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。
@@ -662,15 +620,15 @@ impl KaolsApp {
         if self.session.is_some() {
             return;
         }
-        let config = match &self.config {
-            ConfigState::Loaded(config) => (**config).clone(),
-            ConfigState::Invalid { .. } => {
-                self.pipeline_error =
-                    Some("配置无效，无法启动实时管线（请先在「设置」页填写 API Key）".to_string());
-                warn!("启动实时管线失败：配置无效");
-                return;
-            }
-        };
+        // 未配置 Key 不算配置无效：配置本身是合法的，只是还不能启动实时会话。
+        if self.config.api.key.as_deref().map_or(true, str::is_empty) {
+            self.tab = Tab::Settings;
+            self.api_key_notice = Some("尚未配置 API Key；填写后即可开始实时会话。".to_string());
+            info!("未配置 API Key，已跳转到设置页");
+            return;
+        }
+        self.api_key_notice = None;
+        let config = self.config.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
         // 打字输入命令通道：GUI 提交、会话调度循环消费（无界，界面不会阻塞）。
@@ -770,10 +728,7 @@ impl KaolsApp {
         if !matches!(self.state, SessionState::Starting | SessionState::Running) {
             return;
         }
-        let ConfigState::Loaded(config) = &self.config else {
-            return;
-        };
-        let signature = config_signature(config);
+        let signature = config_signature(&self.config);
         if self.running_config_signature.as_deref() == Some(signature.as_str()) {
             return;
         }
@@ -930,6 +885,14 @@ impl KaolsApp {
                 egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
             );
         }
+        if let Some(detail) = self.config_reload_error.clone() {
+            gui::widgets::banner(
+                ui,
+                "配置重新加载失败",
+                &format!("{detail}（已保留当前运行配置；修复磁盘配置前无法写回）"),
+                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+            );
+        }
         if let Some(detail) = self.pipeline_warning.clone() {
             gui::widgets::banner(
                 ui,
@@ -1049,21 +1012,6 @@ fn config_signature(config: &AppConfig) -> String {
     signature
 }
 
-/// 从指定路径加载配置，失败时返回可展示的错误文本。
-pub fn load_config(path: &Path) -> ConfigState {
-    match AppConfig::load(path) {
-        Ok(config) => {
-            info!("已加载配置：{}", path.display());
-            ConfigState::Loaded(Box::new(config))
-        }
-        Err(err) => {
-            let message = format!("{err:#}");
-            warn!("配置加载失败：{message}");
-            ConfigState::Invalid { error: message }
-        }
-    }
-}
-
 /// 选择渲染后端（默认构建启用 `renderer-wgpu`）。
 ///
 /// 只有 `--no-default-features --features renderer-glow` 构建才有 glow；
@@ -1134,37 +1082,30 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+/// 启动阶段遇到无法继续的错误时，用原生弹窗告知用户后退出。
+///
+/// release 构建没有控制台，不能只写 stderr；这里在创建主界面之前就失败，
+/// 避免 GUI 拿到一份不认识的配置后又把它覆盖回去。
+fn show_fatal_dialog(title: &str, message: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(title)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 /// GUI 入口：完成启动准备后进入 eframe 事件循环。
 pub fn run(paths: AppPaths) -> ExitCode {
     // 尽可能早地安装崩溃钩子：release 构建没有控制台，这是唯一的崩溃线索。
     log_sink::install_panic_hook(paths.crash_log.clone());
 
-    let mut startup_error: Option<String> = None;
-    let mut record_error = |message: String| {
-        if startup_error.is_none() {
-            startup_error = Some(message);
-        }
-    };
-
-    let config_created = match paths.ensure_default_config() {
-        Ok(created) => {
-            if created {
-                info!("已生成默认配置：{}", paths.config_file.display());
-            }
-            created
-        }
-        Err(err) => {
-            record_error(format!("写入默认配置失败：{err}"));
-            false
-        }
-    };
-
     let removed_logs =
         log_sink::cleanup_old_logs(&paths.log_dir, chrono::Local::now().date_naive());
-
-    if let Err(err) = log_sink::init(&paths.log_dir) {
-        record_error(format!("初始化日志失败：{err}"));
-    }
+    let startup_error = match log_sink::init(&paths.log_dir) {
+        Ok(()) => None,
+        Err(err) => Some(format!("初始化日志失败：{err}")),
+    };
     if removed_logs > 0 {
         info!(
             "已清理 {removed_logs} 个过期日志文件（保留 {} 天）",
@@ -1177,14 +1118,45 @@ pub fn run(paths: AppPaths) -> ExitCode {
         env!("CARGO_PKG_VERSION"),
         paths.exe_dir.display()
     );
-    if config_created {
-        info!(
-            "已生成默认配置（[api] key 待填写）：{}",
-            paths.config_file.display()
-        );
-    }
     if let Some(message) = startup_error.as_deref() {
         warn!("启动检查未通过：{message}");
+    }
+
+    let config_created = match paths.ensure_default_config() {
+        Ok(created) => created,
+        Err(err) => {
+            let message = format!(
+                "无法准备配置文件：\n{}\n\n{err}\n\n程序将退出。\n请确认该目录可写。",
+                paths.config_file.display()
+            );
+            error!("{message}");
+            show_fatal_dialog("kaols 配置错误", &message);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 配置加载/校验失败是致命错误：不创建主界面，避免后续写回覆盖未知配置。
+    let config = match AppConfig::load(&paths.config_file) {
+        Ok(config) => {
+            info!("已加载配置：{}", paths.config_file.display());
+            config
+        }
+        Err(err) => {
+            let detail = format!("{err:#}");
+            error!("配置加载失败：{detail}");
+            let message = format!(
+                "无法加载配置文件：\n{}\n\n{detail}\n\n程序将退出。\n请修正该文件；删除它后重启会生成默认配置。",
+                paths.config_file.display()
+            );
+            show_fatal_dialog("kaols 配置错误", &message);
+            return ExitCode::FAILURE;
+        }
+    };
+    if config_created {
+        info!(
+            "已生成默认配置（尚未配置 API Key）：{}",
+            paths.config_file.display()
+        );
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1215,8 +1187,8 @@ pub fn run(paths: AppPaths) -> ExitCode {
             Ok(Box::new(KaolsApp::new(
                 paths,
                 runtime,
+                config,
                 startup_error,
-                config_created,
             )))
         }),
     );

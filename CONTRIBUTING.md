@@ -2,7 +2,7 @@
 
 本文件面向**开发与贡献者**（以及需要维护本仓库的 AI 编码代理），是项目开发流程、编码规范与发布流程的**唯一权威来源**。
 
-- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D34`）
+- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D35`）
 - 模块、数据流与算法：[`docs/architecture.md`](docs/architecture.md)
 - 用户使用说明：[`README.md`](README.md)
 - AI 代理入口：[`AGENTS.md`](AGENTS.md)（只做导航，不重复本文件规则）
@@ -238,7 +238,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 | 开发流程、规范、测试、发布、调试 | 本文件 | 其它文档只引用，不复制 |
 | AI 代理入口 | `AGENTS.md` | 只做导航与阅读顺序 |
 | 模块/数据流/算法 | `docs/architecture.md` | 当前实现的“怎么做” |
-| 设计决定与理由 | `docs/decisions.md` | `D1`–`D33`，编号稳定 |
+| 设计决定与理由 | `docs/decisions.md` | `D1`–`D35`，编号稳定 |
 | 配置字段与默认值 | `config.example.toml` | 编译期内嵌为首次启动模板 |
 | 语言代码集合 | `src/language.rs` | README 的用户表格据此维护 |
 | 模块职责概览 | `docs/architecture.md` | 本文件不重复维护目录树 |
@@ -280,7 +280,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
    - 不含 `config.toml`、`config.example.toml`、`cache.json`、日志、`admin` 调试工具；
    - ONNX Runtime 已静态链接进 exe，**不要**再往 zip 里放 DLL；
 5. 冒烟检查（人工）：
-   - 干净目录解压，首次启动生成配置并落在设置页；
+   - 干净目录解压，首次启动生成配置并正常进入主界面；未填 Key 时点「开始」跳设置页；
    - 填 Key 后实时会话能开始/停止，设备正确打开与释放；
    - 配置保存生效，运行中保存能热重启管线；
    - 自定义音色能注册/复用，缓存跨启动命中；

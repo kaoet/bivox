@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::KaolsApp;
 use crate::events::SessionState;
 
 /// 状态灯颜色。
@@ -20,7 +20,7 @@ fn state_color(state: SessionState) -> egui::Color32 {
 /// 本地 VAD 指示器（放在开始/停止按钮左侧）：
 /// 绿点 = 当前检测到语音；灰点 = 静音 / 管线未运行 / VAD 已被配置关闭。
 fn vad_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
-    let vad_enabled = matches!(&app.config, ConfigState::Loaded(config) if config.vad.enabled);
+    let vad_enabled = app.config.vad.enabled;
     let (color, state_text, hint) = if !vad_enabled {
         (
             egui::Color32::GRAY,
@@ -80,10 +80,6 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
             .clicked()
         {
             app.stop_session();
-        }
-
-        if matches!(app.config, ConfigState::Invalid { .. }) {
-            ui.label(egui::RichText::new("配置无效，无法开始").weak());
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

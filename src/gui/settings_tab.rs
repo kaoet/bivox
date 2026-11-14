@@ -5,11 +5,12 @@
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::KaolsApp;
 use crate::config::AppConfig;
 use crate::gui::widgets;
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 /// 从配置里提取的设置页只读信息（避免界面渲染时长期借用 `app.config`）。
 struct ConfigSummary {
@@ -73,32 +74,27 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
                 ui.colored_label(RED, format!("写回配置失败：{error}"));
                 ui.add_space(4.0);
             }
+            if let Some(notice) = &app.api_key_notice {
+                ui.colored_label(AMBER, notice);
+                ui.add_space(4.0);
+            }
             show_api_key_section(app, ui);
 
-            let summary = match &app.config {
-                ConfigState::Loaded(config) => Some(ConfigSummary::from_config(config)),
-                ConfigState::Invalid { .. } => None,
-            };
-
-            match summary {
-                Some(summary) => {
-                    ui.separator();
-                    show_config_summary(ui, &summary);
-                }
-                None => {
-                    ui.add_space(6.0);
-                    ui.colored_label(RED, "配置无效，实时功能不可用；请先修正上面的 API Key。");
-                    if let ConfigState::Invalid { error } = &app.config {
-                        ui.monospace(error.as_str());
-                    }
-                }
-            }
+            ui.separator();
+            let summary = ConfigSummary::from_config(&app.config);
+            show_config_summary(ui, &summary);
         });
 }
 
 /// API Key：输入框 + 保存按钮（写回 config.toml，明文保存并提示风险）。
+///
+/// 输入框留空保存 = 删除配置里的 `[api] key`，回到“未配置”状态；
+/// 不会写入空字符串（空字符串是非法配置）。
 fn show_api_key_section(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("API Key").strong());
+    if app.config.api.key.is_none() {
+        ui.label(egui::RichText::new("当前未配置 API Key").weak());
+    }
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut app.api_key_input)
@@ -106,13 +102,19 @@ fn show_api_key_section(app: &mut KaolsApp, ui: &mut egui::Ui) {
                 .desired_width(420.0)
                 .hint_text("sk-..."),
         );
-        if ui.button("保存 API Key").clicked() {
+        let button = if app.api_key_input.trim().is_empty() {
+            "清除 API Key"
+        } else {
+            "保存 API Key"
+        };
+        if ui.button(button).clicked() {
             app.save_api_key();
         }
     });
     ui.label(
         egui::RichText::new(
-            "Key 以明文保存在 exe 同目录的 config.toml；整个程序目录含密钥，请勿分享或上传。",
+            "留空保存会清除 API Key；Key 以明文保存在 exe 同目录的 config.toml，\
+             整个程序目录含密钥，请勿分享或上传。",
         )
         .weak(),
     );

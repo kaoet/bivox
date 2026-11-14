@@ -11,7 +11,7 @@
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::KaolsApp;
 use crate::config::{DEFAULT_ASR_MODEL, MAX_ASR_HOTWORDS, normalize_hotwords};
 use crate::language::{ASR_LANGUAGES, language_display_name};
 
@@ -74,15 +74,6 @@ fn show_content(app: &mut KaolsApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
-
-    if let ConfigState::Invalid { error } = &app.config {
-        ui.add_space(6.0);
-        ui.colored_label(
-            RED,
-            format!("配置无效，无法保存语音识别设置：{error}；请先到「设置」页修正配置。"),
-        );
-        return;
-    }
 
     ui.add_space(8.0);
     show_model(app, ui);

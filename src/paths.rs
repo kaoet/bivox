@@ -9,7 +9,8 @@ use std::path::PathBuf;
 /// 首次启动写入的默认配置模板。
 ///
 /// 内嵌自仓库根 `config.example.toml`（编译期 `include_str!`），因此发布包不需要
-/// 再附带该文件；模板里的 `[api] key` 是注释状态，让校验能明确提示"未配置 API Key"。
+/// 再附带该文件；模板里的 `[api] key` 保持注释，首次启动后是合法的“未配置”
+/// 状态，开始实时会话时再由 GUI 引导填写。
 pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../config.example.toml");
 
 /// 程序用到的全部路径。
@@ -75,8 +76,8 @@ mod tests {
         assert_eq!(paths.crash_log, PathBuf::from(r"C:\Apps\kaols\crash.log"));
     }
 
-    /// 模板里的 key 必须保持注释：否则首启写出的配置能通过校验，用户会拿到
-    /// 一个"看起来正常但连不上"的配置，而不是明确的"未配置 API Key"提示。
+    /// 模板里的 key 必须保持注释：避免把示例 key 当真实 key 写进用户配置；
+    /// 缺省 Key 现在是合法的“未配置”状态，不影响首次启动。
     #[test]
     fn default_template_has_commented_api_key() {
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[api]"));

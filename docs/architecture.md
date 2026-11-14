@@ -159,15 +159,16 @@ main()
   ├─ single_instance::acquire(exe)       # 命名 Mutex；已有实例则激活窗口后退出
   └─ app::run(paths)
        ├─ 安装 panic 钩子（尽早，release 无控制台）
-       ├─ paths.ensure_default_config() # 缺 config.toml 时写内嵌模板
-       ├─ log_sink::cleanup_old_logs()  # 清理过期日志（保留 7 天）
-       ├─ log_sink::init()              # 打开按天日志文件、注册 logger
+       ├─ log_sink::cleanup_old_logs()   # 清理过期日志（保留 7 天）
+       ├─ log_sink::init()               # 打开按天日志文件、注册 logger
+       ├─ paths.ensure_default_config()  # 缺 config.toml 时写内嵌模板；失败弹窗退出
+       ├─ AppConfig::load(...)           # 解析/归一化/校验；失败弹窗退出，不创建主界面
        ├─ 创建多线程 tokio Runtime
-       ├─ eframe::run_native(...)       # 1100×720，最小 900×600，wgpu/glow，图标
-       └─ KaolsApp::new(...)            # 加载配置、同步界面状态、枚举设备
+       ├─ eframe::run_native(...)        # 1100×720，最小 900×600，wgpu/glow，图标
+       └─ KaolsApp::new(...)             # 接收已校验配置、同步界面状态、枚举设备
 ```
 
-启动阶段的非致命错误不会中止程序：`ensure_default_config`、`log_sink::init` 等失败会记录到 `startup_error`，界面顶部显示黄色横幅。
+日志初始化失败是非致命错误：记录到 `startup_error`，界面顶部显示黄色横幅。配置文件创建/读取/解析/校验失败是致命错误：弹原生错误窗后退出（D35）。
 
 ### 3.2 应用状态
 
@@ -176,14 +177,14 @@ main()
 - 路径与运行时：`paths`、`runtime`、`egui_ctx`；
 - 会话：`state: SessionState`、`session: Option<PipelineSessionHandle>`、`events_rx`、`running_config_signature`、`restart_pending`；
 - VRChat：`chatbox: ChatboxService`（后台 OSC 任务句柄；不参与配置指纹）；
-- 配置：`config: ConfigState`（`Loaded` / `Invalid`）、`api_key_input`、设备列表与当前设备；
+- 配置：`config: AppConfig`（启动时已校验，始终有效）、`config_reload_error`、`api_key_input`、`api_key_notice`、设备列表与当前设备；
 - 打字输入：`typed_input`（输入框内容）、`typed_input_error`（行内错误）；提交通过 `PipelineSessionHandle::speak_typed` 走命令通道；
 - 音色编辑：`voice_drafts`（未保存草稿）、`selected_voice`、`voice_mode` / `voice_input` / `voice_custom_key`；
 - 语音识别编辑：`asr_model` / `asr_languages` / `asr_hotwords`（未保存草稿）、`asr_edit_error`；
-- 展示：`subtitles`、`log`、`vad_active`、错误/告警横幅（`startup_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
+- 展示：`subtitles`、`log`、`vad_active`、错误/告警横幅（`startup_error` / `config_reload_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
 - 生命周期：`closing`。
 
-`ConfigState::Invalid` 时程序仍可打开：设置页显示错误链，实时会话无法启动。
+`[api] key = None` 不算配置无效：GUI 正常打开；点「开始」时跳转设置页并显示 `api_key_notice`。真正非法的配置在启动阶段就弹窗退出，不会进入 `KaolsApp`。
 
 ### 3.3 主循环
 
@@ -252,21 +253,21 @@ main()
 
 ### 4.2 配置模型
 
-`AppConfig`（`src/config.rs`）与 TOML 一一对应，所有结构都启用 `deny_unknown_fields` 且有默认值，因此最小配置只写 `[api] key`。
+`AppConfig`（`src/config.rs`）与 TOML 一一对应，所有结构都启用 `deny_unknown_fields` 且有默认值；空文件就是一份合法的默认配置。`[api] key` 缺省 = 未配置，属于合法状态；字段一旦显式写出就必须合法，显式空字符串一律拒绝（D35）。
 
 | 段 | 字段 | 默认值 | 说明 |
 |---|---|---|---|
-| `[api]` | `key` | 无（必填） | 百炼 API Key，明文保存 |
+| `[api]` | `key` | 无（未配置合法） | 百炼 API Key，明文保存；显式空字符串非法 |
 | | `workspace_host` | `dashscope.aliyuncs.com` | 纯 host；业务空间专属域名可覆盖 |
 | `[asr]` | `model` | `qwen-audio-3.1-asr-flash-streaming` | 实时识别模型 |
 | | `languages` | `["zh"]` | 有序；首个为默认；整份列表作为 `language_hints`；本地判定也使用完整列表 |
 | | `hotwords` | 空 | 预编译热词（有序；去空白/去空/去重）；权重固定 50（超级热词，最多 50 条）、不限定语种；会话启动时自动同步（D31） |
-| `[cache]` | `file` | `cache.json` | 本地共享缓存（音色 + ASR 热词）路径，相对配置文件所在目录 |
+| `[cache]` | `file` | `cache.json` | 本地共享缓存（音色 + ASR 热词）路径，相对配置文件所在目录；显式空字符串非法 |
 | `[tts]` | `model` | `qwen-audio-3.1-tts-flash` | 合成模型 |
 | | `voice` | `qiaoxiaojiao_v3.1` | 系统音色名 / 复刻 voice_id / `custom:<键名>` |
 | | `dialect` | `普通话` | 中文方言（官方 20 种 + 普通话）；仅中文任务经 `instruction` 生效（D29） |
 | | `custom_voices` | 空 | 键名 → { `name`, `samples[]`（每个样本含 `language` / `audio` / `rate`） } |
-| `[audio]` | `input_device` / `output_device` | 空 = 系统默认 | 完整设备名 |
+| `[audio]` | `input_device` / `output_device` | 空 = 系统默认 | 完整设备名；省略表示系统默认，显式空字符串非法 |
 | `[vad]` | `enabled` | `true` | 关闭后全量上传 |
 | | `threshold` | `0.5` | Silero 起音概率阈值（0–1）；负阈值自动取 `threshold - 0.15` |
 | | `min_silence_ms` | `500` | 低于负阈值持续该时长判定语音结束 |
@@ -306,14 +307,15 @@ rate = 1.0
 
 **校验规则**（`AppConfig::validate`）：
 
-- `[api] key` 必填；`workspace_host` 必须是纯 host（无协议、路径、端口、空白，标签合法且长度符合 DNS 规则）；
-- ASR/TTS model、TTS voice 非空；
+- `[api] key` 缺省合法（未配置）；显式空字符串非法；`workspace_host` 必须是纯 host（无协议、路径、端口、空白，标签合法且长度符合 DNS 规则）；
+- 所有字符串/可选字符串字段：省略 = 默认/未设置，显式空字符串（或纯空白）= 非法；包括 `[audio]` 设备名、`[cache] file`、自定义音色 `name`、样本 `audio`、`[translate] target`；
+- ASR/TTS model、TTS voice、`[cache] file` 非空；
 - `[tts] dialect` 必须在 `CHINESE_DIALECTS` 内（官方方言名；归一化只去首尾空白，不接受「粤语」等别名）；
 - `[asr] languages` 非空、每个都在 `ASR_LANGUAGES` 内、无重复；归一化时去空白并转小写；
 - `[asr] hotwords`：最多 50 条（固定使用超级热词权重 50，官方限制每词表最多 50 个超级热词）；含非 ASCII 字符时整条 ≤15 字符（空格计入），纯 ASCII 时 ≤7 个空格分隔片段；归一化时去空白、丢空条目、按首次出现去重；
-- 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` 非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
+- 自定义音色：引用必须已定义；每个音色至少一个样本；样本 `audio` trim 后非空；语言在 `CLONING_LANGUAGES` 内且归一后不重复；样本 `rate` 必须是有限数且在 `0.5`–`2.0` 内；
 - `[chunking] words > 0`；`[vad] threshold` 必须是 (0, 1) 内的有限数，`min_silence_ms` / `tail_ms` 不超过 5000；
-- `[translate] model` 非空；`enabled = true` 时 `target` 必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内（先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`；
+- `[translate] model` 非空、`target` 非空（`enabled = true` 时还必须在 `TRANSLATION_LANGUAGES`（= 16 种 TTS 语言）内，先做别名归一，如 `tl` → `fil`）；`granularity` 只接受 `clause`/`sentence`；
 - `[vrchat.osc] port` 必须在 1–65535 之间（`0` 拒绝）。
 
 **派生 URL**：
@@ -326,16 +328,16 @@ rate = 1.0
 
 `src/config_edit.rs` 提供定点修改函数：
 
-- `set_api_key`、`set_audio_devices`、`set_asr`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`、`set_vrchat_osc`；
-- 统一入口 `save(path, original, updated)`：无改动直接返回；否则先用 `AppConfig::from_toml_str` 校验新文本，失败不落盘；成功后把原文件复制为 `config.toml.bak`，再写盘。
+- `set_api_key`、`set_audio_devices`、`set_asr`、`set_translate`、`set_active_voice`、`set_tts_dialect`、`set_custom_voices`、`set_vrchat_osc`；
+- 统一入口 `save(path, original, updated)`：无改动直接返回；否则先校验磁盘原配置仍然合法（非法则拒绝写回），再校验新文本；成功后把原文件复制为 `config.toml.bak`，再写盘。
 
-`toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）；`set_asr` 的 `hotwords` 为空时删除该键。
+`toml_edit` 只改目标字段，保留其它字段、注释与顺序；整体替换 `[tts.custom_voices]` 时该表**内部**注释会丢失（D3）；`set_asr` 的 `hotwords` 为空时删除该键。GUI 保存 API Key 时输入框留空 = 删除 `[api] key`（`None`），不写空字符串。
 
 ### 4.4 配置指纹与热更新
 
 `app::config_signature` 手工拼接一组**顺序稳定**的字段：API Key、域名、ASR 模型/语言/热词、TTS 模型/音色/方言、缓存路径、设备、VAD 参数、分块阈值、翻译开关/目标语言/模型/粒度（`show_source` 只影响渲染，不入指纹），以及按配置名排序的自定义音色与样本（含样本 `rate`）。**`[vrchat.*]` 不入指纹**：由 `ChatboxService` 的 watch 实时读取，改设置不重启（D33）。不能使用 `format!("{config:?}")`（`HashMap` 的 Debug 顺序不稳定）。
 
-写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。
+写回成功或「重新加载配置」后，`reload_config` 重新读取磁盘并同步界面状态，然后 `maybe_restart_session`：仅当会话处于 `Starting`/`Running` 且指纹变化时，停旧会话、等 `Idle` 后用新配置重启（D20）。重新加载失败时保留当前内存配置并显示 `config_reload_error`；写回会重新校验磁盘文件，非法时拒绝覆盖（D35）。
 
 ---
 
@@ -597,9 +599,9 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 | 语音合成 | 当前音色 + 中文方言 + 自定义音色编辑器 | 顶部 Radio 现有/自定义音色 + 中文方言下拉（选项来自 `CHINESE_DIALECTS`，默认普通话）；Tab 级保存/放弃更改（一次写回 `[tts] voice`/`dialect`/`custom_voices`）；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳/方言/列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
 | 翻译 | 翻译模式与目标语言 | 开关 + 16 种目标语言下拉（中文名 + 代码）+ 粒度二选一 + 显示原文开关（D25/D26）；改值即走 `config_edit::set_translate` 写回并重载：`show_source` 只影响渲染、不重启，其余字段触发 D20 热重启；`model` 只读展示 |
 | VRChat | OSC 聊天框 | 启用开关、发送端口（1–65535）、三种显示模式、发送测试消息（D33）；改值即写回 `[vrchat.osc]`，不进配置指纹、不重启；翻译模式未开启时模式仍可编辑但无额外提示；无状态行/typing 说明/隐私提示；测试消息立即发送、不走 1 秒文本节流 |
-| 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存；重新加载配置；打开程序目录；只读展示域名/识别模型/识别语言/预编译热词条数/合成模型/音色/方言；配置无效时显示错误链 |
+| 设置 | 便携路径、API Key、配置概览 | API Key 密码框 + 保存（输入框留空 = 清除该项）；「重新加载配置」失败时保留当前配置并显示顶部错误条；打开程序目录；只读展示域名/识别模型/识别语言/预编译热词条数/合成模型/音色/方言；未配置 Key 时显示弱提示 |
 
-- 错误展示：启动横幅（黄）、运行告警（黄，可清除，D8/D31）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。
+- 错误展示：启动横幅（黄）、配置重新加载失败（红）、运行告警（黄，可清除，D8/D31）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。配置启动失败不会进入主界面，而是原生错误弹窗后退出（D35）。
 - 语音合成页的“脏”状态 = 音色草稿 / 当前音色 / 中文方言任一与配置不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
 - 语音识别页的“脏”状态 = 模型 / 语言列表 / 归一化后的热词列表任一与配置不一致（空行/重复项不算改动）。
 - 语言列宽度、字号、颜色衰减等实现细节见 `gui/realtime_tab.rs` 的常量；字幕状态由 `subtitles::SubtitleState` 的纯函数维护（普通模式 `apply_asr` / `push_typed`；翻译模式 `apply_source` / `apply_translation`），GUI 与 VRChat OSC 任务共用同一份归约逻辑，并有单测覆盖。
@@ -609,7 +611,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **237** 个（以 `cargo test` 输出为准）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`，当前共 **250** 个（以 `cargo test` 输出为准）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。

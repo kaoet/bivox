@@ -61,7 +61,7 @@ pub fn api_from_config(config: &AppConfig) -> Result<BailianAsrApi> {
         .api
         .key
         .clone()
-        .context("未配置 API Key，请在配置文件的 [api] key 中设置")?;
+        .context("未配置 API Key，请先在「设置」页填写")?;
     BailianAsrApi::new(api_key, config.http_api_base())
 }
 

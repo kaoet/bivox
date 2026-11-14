@@ -7,18 +7,15 @@
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::KaolsApp;
 use crate::gui::widgets;
 
 /// 从配置里取出当前设备设置（`None` = 系统默认）。
-fn current_devices(app: &KaolsApp) -> Option<(Option<String>, Option<String>)> {
-    match &app.config {
-        ConfigState::Loaded(config) => Some((
-            config.audio.input_device.clone(),
-            config.audio.output_device.clone(),
-        )),
-        ConfigState::Invalid { .. } => None,
-    }
+fn current_devices(app: &KaolsApp) -> (Option<String>, Option<String>) {
+    (
+        app.config.audio.input_device.clone(),
+        app.config.audio.output_device.clone(),
+    )
 }
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
@@ -32,13 +29,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     );
     ui.add_space(8.0);
 
-    let Some((configured_input, configured_output)) = current_devices(app) else {
-        ui.colored_label(
-            egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-            "配置无效，无法保存设备选择；请先到「设置」页填写 API Key。",
-        );
-        return;
-    };
+    let (configured_input, configured_output) = current_devices(app);
 
     let input_names = app.input_devices.clone();
     let output_names = app.output_devices.clone();

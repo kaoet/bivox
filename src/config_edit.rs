@@ -3,7 +3,7 @@
 //! 目标：只动 GUI 负责的那几个字段（`[api] key`、`[audio]` 设备、`[asr]`
 //! model/languages/hotwords、`[tts] voice` / `dialect` / `custom_voices`、`[translate]`
 //! 的可写字段），其余字段、注释、顺序原样保留；
-//! 写盘前先用 `AppConfig::from_toml_str` 校验整份文本，校验失败不落盘；
+//! 写盘前先校验磁盘原配置仍然合法（非法则拒绝写回），再校验新文本；
 //! 写盘前把旧文件备份成 `config.toml.bak`。
 
 use std::fs;
@@ -20,14 +20,26 @@ pub fn read(path: &Path) -> Result<String> {
 }
 
 /// 设置 `[api] key`；`None` 或空字符串表示删除该键（= 未配置）。
+///
+/// 删除后如果 `[api]` 表已经没有任何字段，把整个表也删掉，保持空配置干净。
 pub fn set_api_key(original: &str, key: Option<&str>) -> Result<String> {
     let mut doc = parse(original)?;
-    let api = ensure_table(&mut doc, "api")?;
 
     match normalized(key) {
-        Some(key) => api["key"] = toml_edit::value(key),
+        Some(key) => {
+            let api = ensure_table(&mut doc, "api")?;
+            api["key"] = toml_edit::value(key);
+        }
         None => {
-            api.remove("key");
+            let remove_api = if let Some(api) = doc.get_mut("api").and_then(Item::as_table_mut) {
+                api.remove("key");
+                api.is_empty()
+            } else {
+                false
+            };
+            if remove_api {
+                doc.remove("api");
+            }
         }
     }
 
@@ -188,14 +200,17 @@ pub fn set_tts_dialect(original: &str, dialect: &str) -> Result<String> {
     render(&doc, original)
 }
 
-/// 写回配置：先校验新文本，再备份 `.bak`，最后写盘。
+/// 写回配置：先确认磁盘原配置仍然合法，再校验新文本，最后备份 `.bak` 并写盘。
 ///
-/// `original` 用来判断是否真的有改动；没有改动直接返回。
+/// `original` 用来判断是否真的有改动；没有改动直接返回。磁盘原配置非法时
+/// **拒绝写回**，避免 GUI 覆盖掉它不认识的配置内容。
 pub fn save(path: &Path, original: &str, updated: &str) -> Result<()> {
     if updated == original {
         return Ok(());
     }
 
+    crate::config::AppConfig::from_toml_str(original)
+        .with_context(|| "磁盘上的配置已无效，已拒绝写回（请先修正或删除配置文件）")?;
     crate::config::AppConfig::from_toml_str(updated)
         .with_context(|| "新配置校验失败，已放弃写回（配置文件未被修改）")?;
 
@@ -250,7 +265,8 @@ fn normalized(value: Option<&str>) -> Option<&str> {
 /// 输出文本：`toml_edit` 可能不补末尾换行，这里跟原文保持一致。
 fn render(doc: &DocumentMut, original: &str) -> Result<String> {
     let mut text = doc.to_string();
-    if original.ends_with('\n') && !text.ends_with('\n') {
+    // 全部字段删光时保持真正的空文件，不额外补一个只有换行的“非空”文件。
+    if !text.is_empty() && original.ends_with('\n') && !text.ends_with('\n') {
         text.push('\n');
     }
     Ok(text)
@@ -313,8 +329,21 @@ languages = ["zh", "ja"]
     #[test]
     fn set_api_key_none_clears_key() {
         let updated = set_api_key(SAMPLE, None).unwrap();
-        let err = AppConfig::from_toml_str(&updated).unwrap_err();
-        assert!(format!("{err:#}").contains("未配置 API Key"));
+        let config = AppConfig::from_toml_str(&updated).unwrap();
+        assert_eq!(config.api.key, None, "清除 Key 后应回到未配置状态");
+    }
+
+    #[test]
+    fn set_api_key_none_removes_empty_api_table() {
+        let updated = set_api_key("[api]\nkey = \"sk-test\"\n", None).unwrap();
+        assert_eq!(updated, "", "只剩 key 时清除后应得到空配置");
+        assert!(
+            AppConfig::from_toml_str(&updated)
+                .unwrap()
+                .api
+                .key
+                .is_none()
+        );
     }
 
     #[test]
@@ -354,6 +383,23 @@ languages = ["zh", "ja"]
         let err = save(&path, SAMPLE, &broken).unwrap_err();
         assert!(format!("{err:#}").contains("校验失败"));
         assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_invalid_disk_config() {
+        let path = temp_path("invalid-original");
+        let invalid = "[api]\nkey = \"\"\n";
+        fs::write(&path, invalid).unwrap();
+
+        let updated = "[api]\nkey = \"sk-new\"\n";
+        let err = save(&path, invalid, updated).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("磁盘上的配置已无效"),
+            "应拒绝覆盖非法原配置: {err:#}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
 
         let _ = fs::remove_file(&path);
     }

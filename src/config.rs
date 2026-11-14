@@ -81,7 +81,9 @@ pub const DEFAULT_VRCHAT_OSC_PORT: u16 = 9000;
 
 /// 应用配置，对应 `config.toml` 的顶层结构。
 ///
-/// 所有字段都有默认值：最小的配置文件只需要提供 `[api] key`。
+/// 所有字段都有默认值，空文件就是一份合法的默认配置；`[api] key` 缺省表示
+/// “还没配置”，开始实时会话时再由 GUI 引导到设置页填写，不影响配置加载。
+/// 字段一旦显式写出，就必须是合法值（例如显式空字符串会被拒绝）。
 /// 同时开启 `deny_unknown_fields`，字段名拼错会直接解析失败，避免静默使用默认值。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -107,6 +109,8 @@ pub struct AppConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
     /// 百炼 API Key（只从配置文件读取，不读环境变量）。
+    ///
+    /// `None` = 未配置，配置本身仍然有效；显式写 `key = ""` 属于非法配置。
     pub key: Option<String>,
 
     /// 业务空间专属域名 Host（不含 `wss://` 与路径）。
@@ -188,6 +192,8 @@ impl Default for TtsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// 缓存文件（相对配置文件所在目录），保存「音色 → voice_id」与「ASR 模型 → vocabulary_id」。
+    ///
+    /// 显式写空字符串属于非法配置；不想覆盖默认值时直接省略该键。
     pub file: PathBuf,
 }
 
@@ -460,9 +466,12 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// 把空字符串归一化为 `None`，并去掉各字符串字段的首尾空白。
+    /// 去掉各字符串字段的首尾空白，并完成语言代码等归一化。
+    ///
+    /// 注意：这里**保留显式空字符串**（`Some("")`），交给 [`Self::validate`]
+    /// 判定为非法；只有字段缺省时才是 `None`（未设置）。
     fn normalize(&mut self) {
-        self.api.key = normalize_optional(self.api.key.take());
+        self.api.key = trim_optional(self.api.key.take());
         self.api.workspace_host = self.api.workspace_host.trim().to_string();
         self.asr.model = self.asr.model.trim().to_string();
         self.asr.languages = self
@@ -479,31 +488,34 @@ impl AppConfig {
             language::canonical_language(self.translate.target.trim().to_lowercase().as_str())
                 .to_string();
         self.translate.model = self.translate.model.trim().to_string();
-        self.audio.input_device = normalize_optional(self.audio.input_device.take());
-        self.audio.output_device = normalize_optional(self.audio.output_device.take());
+        self.audio.input_device = trim_optional(self.audio.input_device.take());
+        self.audio.output_device = trim_optional(self.audio.output_device.take());
         for custom in self.tts.custom_voices.values_mut() {
-            custom.name = normalize_optional(custom.name.take());
+            custom.name = trim_optional(custom.name.take());
             for sample in &mut custom.samples {
                 sample.language = sample.language.trim().to_lowercase();
             }
         }
     }
 
-    /// 校验必填项与取值范围。
+    /// 校验显式写出的值、取值范围与跨字段约束。
+    ///
+    /// 缺省字段已经由 `Default` 填好，因此这里校验的是最终生效的配置；
+    /// `[api] key` 例外：`None` 表示尚未配置，是合法状态。
     fn validate(&self) -> Result<()> {
-        if self.api.key.is_none() {
-            bail!("未配置 API Key，请在配置文件的 [api] key 中设置");
-        }
+        validate_optional_non_empty(self.api.key.as_deref(), "[api] key")?;
         validate_workspace_host(&self.api.workspace_host)?;
-        if self.asr.model.trim().is_empty() {
+        validate_optional_non_empty(self.audio.input_device.as_deref(), "[audio] input_device")?;
+        validate_optional_non_empty(self.audio.output_device.as_deref(), "[audio] output_device")?;
+        if self.asr.model.is_empty() {
             bail!("配置项 [asr] model 不能为空");
         }
         self.validate_asr_languages()?;
         validate_hotwords(&self.asr.hotwords)?;
-        if self.tts.model.trim().is_empty() {
+        if self.tts.model.is_empty() {
             bail!("配置项 [tts] model 不能为空");
         }
-        if self.tts.voice.trim().is_empty() {
+        if self.tts.voice.is_empty() {
             bail!("配置项 [tts] voice 不能为空");
         }
         if !language::is_chinese_dialect(&self.tts.dialect) {
@@ -512,6 +524,11 @@ impl AppConfig {
                 self.tts.dialect,
                 language::CHINESE_DIALECTS
             );
+        }
+        if self.cache.file.as_os_str().is_empty()
+            || self.cache.file.to_string_lossy().trim().is_empty()
+        {
+            bail!("配置项 [cache] file 不能为空");
         }
         self.validate_custom_voices()?;
         self.validate_translate()?;
@@ -578,6 +595,10 @@ impl AppConfig {
             if name.trim().is_empty() {
                 bail!("[tts.custom_voices] 中存在空的配置名");
             }
+            validate_optional_non_empty(
+                custom.name.as_deref(),
+                &format!("[tts.custom_voices.{name}] name"),
+            )?;
             if custom.samples.is_empty() {
                 bail!(
                     "自定义音色 [{name}] 至少要有一个 [[tts.custom_voices.{name}.samples]] 声线样本"
@@ -586,7 +607,9 @@ impl AppConfig {
 
             let mut seen_languages = std::collections::HashSet::new();
             for (index, sample) in custom.samples.iter().enumerate() {
-                if sample.audio.as_os_str().is_empty() {
+                if sample.audio.as_os_str().is_empty()
+                    || sample.audio.to_string_lossy().trim().is_empty()
+                {
                     bail!(
                         "自定义音色 [{name}] 的第 {} 个声线样本缺少 audio（样例音频路径）",
                         index + 1
@@ -620,13 +643,16 @@ impl AppConfig {
         Ok(())
     }
 
-    /// 校验 `[translate]`：模型必须有值；启用翻译时目标语言必须可合成。
+    /// 校验 `[translate]`：模型与目标语言必须有值；启用翻译时目标语言必须可合成。
     ///
-    /// 关闭翻译时不校验目标语言，允许用户先改开关、后选语言；
+    /// 关闭翻译时只允许“暂不校验语言代码合法性”，但显式空字符串始终非法；
     /// 真正启用时会在下一次配置加载/写回校验中报错。
     fn validate_translate(&self) -> Result<()> {
-        if self.translate.model.trim().is_empty() {
+        if self.translate.model.is_empty() {
             bail!("配置项 [translate] model 不能为空");
+        }
+        if self.translate.target.is_empty() {
+            bail!("配置项 [translate] target 不能为空");
         }
         if self.translate.enabled
             && !language::is_cloning_language(language::canonical_language(&self.translate.target))
@@ -704,11 +730,21 @@ impl AppConfig {
     }
 }
 
-/// 去掉首尾空白；空字符串视为未配置。
-fn normalize_optional(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+/// 去掉可选字符串的首尾空白，但**保留显式空字符串**。
+///
+/// 字段缺省是 `None`；`Some("")` 表示用户显式写了空值，由校验拒绝。
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_string())
+}
+
+/// 可选字符串如果显式存在，就不能是空字符串。
+///
+/// 这与“缺省 = 未设置”区分开：想让某项保持未设置，应省略该键，而不是写空值。
+fn validate_optional_non_empty(value: Option<&str>, field: &str) -> Result<()> {
+    if value.is_some_and(str::is_empty) {
+        bail!("配置项 {field} 被显式设置为空；不想设置请删除该键");
+    }
+    Ok(())
 }
 
 /// 归一化热词列表：去首尾空白、丢弃空条目、按首次出现去重并保留顺序。
@@ -987,12 +1023,23 @@ words = 10
     }
 
     #[test]
-    fn missing_api_key_is_rejected() {
-        let err = AppConfig::from_toml_str("").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("[api] key"),
-            "错误信息应提示配置 [api] key: {err:#}"
-        );
+    fn empty_config_is_valid_without_api_key() {
+        let config = AppConfig::from_toml_str("").unwrap();
+        assert!(config.api.key.is_none(), "空文件应视为未配置 API Key");
+        assert_eq!(config.asr.model, DEFAULT_ASR_MODEL);
+        assert_eq!(config.tts.voice, DEFAULT_VOICE);
+        assert_eq!(config.cache.file, PathBuf::from("cache.json"));
+    }
+
+    #[test]
+    fn explicit_empty_api_key_is_rejected() {
+        for text in ["[api]\nkey = \"\"\n", "[api]\nkey = \"   \"\n"] {
+            let err = AppConfig::from_toml_str(text).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[api] key"),
+                "显式空 Key 应被拒绝: {err:#}"
+            );
+        }
     }
 
     #[test]
@@ -1005,13 +1052,51 @@ words = 10
     }
 
     #[test]
-    fn empty_device_strings_become_none() {
-        let config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[audio]\ninput_device = \"  \"\noutput_device = \"\"\n",
+    fn explicit_empty_optional_device_is_rejected() {
+        for text in [
+            "[api]\nkey = \"sk-test\"\n[audio]\ninput_device = \"  \"\n",
+            "[api]\nkey = \"sk-test\"\n[audio]\noutput_device = \"\"\n",
+        ] {
+            let err = AppConfig::from_toml_str(text).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[audio]"),
+                "显式空设备名应被拒绝: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_cache_file_is_rejected() {
+        let err = AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[cache]\nfile = \"  \"\n")
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[cache] file"),
+            "显式空缓存路径应被拒绝: {err:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_translate_target_is_rejected_even_when_disabled() {
+        let err = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = false\ntarget = \"\"\n",
         )
-        .unwrap();
-        assert!(config.audio.input_device.is_none());
-        assert!(config.audio.output_device.is_none());
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[translate] target"),
+            "显式空目标语言应被拒绝: {err:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_sample_audio_is_rejected() {
+        let err = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n\n[tts.custom_voices.foo]\n\n[[tts.custom_voices.foo.samples]]\nlanguage = \"zh\"\naudio = \"   \"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("audio"),
+            "显式空样例音频路径应被拒绝: {err:#}"
+        );
     }
 
     #[test]
@@ -1316,17 +1401,15 @@ rate = 1.25
         );
     }
 
-    /// 默认模板必须"结构合法但没填 key"：首启生成的 config.toml 要让校验明确提示
-    /// "未配置 API Key"，而不是看起来正常却连不上（见 paths.rs 的模板测试）。
+    /// 默认模板必须能解析；模板里的 key 仍保持注释，因此首次启动后是
+    /// “未配置 API Key”的合法状态，而不是校验失败（见 paths.rs 的模板测试）。
     #[test]
     fn example_config_is_valid_template_without_key() {
         let raw = include_str!("../config.example.toml");
 
-        let err = AppConfig::from_toml_str(raw).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("未配置 API Key"),
-            "模板应因缺少 key 而校验失败: {err:#}"
-        );
+        let config = AppConfig::from_toml_str(raw).unwrap();
+        assert!(config.api.key.is_none(), "模板不应包含真实 API Key");
+        assert_eq!(config.api.workspace_host, DEFAULT_WORKSPACE_HOST);
 
         let with_key = raw.replace(
             "# key = \"sk-your-dashscope-api-key-here\"",

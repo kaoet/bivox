@@ -7,7 +7,7 @@
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::KaolsApp;
 use crate::config::TranslateGranularity;
 use crate::gui::widgets;
 use crate::language::{TRANSLATION_LANGUAGES, language_display_name};
@@ -17,12 +17,9 @@ fn language_label(code: &str) -> String {
     format!("{}（{code}）", language_display_name(code))
 }
 
-/// 当前配置里的翻译设置（`None` = 配置无效）。
-fn current(app: &KaolsApp) -> Option<crate::config::TranslateConfig> {
-    match &app.config {
-        ConfigState::Loaded(config) => Some(config.translate.clone()),
-        ConfigState::Invalid { .. } => None,
-    }
+/// 当前配置里的翻译设置。
+fn current(app: &KaolsApp) -> crate::config::TranslateConfig {
+    app.config.translate.clone()
 }
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
@@ -36,13 +33,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     );
     ui.add_space(8.0);
 
-    let Some(configured) = current(app) else {
-        ui.colored_label(
-            egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-            "配置无效，无法保存翻译设置；请先到「设置」页修正配置。",
-        );
-        return;
-    };
+    let configured = current(app);
 
     let mut enabled = configured.enabled;
     let mut target = configured.target.clone();

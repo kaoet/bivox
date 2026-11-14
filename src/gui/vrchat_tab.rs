@@ -5,14 +5,11 @@
 
 use eframe::egui;
 
-use crate::app::{ConfigState, KaolsApp};
+use crate::app::KaolsApp;
 use crate::config::{VrchatDisplay, VrchatOscConfig};
 
-fn current(app: &KaolsApp) -> Option<VrchatOscConfig> {
-    match &app.config {
-        ConfigState::Loaded(config) => Some(config.vrchat.osc.clone()),
-        ConfigState::Invalid { .. } => None,
-    }
+fn current(app: &KaolsApp) -> VrchatOscConfig {
+    app.config.vrchat.osc.clone()
 }
 
 fn display_label(display: VrchatDisplay) -> &'static str {
@@ -28,13 +25,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("把实时字幕发送到 VRChat 的 OSC 聊天框。").weak());
     ui.add_space(8.0);
 
-    let Some(configured) = current(app) else {
-        ui.colored_label(
-            egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-            "配置无效，无法保存 VRChat 设置；请先到「设置」页修正配置。",
-        );
-        return;
-    };
+    let configured = current(app);
 
     let mut enabled = configured.enabled;
     let mut port = configured.port;
