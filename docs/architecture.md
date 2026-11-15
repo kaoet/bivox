@@ -587,7 +587,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`；lib 目标当前共 **247** 个（以 `cargo test` 输出为准；`bin` 下的调试工具另有少量单测）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`；lib 目标当前共 **249** 个（以 `cargo test` 输出为准；`bin` 下的调试工具另有少量单测）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、进程环回配速与进程发现、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
@@ -743,5 +743,14 @@ Connecting ──成功──▶ Capturing
 
 ### 18.4 验证
 
-- 单测：倒计时换算（`retry_seconds`）、时间线的双来源交错与去重。
+- 单测：倒计时换算（`retry_seconds`）、时间线的双来源交错、去重与「当前句钉顶」排序。
 - 真机（2026-11-15）：`[vrchat] process` 设为不存在的进程 → 会话照常运行、横幅显示倒计时、日志只记一条 warn；改成 `explorer.exe` 并「应用」→ 触发 D20 重启后他人线路进入 `Capturing`、横幅消失、顶栏出现两个 ASR 就绪日志；停止会话后横幅与指示器清空。
+- 双向对话验收（2026-11-15 真机，VRChat 内有真人语音）：
+  1. 只麦克风：VAD 指示随说话变化、我方字幕与 TTS/聊天框路径与改造前一致；
+  2. 只对方（`mic=false` + `tts=false`）：没有输入/输出设备、没有 TTS 连接，只有他人气泡；
+  3. 双向同时：左右气泡交替出现、当前句钉在开头、定稿后才沉入历史；
+  4. OSC-only（`tts=false` + OSC 开）：日志「未启用语音合成：跳过音色解析与 TTS」，无 TTS WebSocket，OSC 发送套接字存活（`Get-NetUDPEndpoint` 可见 kaols 的 127.0.0.1 UDP 端点）；
+  5. 只打字上屏（`mic=false` + `tts=false` + 翻译开）：打字出「原文小字 + 译文大字」气泡；
+  6. VRChat 未启动 / 运行中退出：横幅倒计时、重开后自动恢复，期间无 ASR 空转；
+  7. 运行中保存「自己」页（关合成）：按 D20 热重启，新会话跳过音色解析与 TTS；「他人」页语言列表保存走同一配置指纹机制；
+  8. 约 7 分钟连续浸泡（麦克风 + 他人线路 + 翻译同时跑）：除每次启动时的 cpal `Xrun` 告警外无其他 WARN/ERROR，两条线路稳定产出。
