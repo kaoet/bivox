@@ -32,7 +32,7 @@
 ## 2. 构建与运行
 
 ```bash
-cargo build --bins        # 构建三个 bin：kaols（GUI）、admin 与 vad_debug（调试 CLI）
+cargo build --bins        # 构建三个 bin：bivox（GUI）、admin 与 vad_debug（调试 CLI）
 cargo run                 # 启动 GUI（默认 wgpu 后端，debug 版保留控制台）
 cargo run --bin admin -- voice list   # 音色与热词列表调试 CLI，见第 9 节
 cargo run --release --bin vad_debug -- --seconds 15   # VAD 调参工具，见第 10 节
@@ -92,7 +92,7 @@ cargo test -- --nocapture
 ### 日志与崩溃
 
 - GUI 底部日志面板：内存保留最近 5000 行，面板渲染最近 500 行；
-- `logs\kaols-YYYY-MM-DD.log`：按天文件，保留 7 天；
+- `logs\bivox-YYYY-MM-DD.log`：按天文件，保留 7 天；
 - `crash.log`：panic 钩子写入（含 backtrace），界面也会显示崩溃横幅；
 - `[vad] debug = true`：每个音频块打印 Silero 概率、阈值与发送决策，用于排障（本地 VAD 不需要按麦克风/房间标定）。
 - VAD 起音迟钝、句首被切：用 `vad_debug` 对比"VAD 输入"与"实际发给 ASR"的两份 WAV，并可用同一段录音重放扫参，见第 10 节。
@@ -203,7 +203,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 - **新增/修改配置字段时必须同时提供 GUI 编辑入口**（D3）：不允许只存在于 `config.toml`、只能手改的字段；字段归哪个页签见 D22/D27/D32/D38。
 - 写回流程：读原文件 → 解析为 `AppConfig` → 类型化修改 → 校验磁盘原配置和新文本 → 备份 `config.toml.bak` → 写盘；无改动不写盘。
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
-- 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
+- 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
 - 不要提交 `config.toml`、`config.toml.bak`、`cache.json`、`logs/`、`crash.log`。
 
 ### 音色、缓存与热词
@@ -273,11 +273,11 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
    ```powershell
    .\scripts\package.ps1            # 构建 release 并打包
-   .\scripts\package.ps1 -NoBuild   # 用现有 target\release\kaols.exe 打包
+   .\scripts\package.ps1 -NoBuild   # 用现有 target\release\bivox.exe 打包
    ```
 
-4. 检查产物 `dist\kaols-<version>-win64.zip`：
-   - 只包含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
+4. 检查产物 `dist\bivox-<version>-win64.zip`：
+   - 只包含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
    - 不含 `config.toml`、`cache.json`、日志、`admin` 调试工具；
    - ONNX Runtime 已静态链接进 exe，**不要**再往 zip 里放 DLL；
 5. 冒烟检查（人工）：

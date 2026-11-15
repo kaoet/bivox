@@ -18,12 +18,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
-use kaols::asr::admin as asr_admin;
-use kaols::asr::admin::DeleteOutcome as VocabDeleteOutcome;
-use kaols::asr::api::RemoteVocabulary;
-use kaols::config::AppConfig;
-use kaols::voice::admin::{self, DeleteOutcome};
-use kaols::voice::api::{BailianVoiceApi, RemoteVoice};
+use bivox::asr::admin as asr_admin;
+use bivox::asr::admin::DeleteOutcome as VocabDeleteOutcome;
+use bivox::asr::api::RemoteVocabulary;
+use bivox::config::AppConfig;
+use bivox::voice::admin::{self, DeleteOutcome};
+use bivox::voice::api::{BailianVoiceApi, RemoteVoice};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -116,7 +116,7 @@ async fn run() -> Result<()> {
     let args = Args::parse();
     let config = AppConfig::load(&args.config)
         .with_context(|| format!("读取配置失败：{}", args.config.display()))?;
-    let api = kaols::voice::api_from_config(&config)?;
+    let api = bivox::voice::api_from_config(&config)?;
 
     println!(
         "{} {}",
@@ -136,7 +136,7 @@ async fn run() -> Result<()> {
             VoiceCommand::DeleteAll { yes } => delete_all(&api, yes).await,
         },
         Command::Vocab { command } => {
-            let asr_api = kaols::asr::api_from_config(&config)?;
+            let asr_api = bivox::asr::api_from_config(&config)?;
             match command {
                 VocabCommand::List => list_vocabularies(&asr_api).await,
                 VocabCommand::Delete {
@@ -239,7 +239,7 @@ async fn delete_all(api: &BailianVoiceApi, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn list_vocabularies(api: &kaols::asr::api::BailianAsrApi) -> Result<()> {
+async fn list_vocabularies(api: &bivox::asr::api::BailianAsrApi) -> Result<()> {
     let vocabularies = asr_admin::list_remote_vocabularies(api).await?;
     if vocabularies.is_empty() {
         println!("📭 账号下没有预编译热词列表。");
@@ -252,7 +252,7 @@ async fn list_vocabularies(api: &kaols::asr::api::BailianAsrApi) -> Result<()> {
 }
 
 async fn delete_vocabularies(
-    api: &kaols::asr::api::BailianAsrApi,
+    api: &bivox::asr::api::BailianAsrApi,
     vocabulary_ids: &[String],
     yes: bool,
 ) -> Result<()> {

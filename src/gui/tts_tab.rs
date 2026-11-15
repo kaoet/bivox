@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::config::{DEFAULT_SAMPLE_RATE, DEFAULT_TTS_MODEL};
 use crate::gui::{tts_current_voice, tts_voice_editor, widgets};
 use crate::language::CLONING_LANGUAGES;
@@ -27,7 +27,7 @@ use crate::voice::editor::{SampleDraft, VoiceDraft};
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     // Tab 级操作：保存 / 放弃更改 作用于「当前音色 + 自定义音色草稿」全部改动
     let mut save = false;
     let mut reset = false;

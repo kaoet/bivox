@@ -1,6 +1,6 @@
 # 架构与模块设计
 
-面向项目开发与贡献者，描述 kaols 当前实现的结构、数据流、关键算法与边界。
+面向项目开发与贡献者，描述 Bivox 当前实现的结构、数据流、关键算法与边界。
 
 - “为什么这样设计”见 [decisions.md](./decisions.md)；
 - 用户可见行为以 `README.md` 为准；
@@ -10,11 +10,11 @@
 
 ## 1. 系统概览
 
-kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时送云端 ASR，按标点/语义把识别文本切成小段，再流式送 TTS 合成并播放，做到“边说边出字幕、边合成”。
+Bivox 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时送云端 ASR，按标点/语义把识别文本切成小段，再流式送 TTS 合成并播放，做到“边说边出字幕、边合成”。
 
 - 纯 GUI（egui/eframe），便携模式：配置、缓存、日志都在 exe 同目录（D4）；
 - 内部全异步：tokio runtime 跑后台任务，eframe 占主线程（D5）；
-- 两个二进制：`kaols.exe`（GUI 主程序）与 `admin.exe`（百炼音色/热词调试 CLI，不随发布包分发，D19）；
+- 两个二进制：`bivox.exe`（GUI 主程序）与 `admin.exe`（百炼音色/热词调试 CLI，不随发布包分发，D19）；
 - 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口、声音复刻 HTTP 接口，以及 ASR 预编译热词管理 HTTP 接口（D31）；
 - 翻译模式（`[self] translate`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成，字幕以「译文 + 原文」双语呈现（M2，D26；独立 GUI 翻译页是 M3）；
 - VRChat OSC 聊天框（`[vrchat.osc]`，D33）：会话事件额外喂给独立后台任务，按固定 1 秒文本间隔、typing 跳变和约 30 秒自然过期更新本机 `127.0.0.1:9000` 的 ChatBox；
@@ -71,7 +71,7 @@ VRChat OSC 聊天框（D33）：
 src/
 ├── main.rs              GUI 入口：便携路径 → 单实例 → app::run
 ├── lib.rs               库入口：暴露模块；校验渲染后端 feature
-├── app.rs               KaolsApp：启动准备、状态、事件泵、配置写回编排、热重启、退出
+├── app.rs               BivoxApp：启动准备、状态、事件泵、配置写回编排、热重启、退出
 ├── events.rs            PipelineEvent / SessionState / Speaker（后台 → GUI 的事件契约）
 ├── paths.rs             AppPaths（便携路径）+ 空配置初始化
 ├── log_sink.rs          log 门面 → 内存环形缓冲 + 按天文件 + panic 钩子
@@ -138,13 +138,13 @@ src/
 │   ├── admin.rs         调试 CLI：参数解析 + 终端输出
 │   ├── vad_debug.rs     VAD 调参工具（麦克风/录音重放）
 │   └── loopback_debug.rs 进程环回采集调试：逐秒电平 + WAV（D36）
-└── build.rs             把 assets/kaols.ico 写入 exe 资源
+└── build.rs             把 assets/bivox.ico 写入 exe 资源
 ```
 
 | 模块 | 职责 | 依赖方向 |
 |---|---|---|
 | `app` | 应用状态与所有 GUI 操作的编排；唯一同时接触 UI 与后台任务的地方 | 依赖几乎全部下层模块 |
-| `gui` | 只负责绘制和把用户操作转成 `KaolsApp` 方法调用 | 依赖 `app` 状态 |
+| `gui` | 只负责绘制和把用户操作转成 `BivoxApp` 方法调用 | 依赖 `app` 状态 |
 | `pipeline::session` | 一次实时会话的编排：建连、设备、音色、翻译 worker、生命周期与收尾 | 依赖 audio/client/voice/asr + `asr_line` / `self_line` |
 | `pipeline::asr_line` | 「chunk → VAD → ASR」的共用接线，产出 `AsrEvent` 流 | 依赖 audio/client |
 | `pipeline::self_line` | 我方文本流转：语言判定、分块、翻译、TTS 边界、打字输入 | 依赖 client/chunker/translator/voice/language |
@@ -179,14 +179,14 @@ main()
        ├─ AppConfig::load(...)           # 解析/归一化/校验；失败弹窗退出，不创建主界面
        ├─ 创建多线程 tokio Runtime
        ├─ eframe::run_native(...)        # 1100×720，最小 900×600，wgpu/glow，图标
-       └─ KaolsApp::new(...)             # 接收已校验配置、同步界面状态、枚举设备
+       └─ BivoxApp::new(...)             # 接收已校验配置、同步界面状态、枚举设备
 ```
 
 日志初始化失败是非致命错误：记录到 `startup_error`，界面顶部显示黄色横幅。配置文件创建/读取/解析/校验失败是致命错误：弹原生错误窗后退出（D35）。
 
 ### 3.2 应用状态
 
-`KaolsApp`（`src/app.rs`）集中保存：
+`BivoxApp`（`src/app.rs`）集中保存：
 
 - 路径与运行时：`paths`、`runtime`、`egui_ctx`；
 - 会话：`state: SessionState`、`session: Option<PipelineSessionHandle>`、`events_rx`、`running_config_signature`、`restart_pending`；
@@ -198,7 +198,7 @@ main()
 - 展示：`timeline`、`log`、`vad_active`、错误/告警横幅（`startup_error` / `config_reload_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
 - 生命周期：`closing`。
 
-`[api] key = None` 不算配置无效：GUI 正常打开；点「开始」时跳转设置页并显示 `api_key_notice`。真正非法的配置在启动阶段就弹窗退出，不会进入 `KaolsApp`。
+`[api] key = None` 不算配置无效：GUI 正常打开；点「开始」时跳转设置页并显示 `api_key_notice`。真正非法的配置在启动阶段就弹窗退出，不会进入 `BivoxApp`。
 
 ### 3.3 主循环
 
@@ -256,12 +256,12 @@ main()
 
 ```text
 <exe 目录>/
-├── kaols.exe
+├── bivox.exe
 ├── config.toml          # 缺失时生成空文件（字段走内置默认值）
 ├── config.toml.bak      # 每次 GUI 写回前的完整备份
 ├── cache.json           # 本地共享缓存：音色 voice_id + ASR 预编译热词 vocabulary_id
 │                        # 路径可由配置修改
-├── logs/kaols-YYYY-MM-DD.log
+├── logs/bivox-YYYY-MM-DD.log
 └── crash.log            # panic 时生成
 ```
 
@@ -313,7 +313,7 @@ main()
 事件流：
 
 ```text
-后台任务 ──(PipelineEvent, unbounded)──▶ KaolsApp::pump_events
+后台任务 ──(PipelineEvent, unbounded)──▶ BivoxApp::pump_events
       └── ctx.request_repaint() ──▶ egui 下一帧
 
 pipeline::self_line ──(经 session::emit 克隆, unbounded)──▶ ChatboxService（D33）
@@ -533,7 +533,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
   },
   "asr_hotwords": {
     "qwen-audio-3.1-asr-flash-streaming": {
-      "vocabulary_id": "vocab-kaols-...",
+      "vocabulary_id": "vocab-bivox-...",
       "hotwords": ["原神"],
       "weight": 50,
       "updated_at": 1730000000
@@ -648,7 +648,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 2. 加载 `cache.json`，按 ASR 模型查 `asr_hotwords`；
 3. 命中缓存 → `query_vocabulary` 校验（资源不存在则重建；网络异常沿用缓存 ID）；
 4. 词表与权重都没变 → 复用；任一项变化且距 `updated_at` ≥5 分钟 → `update_vocabulary` 全量替换并更新缓存（词条全部按权重 50 发送）；
-5. 无缓存 → `create_vocabulary`（`target_model` = `[asr] model`，prefix 固定 `kaols`），
+5. 无缓存 → `create_vocabulary`（`target_model` = `[asr] model`，prefix 固定 `bivox`），
    **立即把 `vocabulary_id` 写入 `cache.json`**（同时记录词表与权重快照），再轮询 `query_vocabulary` 到 `status == "OK"`（最多 60s）；
 6. 结果交给 `pipeline::session`，注入 ASR run-task 的 `payload.parameters.vocabulary_id`。
 
@@ -686,7 +686,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ### 17.3 发送与限流
 
-- `ChatboxService` 是 `KaolsApp` 持有的常驻 tokio 任务；会话 `emit` 把 `PipelineEvent` 克隆一份发到其无界通道。
+- `ChatboxService` 是 `BivoxApp` 持有的常驻 tokio 任务；会话 `emit` 把 `PipelineEvent` 克隆一份发到其无界通道。
 - 文本：距上次成功文本发送 ≥ `CHATBOX_TEXT_INTERVAL`（1000ms）才发；1 秒内多次变化只发最新内容；相同文本只在同一段显示内去重，新当前句/打字输入会重置去重。
 - typing：`/chatbox/typing` 只在当前句开始/结束时发送；实测不占文本预算。
 - 正常句终不清空；VRChat 约 30 秒自然过期。停止/失败/关闭 OSC/关窗发空字符串显式清空。
@@ -749,7 +749,7 @@ Connecting ──成功──▶ Capturing
   1. 只麦克风：VAD 指示随说话变化、我方字幕与 TTS/聊天框路径与改造前一致；
   2. 只对方（`mic=false` + `tts=false`）：没有输入/输出设备、没有 TTS 连接，只有他人气泡；
   3. 双向同时：左右气泡交替出现、当前句钉在开头、定稿后才沉入历史；
-  4. OSC-only（`tts=false` + OSC 开）：日志「未启用语音合成：跳过音色解析与 TTS」，无 TTS WebSocket，OSC 发送套接字存活（`Get-NetUDPEndpoint` 可见 kaols 的 127.0.0.1 UDP 端点）；
+  4. OSC-only（`tts=false` + OSC 开）：日志「未启用语音合成：跳过音色解析与 TTS」，无 TTS WebSocket，OSC 发送套接字存活（`Get-NetUDPEndpoint` 可见 Bivox 的 127.0.0.1 UDP 端点）；
   5. 只打字上屏（`mic=false` + `tts=false` + 翻译开）：打字出「原文小字 + 译文大字」气泡；
   6. VRChat 未启动 / 运行中退出：横幅倒计时、重开后自动恢复，期间无 ASR 空转；
   7. 运行中保存「自己」页（关合成）：按 D20 热重启，新会话跳过音色解析与 TTS；「他人」页语言列表保存走同一配置指纹机制；

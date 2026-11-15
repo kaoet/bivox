@@ -2,13 +2,13 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::log_sink::LogLine;
 
 /// 界面每帧最多渲染的行数（避免大量 label 拖慢立即模式）。
 const VISIBLE_LINES: usize = 500;
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("日志").strong());
         ui.label(

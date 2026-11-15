@@ -59,23 +59,23 @@ mod tests {
 
     #[test]
     fn derived_paths_are_next_to_exe() {
-        let dir = PathBuf::from(r"C:\Apps\kaols");
+        let dir = PathBuf::from(r"C:\Apps\bivox");
         let paths = AppPaths::from_exe_dir(dir.clone());
 
         assert_eq!(paths.exe_dir, dir);
         assert_eq!(
             paths.config_file,
-            PathBuf::from(r"C:\Apps\kaols\config.toml")
+            PathBuf::from(r"C:\Apps\bivox\config.toml")
         );
-        assert_eq!(paths.log_dir, PathBuf::from(r"C:\Apps\kaols\logs"));
-        assert_eq!(paths.crash_log, PathBuf::from(r"C:\Apps\kaols\crash.log"));
+        assert_eq!(paths.log_dir, PathBuf::from(r"C:\Apps\bivox\logs"));
+        assert_eq!(paths.crash_log, PathBuf::from(r"C:\Apps\bivox\crash.log"));
     }
 
     /// 只缺配置时创建一个空文件，不能写入模板/注释。
     #[test]
     fn ensure_default_config_writes_empty_file() {
         let dir = std::env::temp_dir().join(format!(
-            "kaols-paths-{}-{}",
+            "bivox-paths-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

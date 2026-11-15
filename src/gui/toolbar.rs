@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::events::SessionState;
 
 /// 状态灯颜色。
@@ -19,7 +19,7 @@ fn state_color(state: SessionState) -> egui::Color32 {
 
 /// 本地 VAD 指示器（放在开始/停止按钮左侧）：
 /// 绿点 = 当前检测到语音；灰点 = 静音 / 管线未运行 / VAD 已被配置关闭。
-fn vad_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
+fn vad_indicator(app: &BivoxApp, ui: &mut egui::Ui) {
     let vad_enabled = app.config.vad.enabled;
     let (color, state_text, hint) = if !vad_enabled {
         (
@@ -52,7 +52,7 @@ fn vad_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
 }
 
 /// 他人线路的 VAD 指示：只在「他人」页启用侦听时显示（未启用时不占位）。
-fn others_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
+fn others_indicator(app: &BivoxApp, ui: &mut egui::Ui) {
     if !app.config.others.enabled {
         return;
     }
@@ -86,10 +86,10 @@ fn others_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
     response.on_hover_text(hint);
 }
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.heading("kaols");
+        ui.heading("Bivox");
         ui.label(egui::RichText::new("超低延迟实时识别与合成").weak());
         ui.separator();
 

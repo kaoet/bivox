@@ -344,7 +344,7 @@ mod tests {
 
     fn temp_cache_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "kaols-hotwords-{tag}-{}-{}.json",
+            "bivox-hotwords-{tag}-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

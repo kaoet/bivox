@@ -20,7 +20,7 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::events::SessionState;
 
 /// 底部输入行的面板 id。
@@ -60,7 +60,7 @@ fn measured_input_height(ui: &egui::Ui, text: &str, outer_width: f32) -> f32 {
     (galley.size().y + 2.0 * margin + HEIGHT_SLACK).clamp(min_height, max_height)
 }
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let can_speak = app.session.is_some() && matches!(app.state, SessionState::Running);
 
     egui::Panel::bottom(PANEL_ID).show(ui, |ui| {

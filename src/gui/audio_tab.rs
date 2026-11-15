@@ -7,21 +7,21 @@
 
 use eframe::egui;
 
-use crate::app::{KaolsApp, Tab};
+use crate::app::{BivoxApp, Tab};
 use crate::gui::widgets;
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 /// 从配置里取出当前设备设置（`None` = 系统默认）。
-fn current_devices(app: &KaolsApp) -> (Option<String>, Option<String>) {
+fn current_devices(app: &BivoxApp) -> (Option<String>, Option<String>) {
     (
         app.config.audio.input_device.clone(),
         app.config.audio.output_device.clone(),
     )
 }
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.heading("音频");
     ui.label(
         egui::RichText::new(
@@ -87,7 +87,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
 }
 
 /// 本地 Silero VAD 发送门控参数。
-fn show_vad_settings(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_vad_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.separator();
     ui.label(egui::RichText::new("本地 VAD").strong());
     ui.checkbox(&mut app.vad_enabled, "启用本地 VAD（关闭后音频全量上传）");

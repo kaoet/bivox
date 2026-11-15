@@ -1,8 +1,8 @@
 [package]
-name = "kaols"
+name = "bivox"
 version = "0.1.0"
 edition = "2024"
-default-run = "kaols"
+default-run = "bivox"
 
 [features]
 # 渲染后端二选一：默认 wgpu（DX12，远程桌面也能用）。
@@ -73,7 +73,7 @@ windows = { version = "0.62", features = [
 windows-core = "0.62"
 
 [build-dependencies]
-# 把 assets/kaols.ico 写进 exe 资源（资源管理器/任务栏里的文件图标）
+# 把 assets/bivox.ico 写进 exe 资源（资源管理器/任务栏里的文件图标）
 winres = "0.1"
 
 [profile.release]

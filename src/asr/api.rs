@@ -29,7 +29,7 @@ use crate::http::{parse_response, payload};
 pub const SPEECH_BIASING_MODEL: &str = "speech-biasing";
 
 /// 创建的预编译热词列表前缀（官方规则：小写字母/数字，≤10 字符）。
-pub const VOCABULARY_PREFIX: &str = "kaols";
+pub const VOCABULARY_PREFIX: &str = "bivox";
 
 /// 热词权重：百炼「超级热词」权重 50（普通热词范围 1–5、常用 4）。
 ///
@@ -88,7 +88,7 @@ impl BailianAsrApi {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(120))
-            .user_agent(concat!("kaols/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("bivox/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("创建百炼 HTTP 客户端失败")?;
         Ok(Self {
@@ -345,7 +345,7 @@ mod tests {
     async fn create_vocabulary_posts_speech_biasing_body() {
         let server = MockHttpServer::start(|_request| {
             MockResponse::json(
-                r#"{"output":{"vocabulary_id":"vocab-kaols-1"},"usage":{"count":1}}"#,
+                r#"{"output":{"vocabulary_id":"vocab-bivox-1"},"usage":{"count":1}}"#,
             )
         })
         .await;
@@ -358,7 +358,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(id, "vocab-kaols-1");
+        assert_eq!(id, "vocab-bivox-1");
 
         let requests = server.requests();
         assert_eq!(requests[0].path, "/api/v1/services/audio/asr/customization");
@@ -370,7 +370,7 @@ mod tests {
             body["input"]["target_model"],
             "qwen-audio-3.1-asr-flash-streaming"
         );
-        assert_eq!(body["input"]["prefix"], "kaols");
+        assert_eq!(body["input"]["prefix"], "bivox");
         assert_eq!(body["input"]["vocabulary"][0]["text"], "原神");
         assert_eq!(
             body["input"]["vocabulary"][0]["weight"], HOTWORD_WEIGHT,

@@ -1,14 +1,14 @@
 //! 语音合成页顶部「当前音色」选择：现有音色（输入框）/ 自定义音色（下拉）。
 //!
-//! 只读写 [`KaolsApp`] 里的草稿字段（`voice_mode` / `voice_input` / `voice_custom_key`），
+//! 只读写 [`BivoxApp`] 里的草稿字段（`voice_mode` / `voice_input` / `voice_custom_key`），
 //! 保存与放弃由 [`super::tts_tab`] 统一处理（决策 D22，见 docs/decisions.md）。
 
 use eframe::egui;
 
-use crate::app::{KaolsApp, VoiceMode};
+use crate::app::{BivoxApp, VoiceMode};
 
 /// 顶部「当前音色」：Radio 二选一（未选中的控件禁用）。
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let mut mode = app.voice_mode;
     let mut existing = app.voice_input.clone();
     let mut custom_key = app.voice_custom_key.clone();

@@ -24,7 +24,7 @@ use crate::timeline::Timeline;
 pub const CHATBOX_TEXT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 测试消息立即发送，不参与文本节流。
-const TEST_MESSAGE: &str = "kaols OSC 测试：你好，VRChat！";
+const TEST_MESSAGE: &str = "Bivox OSC 测试：你好，VRChat！";
 
 /// 当前 OSC 配置（由 GUI 写回后通过 watch 实时同步）。
 #[derive(Debug, Clone, PartialEq, Eq)]

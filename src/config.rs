@@ -1369,7 +1369,7 @@ voice = "voice-test"
 dialect = "四川话"
 
 [cache]
-file = "cache/kaols.json"
+file = "cache/bivox.json"
 
 [translate]
 granularity = "sentence"
@@ -1550,7 +1550,7 @@ language = "ja"
 audio = "b.wav"
 
 [cache]
-file = "cache/kaols.json"
+file = "cache/bivox.json"
 
 [audio]
 input_device = "Microphone"
@@ -1611,7 +1611,7 @@ display = "translation"
         assert_eq!(round.tts.custom_voices["foo"].samples.len(), 2);
         assert!((round.tts.custom_voices["foo"].samples[0].rate - 1.3).abs() < 1e-6);
         assert_eq!(round.tts.custom_voices["foo"].samples[1].rate, 1.0);
-        assert_eq!(round.cache.file, PathBuf::from("cache/kaols.json"));
+        assert_eq!(round.cache.file, PathBuf::from("cache/bivox.json"));
         assert_eq!(round.audio.input_device.as_deref(), Some("Microphone"));
         assert!(!round.vad.enabled);
         assert_eq!(round.vad.threshold, 0.42);

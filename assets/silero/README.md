@@ -1,7 +1,7 @@
 # Silero VAD 模型（随仓库分发）
 
 `silero_vad_16k_op15.onnx` 是 Silero VAD 官方提供的 **16kHz 单采样率 ONNX 导出**（opset 15），
-供 kaols 的本地语音活动检测（VAD）使用；P1 起通过 `include_bytes!` 嵌入 exe，不随发布包单独分发。
+供 Bivox 的本地语音活动检测（VAD）使用；P1 起通过 `include_bytes!` 嵌入 exe，不随发布包单独分发。
 
 ## 来源与版本
 

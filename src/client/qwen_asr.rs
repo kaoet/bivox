@@ -562,7 +562,7 @@ mod tests {
             "qwen-audio-3.1-asr-flash-streaming".to_string(),
             format!("ws://{addr}/api-ws/v1/inference"),
             vec!["zh".to_string()],
-            Some("vocab-kaols-1".to_string()),
+            Some("vocab-bivox-1".to_string()),
             None,
             rx_audio,
             tx_events,
@@ -574,7 +574,7 @@ mod tests {
             .expect("应收到 run-task")
             .expect("run-task 解析失败");
         assert_eq!(
-            value["payload"]["parameters"]["vocabulary_id"], "vocab-kaols-1",
+            value["payload"]["parameters"]["vocabulary_id"], "vocab-bivox-1",
             "vocabulary_id 必须放在 payload.parameters 里（D31）"
         );
         assert_eq!(

@@ -1,4 +1,4 @@
-//! kaols：基于百炼 Qwen-Audio 的超低延迟实时语音识别与语音合成。
+//! Bivox：基于百炼 Qwen-Audio 的超低延迟实时语音识别与语音合成。
 //!
 //! - 二进制入口：`src/main.rs`（GUI，见 docs/architecture.md）
 //! - 独立调试工具：`src/bin/admin.rs`（百炼音色/热词管理）、

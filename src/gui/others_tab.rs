@@ -1,19 +1,19 @@
 //! 「他人」页：他人线路的开关、语言列表与翻译（D38）。
 //!
 //! 音源（从哪个进程采集）不在这里：那是「VRChat」页的 `[vrchat] process`。
-//! 只改草稿，点右上角「保存」由 `KaolsApp::save_others_tab` 一次写回 `[others]`；
+//! 只改草稿，点右上角「保存」由 `BivoxApp::save_others_tab` 一次写回 `[others]`；
 //! 所有字段都进配置指纹，运行中保存按 D20 热重启。
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::gui::language_list;
 use crate::language::TRANSLATION_LANGUAGES;
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_salt("others_tab_scroll")
@@ -24,7 +24,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
         });
 }
 
-fn show_content(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let mut save = false;
     let mut reset = false;
     ui.horizontal(|ui| {

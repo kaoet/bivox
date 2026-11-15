@@ -1,4 +1,4 @@
-# kaols — 超低延迟实时语音识别 / 语音合成（Windows GUI）
+# Bivox — 超低延迟实时语音识别 / 语音合成（Windows GUI）
 
 基于阿里云百炼 **Qwen-Audio** 的实时语音识别（ASR）与语音合成（TTS）桌面客户端，面向实时对话、VRChat 等低延迟场景。
 
@@ -15,8 +15,8 @@
 
 ## 快速开始
 
-1. 解压发布包（`kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`）到一个**可写目录**（例如 `D:\Apps\kaols`）；
-2. 双击 `kaols.exe`：首次启动会在 exe 同目录生成空 `config.toml`，正常进入主界面；未配置 API Key 时点「开始」会跳转到「设置」页；
+1. 解压发布包（`bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`）到一个**可写目录**（例如 `D:\Apps\bivox`）；
+2. 双击 `bivox.exe`：首次启动会在 exe 同目录生成空 `config.toml`，正常进入主界面；未配置 API Key 时点「开始」会跳转到「设置」页；
 3. 在「设置」页填入百炼 API Key（[控制台](https://bailian.console.aliyun.com/)），点页面右上角「保存」；
 4. 回到「实时」页点「开始」，对着麦克风说话即可看到字幕并听到合成语音。
 
@@ -26,11 +26,11 @@
 ### 便携目录
 
 ```text
-kaols.exe
+bivox.exe
 config.toml            # 首次启动生成；含 API Key，注意保密
 config.toml.bak        # 每次在 GUI 中写回配置前的备份
 cache.json             # 音色复刻 + ASR 预编译热词缓存（模型/音频指纹 → voice_id；ASR 模型 → vocabulary_id）
-logs\kaols-YYYY-MM-DD.log  # 按天日志，保留最近 7 天
+logs\bivox-YYYY-MM-DD.log  # 按天日志，保留最近 7 天
 crash.log              # 崩溃信息（如有）
 ```
 
@@ -228,8 +228,8 @@ zh en fr de ja ko ru pt th id vi es it ms fil ar
 - **自定义音色失败**：检查样例音频路径、时长/大小/格式，以及账号下音色是否仍存在；日志里会标出是哪一步失败。
 - **方言没生效**：确认本句判定为中文、且所选音色支持方言指令（复刻音色支持全部 20 种；系统音色仅上述 4 个多语种/方言音色支持 8 种）；运行中改方言需点「保存」触发自动重启。
 - **热词没生效 / 顶部显示黄色「运行告警」**：预编译热词仅**主业务空间**支持，确认没有使用子业务空间，并检查网络与 API Key；百炼建议两次热词更新间隔 ≥5 分钟，太频繁时本次沿用旧词表、下次开始会话自动重试；改完热词要**重新开始会话**才会上传；底部日志里能看到具体的同步错误。
-- **VRChat 聊天框不显示**：确认 VRChat 中 OSC 已开启、`Show Own ChatBox` 已开、kaols 的发送端口与 VRChat 接收端口一致；可用「发送测试消息」快速确认链路；VRChat 未运行时不会报错（UDP 无连接）。
-- **VRChat 聊天框偶尔跳字**：VRChat 侧对 ChatBox 有约 1 条/秒的更新上限，kaols 已按 1 秒节流；如果仍出现，检查是否有其它 OSC 程序同时占用/写聊天框。
+- **VRChat 聊天框不显示**：确认 VRChat 中 OSC 已开启、`Show Own ChatBox` 已开、Bivox 的发送端口与 VRChat 接收端口一致；可用「发送测试消息」快速确认链路；VRChat 未运行时不会报错（UDP 无连接）。
+- **VRChat 聊天框偶尔跳字**：VRChat 侧对 ChatBox 有约 1 条/秒的更新上限，Bivox 已按 1 秒节流；如果仍出现，检查是否有其它 OSC 程序同时占用/写聊天框。
 - **启动中停留几十秒**：首次创建预编译热词列表需要等百炼部署就绪，通常会自行进入就绪状态；就绪前本次识别暂不带热词，下次开始会话会继续等待。
 - **日志与崩溃**：底部日志面板与 `logs\` 目录；崩溃信息见 `crash.log` 和界面顶部红色错误条。
 - **双击没反应**：可能已有实例在运行（会尝试激活已有窗口）；也检查程序是否被安全软件拦截。
@@ -238,14 +238,14 @@ zh en fr de ja ko ru pt th id vi es it ms fil ar
 
 - `config.toml` 里是**明文 API Key**；不要把整个程序目录发给别人，发布 zip 里不含它；
 - 备份/分享目录等于分享 Key 与缓存（音色复刻、ASR 预编译热词），请自行评估风险；
-- 所有可写文件都在 exe 同目录，不需要管理员权限；建议放在可写目录（如 `D:\Apps\kaols`）。
+- 所有可写文件都在 exe 同目录，不需要管理员权限；建议放在可写目录（如 `D:\Apps\bivox`）。
 
 ---
 
 ## 第三方组件与许可
 
 - **Silero VAD**（<https://github.com/snakers4/silero-vad>，MIT）：内嵌的 `silero_vad_16k_op15.onnx` 语音活动检测模型；
-- **ONNX Runtime**（<https://github.com/microsoft/onnxruntime>，MIT）：Silero 的 CPU 推理运行时，已静态链接进 `kaols.exe`，无需额外安装或 DLL；
+- **ONNX Runtime**（<https://github.com/microsoft/onnxruntime>，MIT）：Silero 的 CPU 推理运行时，已静态链接进 `bivox.exe`，无需额外安装或 DLL；
 - 发布包附带 `THIRD_PARTY_NOTICES.md`，包含上述 MIT 许可全文；其余 Rust 依赖的许可信息见仓库 `Cargo.lock` 与各 crate 仓库。
 
 ---

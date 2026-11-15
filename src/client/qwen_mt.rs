@@ -71,7 +71,7 @@ impl QwenMtClient {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("kaols/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("bivox/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("创建翻译 HTTP 客户端失败")?;
         Ok(Self {

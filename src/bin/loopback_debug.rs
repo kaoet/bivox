@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bivox::audio::process_capture::{ProcessCapture, find_pid, process_alive};
 use clap::Parser;
-use kaols::audio::process_capture::{ProcessCapture, find_pid, process_alive};
 
 /// 每秒应有的音频块数（每块 100ms）。
 const CHUNKS_PER_SECOND: u32 = 10;
@@ -210,7 +210,7 @@ impl WavSink {
     fn create(path: &Path) -> Result<Self> {
         let spec = hound::WavSpec {
             channels: 1,
-            sample_rate: kaols::audio::process_loopback::SAMPLE_RATE,
+            sample_rate: bivox::audio::process_loopback::SAMPLE_RATE,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };

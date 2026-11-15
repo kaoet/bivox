@@ -25,7 +25,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 $profileName = if ($Release) { "release" } else { "debug" }
-$cargoArgs = @("build", "--bin", "kaols")
+$cargoArgs = @("build", "--bin", "bivox")
 if ($Glow) { $cargoArgs += @("--no-default-features", "--features", "renderer-glow") }
 if ($Release) { $cargoArgs += "--release" }
 
@@ -57,5 +57,5 @@ if (Test-Path $configSource) {
 
 if ($NoRun) { exit 0 }
 
-& (Join-Path $targetDir "kaols.exe")
+& (Join-Path $targetDir "bivox.exe")
 exit $LASTEXITCODE

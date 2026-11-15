@@ -28,10 +28,10 @@ use clap::Parser;
 use colored::Colorize;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 
-use kaols::audio::capture::AudioCapture;
-use kaols::audio::device::{AudioDeviceManager, device_name};
-use kaols::audio::silero::SileroDetector;
-use kaols::audio::vad::{FrameDetector, GateConfig, SpeechGate};
+use bivox::audio::capture::AudioCapture;
+use bivox::audio::device::{AudioDeviceManager, device_name};
+use bivox::audio::silero::SileroDetector;
+use bivox::audio::vad::{FrameDetector, GateConfig, SpeechGate};
 
 /// 采集与输出统一为 16kHz 单声道 PCM16（与服务端一致）。
 const SAMPLE_RATE: u32 = 16_000;
@@ -886,7 +886,7 @@ mod tests {
 
     fn test_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("kaols-vad-debug-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("bivox-vad-debug-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("创建临时目录失败");
         dir
     }

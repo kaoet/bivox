@@ -7,7 +7,7 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::events::Speaker;
 use crate::timeline::Message;
 
@@ -37,14 +37,14 @@ const UNSENT_COLOR_SCALE: f32 = 0.45;
 /// 原文行的弱化系数。
 const SOURCE_DIM_SCALE: f32 = 0.72;
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     // 底部输入行先占位（嵌套 Panel 从当前 Ui 底部切走输入行高度），剩余空间给气泡列表。
     super::typed_input::show(app, ui);
     show_timeline(app, ui);
 }
 
 /// 气泡列表：从底部输入行上方剩余的空间向下填满。
-fn show_timeline(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_timeline(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let show_source = app.translate_show_source();
 
     egui::ScrollArea::vertical()

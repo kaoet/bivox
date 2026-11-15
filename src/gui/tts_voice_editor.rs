@@ -2,7 +2,7 @@
 //!
 //! 这些函数只操作传入的 `VoiceDraft` 与 egui 状态；草稿的保存/放弃由
 //! [`super::tts_tab`] 统一处理（决策 D22，见 docs/decisions.md）。需要改列表的操作
-//! （删除样本、拖动排序）通过参数或返回值交给调用方应用，避免同时借用 `KaolsApp`。
+//! （删除样本、拖动排序）通过参数或返回值交给调用方应用，避免同时借用 `BivoxApp`。
 
 use std::path::{Path, PathBuf};
 

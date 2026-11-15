@@ -1,7 +1,7 @@
 //! 日志与崩溃信息收集（决策 D7/D8，见 docs/decisions.md）。
 //!
 //! 只做两件事：
-//! 1. 把日志同时写进内存队列（界面每帧取走显示）和按天文件（`logs\kaols-YYYY-MM-DD.log`）；
+//! 1. 把日志同时写进内存队列（界面每帧取走显示）和按天文件（`logs\bivox-YYYY-MM-DD.log`）；
 //! 2. 提供 panic 钩子，把崩溃信息写到 `crash.log` 并交给界面显示。
 //!
 //! 这里不持有 `egui::Context`：接入后台任务后，由发日志的一方决定是否调用
@@ -21,7 +21,7 @@ pub const MAX_LOG_LINES: usize = 5000;
 /// 按天日志文件保留天数（含当天）。
 pub const LOG_RETENTION_DAYS: i64 = 7;
 
-/// 删除超过保留期的按天日志文件（`kaols-YYYY-MM-DD.log`），返回删除数量。
+/// 删除超过保留期的按天日志文件（`bivox-YYYY-MM-DD.log`），返回删除数量。
 ///
 /// 只处理本程序命名的文件；其它文件（用户放的说明、`.bak` 等）一律不动。
 pub fn cleanup_old_logs(log_dir: &Path, today: chrono::NaiveDate) -> usize {
@@ -36,7 +36,7 @@ pub fn cleanup_old_logs(log_dir: &Path, today: chrono::NaiveDate) -> usize {
             continue;
         };
         let Some(date_part) = name
-            .strip_prefix("kaols-")
+            .strip_prefix("bivox-")
             .and_then(|rest| rest.strip_suffix(".log"))
         else {
             continue;
@@ -104,7 +104,7 @@ pub fn init(log_dir: &Path) -> std::io::Result<()> {
 /// 当天日志文件路径。
 pub fn today_log_path(log_dir: &Path) -> PathBuf {
     let today = Local::now().format("%Y-%m-%d").to_string();
-    log_dir.join(format!("kaols-{today}.log"))
+    log_dir.join(format!("bivox-{today}.log"))
 }
 
 /// 取走累计的待展示日志（界面每帧调用一次）。
@@ -268,34 +268,34 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_only_expired_kaols_logs() {
+    fn cleanup_removes_only_expired_bivox_logs() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("kaols-log-cleanup-{nanos}"));
+        let dir = std::env::temp_dir().join(format!("bivox-log-cleanup-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
 
         // 保留窗口：today 和之前 6 天（cutoff = today - 6）
         let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
         for name in [
-            "kaols-2026-10-20.log", // 过期
-            "kaols-2026-10-27.log", // 过期（cutoff=2026-10-28）
-            "kaols-2026-10-28.log", // 保留（边界）
-            "kaols-2026-11-03.log", // 今天
+            "bivox-2026-10-20.log", // 过期
+            "bivox-2026-10-27.log", // 过期（cutoff=2026-10-28）
+            "bivox-2026-10-28.log", // 保留（边界）
+            "bivox-2026-11-03.log", // 今天
             "notes.txt",            // 非日志文件
-            "kaols-bad-date.log",   // 格式不合法
+            "bivox-bad-date.log",   // 格式不合法
         ] {
             fs::write(dir.join(name), b"x").unwrap();
         }
 
         assert_eq!(cleanup_old_logs(&dir, today), 2);
-        assert!(!dir.join("kaols-2026-10-20.log").exists());
-        assert!(!dir.join("kaols-2026-10-27.log").exists());
-        assert!(dir.join("kaols-2026-10-28.log").exists());
-        assert!(dir.join("kaols-2026-11-03.log").exists());
+        assert!(!dir.join("bivox-2026-10-20.log").exists());
+        assert!(!dir.join("bivox-2026-10-27.log").exists());
+        assert!(dir.join("bivox-2026-10-28.log").exists());
+        assert!(dir.join("bivox-2026-11-03.log").exists());
         assert!(dir.join("notes.txt").exists());
-        assert!(dir.join("kaols-bad-date.log").exists());
+        assert!(dir.join("bivox-bad-date.log").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

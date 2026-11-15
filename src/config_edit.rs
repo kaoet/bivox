@@ -59,7 +59,7 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "kaols-config-edit-{tag}-{}-{}.toml",
+            "bivox-config-edit-{tag}-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -94,7 +94,7 @@ impl BailianVoiceApi {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(120))
-            .user_agent(concat!("kaols/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("bivox/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("创建百炼 HTTP 客户端失败")?;
         Ok(Self {

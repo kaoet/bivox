@@ -1,12 +1,12 @@
 # 发布打包脚本
 #
-# 产物：dist\kaols-<version>-win64.zip
-#   只包含 kaols.exe + README.md + THIRD_PARTY_NOTICES.md
+# 产物：dist\bivox-<version>-win64.zip
+#   只包含 bivox.exe + README.md + THIRD_PARTY_NOTICES.md
 #   （不含 config.toml / 调试工具 / 缓存 / 日志；ONNX Runtime 已静态链接进 exe）
 #
 # 用法：
 #   .\scripts\package.ps1             # 构建 release 并打包
-#   .\scripts\package.ps1 -NoBuild    # 跳过 cargo build（用现有 target\release\kaols.exe 打包）
+#   .\scripts\package.ps1 -NoBuild    # 跳过 cargo build（用现有 target\release\bivox.exe 打包）
 
 param([switch]$NoBuild)
 
@@ -19,18 +19,18 @@ if (-not $versionLine) { throw "Cargo.toml 里找不到 package version" }
 $version = $versionLine.Matches[0].Groups[1].Value
 
 if (-not $NoBuild) {
-    & cargo build --release --bin kaols
+    & cargo build --release --bin bivox
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-$exe = Join-Path $root "target\release\kaols.exe"
+$exe = Join-Path $root "target\release\bivox.exe"
 if (-not (Test-Path $exe)) {
-    throw "找不到 $exe；先执行 cargo build --release --bin kaols 或去掉 -NoBuild"
+    throw "找不到 $exe；先执行 cargo build --release --bin bivox 或去掉 -NoBuild"
 }
 
 $dist = Join-Path $root "dist"
-$stage = Join-Path $dist "kaols-$version-win64"
-$zip = Join-Path $dist "kaols-$version-win64.zip"
+$stage = Join-Path $dist "bivox-$version-win64"
+$zip = Join-Path $dist "bivox-$version-win64.zip"
 
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
@@ -46,6 +46,6 @@ $sizeMb = [math]::Round((Get-Item $zip).Length / 1MB, 2)
 $exeMb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
 Write-Host "打包完成：$zip"
 Write-Host "  版本：$version"
-Write-Host "  kaols.exe：$exeMb MB"
+Write-Host "  bivox.exe：$exeMb MB"
 Write-Host "  zip：$sizeMb MB"
-Write-Host "  内容：kaols.exe + README.md + THIRD_PARTY_NOTICES.md（无 config.toml、无密钥、无 DLL）"
+Write-Host "  内容：bivox.exe + README.md + THIRD_PARTY_NOTICES.md（无 config.toml、无密钥、无 DLL）"

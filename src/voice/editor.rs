@@ -269,8 +269,8 @@ audio = "C:/voices/b-ja.wav"
 
     #[test]
     fn audio_path_is_relative_inside_exe_dir() {
-        let exe_dir = std::path::Path::new("C:/kaols");
-        let inside = std::path::Path::new("C:/kaols/voices/a.wav");
+        let exe_dir = std::path::Path::new("C:/bivox");
+        let inside = std::path::Path::new("C:/bivox/voices/a.wav");
         let outside = std::path::Path::new("C:/elsewhere/b.wav");
         assert_eq!(config_audio_path(exe_dir, inside), "voices/a.wav");
         assert_eq!(config_audio_path(exe_dir, outside), "C:/elsewhere/b.wav");

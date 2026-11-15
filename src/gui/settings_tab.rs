@@ -6,12 +6,12 @@
 
 use eframe::egui;
 
-use crate::app::{KaolsApp, Tab};
+use crate::app::{BivoxApp, Tab};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_salt("settings_scroll")
@@ -74,7 +74,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
 }
 
 /// 百炼：API Key 与接入域名。
-fn show_bailian_section(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_bailian_section(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("百炼").strong());
     if app.config.api.key.is_none() {
         ui.label(egui::RichText::new("当前未配置 API Key").weak());
@@ -113,7 +113,7 @@ fn show_bailian_section(app: &mut KaolsApp, ui: &mut egui::Ui) {
 }
 
 /// 高级设置：缓存文件与分块词数。
-fn show_advanced_settings(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_advanced_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.label(egui::RichText::new("高级设置").strong());
 

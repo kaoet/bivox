@@ -53,7 +53,7 @@ pub fn acquire(exe_path: &Path) -> std::io::Result<Option<SingleInstance>> {
     Ok(Some(SingleInstance { handle }))
 }
 
-/// 命名 Mutex 名：`Local\kaols-<hash>`。
+/// 命名 Mutex 名：`Local\bivox-<hash>`。
 ///
 /// 用 `Local\`（当前登录会话内唯一）即可：不同用户会话互不影响，且不需要管理员权限。
 fn mutex_name(exe_path: &Path) -> String {
@@ -64,7 +64,7 @@ fn mutex_name(exe_path: &Path) -> String {
         .to_lowercase();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     normalized.hash(&mut hasher);
-    format!("Local\\kaols-{:016x}", hasher.finish())
+    format!("Local\\bivox-{:016x}", hasher.finish())
 }
 
 /// 找到标题匹配的已有窗口，恢复并置前台。窗口可能还在创建中，短暂重试。
@@ -95,11 +95,11 @@ mod tests {
 
     #[test]
     fn mutex_name_is_stable_and_path_specific() {
-        let a = PathBuf::from(r"C:\Apps\kaols\kaols.exe");
-        let b = PathBuf::from(r"D:\Portable\kaols\kaols.exe");
+        let a = PathBuf::from(r"C:\Apps\bivox\bivox.exe");
+        let b = PathBuf::from(r"D:\Portable\bivox\bivox.exe");
 
         assert_eq!(mutex_name(&a), mutex_name(&a));
         assert_ne!(mutex_name(&a), mutex_name(&b));
-        assert!(mutex_name(&a).starts_with("Local\\kaols-"));
+        assert!(mutex_name(&a).starts_with("Local\\bivox-"));
     }
 }

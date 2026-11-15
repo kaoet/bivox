@@ -7,7 +7,7 @@
 
 use eframe::egui;
 
-use crate::app::{KaolsApp, Tab};
+use crate::app::{BivoxApp, Tab};
 use crate::config::{DEFAULT_TRANSLATE_MODEL, TranslateGranularity};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
@@ -19,14 +19,14 @@ struct Current {
     show_source: bool,
 }
 
-fn current(app: &KaolsApp) -> Current {
+fn current(app: &BivoxApp) -> Current {
     Current {
         granularity: app.config.translate.granularity,
         show_source: app.config.translate.show_source,
     }
 }
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.heading("翻译");
     ui.label(
         egui::RichText::new(

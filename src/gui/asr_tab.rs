@@ -1,7 +1,7 @@
 //! 语音识别页：两条线路**共用**的识别模型与预编译热词（D22/D31/D32/D38）。
 //!
 //! 本页编辑 `[asr] model` 与 `[asr] hotwords`；语言列表属于各条线路，在「自己」/「他人」页。
-//! 改动只写本页草稿，点右上角「保存」后由 `KaolsApp::save_asr_tab` 合并成一次
+//! 改动只写本页草稿，点右上角「保存」后由 `BivoxApp::save_asr_tab` 合并成一次
 //! 类型化写回（一次校验 + 一份 `.bak`）；「放弃更改」恢复配置文件里的值。
 //! 运行中保存会按 D20 重启实时管线、丢失当前句；热词列表在下一次会话启动时
 //! 自动创建/更新为百炼预编译热词列表（D31）。
@@ -11,20 +11,20 @@
 
 use eframe::egui;
 
-use crate::app::KaolsApp;
+use crate::app::BivoxApp;
 use crate::config::{DEFAULT_ASR_MODEL, MAX_ASR_HOTWORDS, normalize_hotwords};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
-pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
+pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_salt("asr_tab_scroll")
         .show(ui, |ui| show_content(app, ui));
 }
 
-fn show_content(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     // Tab 级操作：保存 / 放弃更改 作用于「模型 + 热词」
     let mut save = false;
     let mut reset = false;
@@ -71,7 +71,7 @@ fn show_content(app: &mut KaolsApp, ui: &mut egui::Ui) {
 }
 
 /// 「识别模型」：单行输入框 + 恢复默认。
-fn show_model(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_model(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("识别模型");
         ui.add(egui::TextEdit::singleline(&mut app.asr_model).desired_width(380.0));
@@ -88,7 +88,7 @@ fn show_model(app: &mut KaolsApp, ui: &mut egui::Ui) {
 }
 
 /// 「预编译热词」：多行文本（一行一个）；标题右侧显示归一化后的条数 / 上限。
-fn show_hotwords(app: &mut KaolsApp, ui: &mut egui::Ui) {
+fn show_hotwords(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let lines: Vec<String> = app.asr_hotwords.lines().map(str::to_string).collect();
     let count = normalize_hotwords(&lines).len();
     let over_limit = count > MAX_ASR_HOTWORDS;

@@ -25,7 +25,7 @@ use crate::timeline::Timeline;
 use crate::voice::editor::{self, VoiceDraft};
 
 /// 窗口标题。
-pub const WINDOW_TITLE: &str = "kaols — 实时语音识别与合成";
+pub const WINDOW_TITLE: &str = "Bivox — 实时语音识别与合成";
 
 /// 语音合成页顶部「当前音色」的选择方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,7 @@ fn retry_seconds(deadline: Instant, now: Instant) -> u64 {
 }
 
 /// 应用状态。
-pub struct KaolsApp {
+pub struct BivoxApp {
     pub paths: AppPaths,
     /// 后台运行时：用它 spawn `PipelineSession`。
     pub runtime: tokio::runtime::Runtime,
@@ -208,7 +208,7 @@ pub struct KaolsApp {
     pub closing: bool,
 }
 
-impl KaolsApp {
+impl BivoxApp {
     fn new(
         paths: AppPaths,
         runtime: tokio::runtime::Runtime,
@@ -1374,7 +1374,7 @@ impl KaolsApp {
     }
 }
 
-impl eframe::App for KaolsApp {
+impl eframe::App for BivoxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_logs();
         self.pump_events();
@@ -1387,9 +1387,9 @@ impl eframe::App for KaolsApp {
         }
 
         // 面板顺序：先上/下，最后 CentralPanel。
-        egui::Panel::top("kaols_toolbar").show(ui, |ui| gui::toolbar::show(self, ui));
+        egui::Panel::top("bivox_toolbar").show(ui, |ui| gui::toolbar::show(self, ui));
         // 日志面板高度可拖拽调整（分割线在日志面板上边缘）
-        egui::Panel::bottom("kaols_log")
+        egui::Panel::bottom("bivox_log")
             .resizable(true)
             .default_size(180.0)
             .min_size(60.0)
@@ -1494,9 +1494,9 @@ fn preferred_renderer() -> eframe::Renderer {
     eframe::Renderer::Glow
 }
 
-/// 窗口图标（与 `assets/kaols.ico` 同设计：深色圆角底 + 绿色声波柱）。
+/// 窗口图标（与 `assets/bivox.ico` 同设计：深色圆角底 + 绿色声波柱）。
 ///
-/// 程序化生成，避免运行时依赖图片解码库；exe 文件图标由 `build.rs` + `assets/kaols.ico` 提供。
+/// 程序化生成，避免运行时依赖图片解码库；exe 文件图标由 `build.rs` + `assets/bivox.ico` 提供。
 fn app_icon() -> egui::IconData {
     const SIZE: usize = 64;
     const RADIUS: f32 = 14.0;
@@ -1581,7 +1581,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
     }
 
     info!(
-        "kaols v{} 启动，程序目录 {}",
+        "Bivox v{} 启动，程序目录 {}",
         env!("CARGO_PKG_VERSION"),
         paths.exe_dir.display()
     );
@@ -1597,7 +1597,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
                 paths.config_file.display()
             );
             error!("{message}");
-            show_fatal_dialog("kaols 配置错误", &message);
+            show_fatal_dialog("Bivox 配置错误", &message);
             return ExitCode::FAILURE;
         }
     };
@@ -1615,7 +1615,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
                 "无法加载配置文件：\n{}\n\n{detail}\n\n程序将退出。\n请修正该文件；删除它后重启会生成默认配置。",
                 paths.config_file.display()
             );
-            show_fatal_dialog("kaols 配置错误", &message);
+            show_fatal_dialog("Bivox 配置错误", &message);
             return ExitCode::FAILURE;
         }
     };
@@ -1651,7 +1651,7 @@ pub fn run(paths: AppPaths) -> ExitCode {
         WINDOW_TITLE,
         native_options,
         Box::new(move |_cc| {
-            Ok(Box::new(KaolsApp::new(
+            Ok(Box::new(BivoxApp::new(
                 paths,
                 runtime,
                 config,

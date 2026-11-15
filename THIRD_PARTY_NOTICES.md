@@ -1,13 +1,13 @@
 # 第三方组件与许可声明
 
-kaols 的发布包（`kaols.exe`）内嵌/链接了以下第三方组件。按 MIT 许可要求，随附其版权与许可声明。
+Bivox 的发布包（`bivox.exe`）内嵌/链接了以下第三方组件。按 MIT 许可要求，随附其版权与许可声明。
 
 ## Silero VAD（模型）
 
 - 项目：<https://github.com/snakers4/silero-vad>
 - 版本：v6.2.3（模型文件 `silero_vad_16k_op15.onnx`，取自 `master` 的 `src/silero_vad/data/`）
 - 许可：MIT，Copyright (c) 2020-present Silero Team
-- 说明：模型通过 `include_bytes!` 内嵌进 `kaols.exe`，用于本地语音活动检测。
+- 说明：模型通过 `include_bytes!` 内嵌进 `bivox.exe`，用于本地语音活动检测。
 
 ```text
 MIT License
@@ -36,7 +36,7 @@ SOFTWARE.
 ## ONNX Runtime
 
 - 项目：<https://github.com/microsoft/onnxruntime>
-- 版本：1.31（通过 `ort` crate 的 pyke 预编译包静态链接进 `kaols.exe`）
+- 版本：1.31（通过 `ort` crate 的 pyke 预编译包静态链接进 `bivox.exe`）
 - 许可：MIT，Copyright (c) Microsoft Corporation
 - 说明：ONNX Runtime 自身还包含第三方组件，完整声明见其仓库的
   [`ThirdPartyNotices.txt`](https://github.com/microsoft/onnxruntime/blob/main/ThirdPartyNotices.txt)。
@@ -68,4 +68,4 @@ SOFTWARE.
 ## 其他 Rust 依赖
 
 其余 Rust crate 的许可信息见仓库的 `Cargo.lock` 与各 crate 的仓库页面；它们以源码形式编译进
-`kaols.exe`。
+`bivox.exe`。

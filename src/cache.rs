@@ -9,7 +9,7 @@
 //!   },
 //!   "asr_hotwords": {
 //!     "qwen-audio-3.1-asr-flash-streaming": {
-//!       "vocabulary_id": "vocab-kaols-...",
+//!       "vocabulary_id": "vocab-bivox-...",
 //!       "hotwords": ["原神"],
 //!       "weight": 50,
 //!       "updated_at": 1730000000
@@ -335,7 +335,7 @@ mod tests {
 
     fn temp_cache_path(tag: &str) -> PathBuf {
         let unique = format!(
-            "kaols-cache-{tag}-{}-{}.json",
+            "bivox-cache-{tag}-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

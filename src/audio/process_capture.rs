@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn find_pid_returns_none_for_unknown_process() {
         assert_eq!(
-            find_pid("kaols-不存在这个进程.exe").unwrap(),
+            find_pid("bivox-不存在这个进程.exe").unwrap(),
             None,
             "未知进程名应返回 None 而不是报错"
         );
