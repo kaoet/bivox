@@ -5,7 +5,7 @@
 > 用户可见行为进 [`README.md`](../README.md)；本文件随后删除（git 历史保留）。
 > 配置字段的最终事实源仍然是 [`src/config.rs`](../src/config.rs)，本文件中的 TOML 只是方案快照。
 
-**状态**：需求已冻结；P0–P3 已完成，P4（会话拆分）待开工。
+**状态**：需求已冻结；P0–P4 已完成，P5（对方线路）待开工。
 
 ---
 
@@ -303,7 +303,9 @@ pub struct Timeline {
 - [x] **P3 契约与纯逻辑**：`Speaker` + 事件来源；`timeline.rs`；`chatbox` 投影；单测。D39 已落地。
   落地内容：`events::Speaker { Local, Others }`，`Asr` / `Translation` / `VadActive` 带 `speaker`；`timeline::Timeline` 替代 `subtitles.rs`（消息带来源、每条线路至多一条未完成消息、按 `(speaker, sentence_id)` 去重、合并上限 500）；`chatbox::compose(&SpeakerView, display)`；OSC 只消费 `Local`；实时页改为按时间线渲染（布局暂不变，P7 再改气泡）。
   验证（2026-11-15）：门禁全绿（lib 244）；GUI 启动后实时页空状态正常；真实启动会话后用打字输入提交一句，消息以 `zh` 语言列 + 大字行出现在时间线顶部、输入框清空。
-- [ ] **P4 会话拆分**：`asr_line` / `self_line` / 会话瘦身；我方行为零变化；全门禁 + GUI 冒烟。
+- [x] **P4 会话拆分**：`asr_line` / `self_line` / 会话瘦身；我方行为零变化；全门禁 + GUI 冒烟。
+  落地内容：`pipeline/asr_line.rs`（chunk → VAD 线程 → ASR 任务 → `AsrEvent`，我方与他人线路共用）、`pipeline/self_line.rs`（我方调度循环原样搬移：语言判定/分块/翻译/打字输入/TTS 边界，886 行）、`pipeline/session.rs` 从 1174 行降到 377 行，只做建连、设备、音色、翻译 worker 与收尾。
+  验证（2026-11-15）：门禁全绿（lib 244）；GUI 冒烟：开启翻译 → 开始会话 → 打字输入「你好，今天天气不错。」→ 时间线显示 `zh` 原文行 + `ja` 译文行（走完 self_line 的翻译 → TTS 路径）；停止后状态回空闲、配置已恢复。
 - [ ] **P5 对方线路**：采集 + 重连状态机 + `OthersStatus` + 倒计时横幅 + 双 VAD 指示器（不含翻译）。
 - [ ] **P6 对方翻译 + 打字输入**：对方 MT worker；`tts=false` 时的打字输入输出路径；双向联调。
 - [ ] **P7 界面**：气泡时间线重写（最新在上、左右对齐、角标、分色、复制）。

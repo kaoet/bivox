@@ -103,9 +103,11 @@ src/
 │   ├── qwen_tts.rs      Qwen-Audio-TTS 流式合成
 │   └── qwen_mt.rs       机器翻译（qwen-mt-flash，OpenAI 兼容 HTTP）
 ├── pipeline/
+│   ├── asr_line.rs      识别线路接线：chunk → VAD 线程 → ASR 任务 → AsrEvent（两条线路共用）
+│   ├── self_line.rs     我方调度：ASR → 语言判定 → 分块 → 翻译/TTS/字幕 + 打字输入
 │   ├── chunker.rs       流式文本分块（含翻译模式 ChunkPolicy）
 │   ├── translator.rs    翻译 worker（单 in-flight 保序，generation 丢弃旧结果）
-│   └── session.rs       实时会话编排（ASR → 语言 → 分块 → TTS；打字输入/翻译接入）
+│   └── session.rs       会话编排：建连、设备、音色、翻译 worker 与生命周期收尾
 ├── voice/
 │   ├── mod.rs           生效音色解析、样本复刻/缓存注册、语言→(voice_id, 语速) 映射
 │   ├── api.rs           百炼声音复刻 HTTP API（不依赖 SDK）
@@ -141,7 +143,9 @@ src/
 |---|---|---|
 | `app` | 应用状态与所有 GUI 操作的编排；唯一同时接触 UI 与后台任务的地方 | 依赖几乎全部下层模块 |
 | `gui` | 只负责绘制和把用户操作转成 `KaolsApp` 方法调用 | 依赖 `app` 状态 |
-| `pipeline::session` | 一次实时会话的完整生命周期与调度 | 依赖 audio/client/language/chunker/voice/asr |
+| `pipeline::session` | 一次实时会话的编排：建连、设备、音色、翻译 worker、生命周期与收尾 | 依赖 audio/client/voice/asr + `asr_line` / `self_line` |
+| `pipeline::asr_line` | 「chunk → VAD → ASR」的共用接线，产出 `AsrEvent` 流 | 依赖 audio/client |
+| `pipeline::self_line` | 我方文本流转：语言判定、分块、翻译、TTS 边界、打字输入 | 依赖 client/chunker/translator/voice/language |
 | `client` | 协议实现；不感知 GUI，通过 channel 上报 | 依赖 `ws` 骨架与 `language` |
 | `audio` | 采集/播放/VAD；不感知 GUI | 独立 |
 | `voice` | 配置 → 音色解析/注册/缓存 | 依赖 config + `cache` + 自身 HTTP 客户端 |
@@ -222,10 +226,11 @@ main()
    写回 `vocabulary_id`；失败只发 `Warning` 并降级为不带热词；
 4. 按完整设备名打开输入/输出设备（失败直接结束会话），发 `Devices`；
 5. 创建播放引擎（TTS 输出 22050Hz）、启动采集（16kHz）；
-6. 启动 ASR、TTS 两个后台任务（ASR 带 `vocabulary_id`）；
-7. 状态置 `Running`；
-8. 进入调度循环，直到停止或出错；
-9. 收尾（见 3.5）。
+6. 用 `pipeline::asr_line::spawn` 启动 VAD 线程与 ASR 任务（带 `vocabulary_id`），并启动 TTS 任务；
+7. 需要翻译时建 `QwenMtClient` + 翻译 worker，得到 `TranslationRuntime`；
+8. 状态置 `Running`；
+9. 把上述对象交给 `pipeline::self_line::run`（我方调度循环），直到停止或出错；
+10. 收尾（见 3.5）。
 
 ### 3.5 停止、失败与关闭
 
@@ -307,7 +312,7 @@ main()
 后台任务 ──(PipelineEvent, unbounded)──▶ KaolsApp::pump_events
       └── ctx.request_repaint() ──▶ egui 下一帧
 
-pipeline::session::emit ──(PipelineEvent 克隆, unbounded)──▶ ChatboxService（D33）
+pipeline::self_line ──(经 session::emit 克隆, unbounded)──▶ ChatboxService（D33）
       └── 独立任务：我方投影（`speaker_view(Speaker::Local)`）→ 1 秒文本节流 / typing / 清空
 
 实时页输入框 ──(TypedInput, unbounded)──▶ session 调度循环（biased 优先）
