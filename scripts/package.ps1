@@ -1,7 +1,7 @@
 # 发布打包脚本
 #
 # 产物：dist\bivox-<version>-win64.zip
-#   只包含 bivox.exe + README.md + THIRD_PARTY_NOTICES.md
+#   只包含 bivox.exe + README.md + THIRD_PARTY_NOTICES.md + LICENSE-MIT + LICENSE-APACHE
 #   （不含 config.toml / 调试工具 / 缓存 / 日志；ONNX Runtime 已静态链接进 exe）
 #
 # 用法：
@@ -38,6 +38,8 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item $exe $stage
 Copy-Item (Join-Path $root "README.md") $stage
 Copy-Item (Join-Path $root "THIRD_PARTY_NOTICES.md") $stage
+Copy-Item (Join-Path $root "LICENSE-MIT") $stage
+Copy-Item (Join-Path $root "LICENSE-APACHE") $stage
 
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
@@ -48,4 +50,4 @@ Write-Host "打包完成：$zip"
 Write-Host "  版本：$version"
 Write-Host "  bivox.exe：$exeMb MB"
 Write-Host "  zip：$sizeMb MB"
-Write-Host "  内容：bivox.exe + README.md + THIRD_PARTY_NOTICES.md（无 config.toml、无密钥、无 DLL）"
+Write-Host "  内容：bivox.exe + README.md + THIRD_PARTY_NOTICES.md + LICENSE-MIT + LICENSE-APACHE（无 config.toml、无密钥、无 DLL）"

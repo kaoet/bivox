@@ -3,6 +3,15 @@ name = "bivox"
 version = "0.1.0"
 edition = "2024"
 default-run = "bivox"
+description = "超低延迟VRChat语音识别、翻译与语音合成"
+license = "MIT OR Apache-2.0" # 双许可，二选一，见 LICENSE-MIT / LICENSE-APACHE
+repository = "https://github.com/kaoet/bivox"
+readme = "README.md"
+rust-version = "1.95" # MSRV，见 CONTRIBUTING 第 1 节
+keywords = ["vrchat", "speech-to-text", "text-to-speech", "translation", "wasapi"]
+categories = ["multimedia::audio", "gui"]
+# 桌面应用，不发布到 crates.io
+publish = false
 
 [features]
 # 渲染后端二选一：默认 wgpu（DX12，远程桌面也能用）。

@@ -1,0 +1,67 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请确认：已读过 README 的「故障排查」与 `CONTRIBUTING.md`，并且日志里没有 API Key。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 发生了什么？你期望发生什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从启动开始，尽量精确到点了哪个页签、哪个开关。
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Bivox 版本
+      description: 窗口右上角显示的版本号。
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Windows 版本
+      description: 例如 Windows 11 24H2 x64。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: line
+    attributes:
+      label: 受影响的功能
+      multiple: true
+      options:
+        - 自己线路（麦克风 / TTS）
+        - 他人线路（VRChat 进程环回）
+        - 翻译
+        - VRChat OSC 聊天框
+        - 语音识别 / 预编译热词
+        - 自定义（复刻）音色
+        - 音频设备 / VAD
+        - 配置保存 / 便携路径
+        - 其它（在「现象」里说明）
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: exe 同目录 `logs\bivox-YYYY-MM-DD.log` 的相关片段。**贴之前删掉 API Key 与个人信息。**
+      render: text
+    validations:
+      required: false

@@ -1,6 +1,11 @@
 # Bivox — 超低延迟实时语音识别 / 语音合成（Windows GUI）
 
+[![CI](https://github.com/kaoet/bivox/actions/workflows/ci.yml/badge.svg)](https://github.com/kaoet/bivox/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
+
 基于阿里云百炼 **Qwen-Audio** 的实时语音识别（ASR）与语音合成（TTS）桌面客户端，面向实时对话、VRChat 等低延迟场景。
+
+> **下载**：到 [Releases](https://github.com/kaoet/bivox/releases) 取最新的 `bivox-<版本>-win64.zip`（便携，解压即用）。
 
 全双工流式流水线：麦克风采集 → 流式 ASR → 按标点/语义分块 → 流式 TTS → 平滑播放，无需等整句说完。
 
@@ -11,11 +16,13 @@
 
 **系统要求**：Windows 10/11 x64、可用的百炼 API Key、联网。发布包不含安装器，解压即用；ONNX Runtime 已静态链接进 exe，无需安装额外运行库。
 
+![Bivox 实时页界面](docs/assets/ui-realtime.png)
+
 ---
 
 ## 快速开始
 
-1. 解压发布包（`bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`）到一个**可写目录**（例如 `D:\Apps\bivox`）；
+1. 解压发布包（`bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md` + `LICENSE-MIT` / `LICENSE-APACHE`）到一个**可写目录**（例如 `D:\Apps\bivox`）；
 2. 双击 `bivox.exe`：首次启动会在 exe 同目录生成空 `config.toml`，正常进入主界面；未配置 API Key 时点「开始」会跳转到「设置」页；
 3. 在「设置」页填入百炼 API Key（[控制台](https://bailian.console.aliyun.com/)），点页面右上角「保存」；
 4. 回到「实时」页点「开始」，对着麦克风说话即可看到字幕并听到合成语音。
@@ -242,6 +249,22 @@ zh en fr de ja ko ru pt th id vi es it ms fil ar
 
 ---
 
+## 关于本项目
+
+- 个人独立开发的开源项目，与 VRChat、阿里云（百炼）、VoiceLinkVR 均无隶属或合作关系；
+- 识别、翻译、合成都走你自备的百炼账号与 API Key，调用费用由你的账号承担；
+- 按「现状」提供，不附带任何担保；使用前请自行确认所在平台与地区的合规要求。
+
+---
+
+## 许可
+
+本项目以 **MIT OR Apache-2.0** 双许可发布，你可以任选其一：[LICENSE-MIT](LICENSE-MIT) 或 [LICENSE-APACHE](LICENSE-APACHE)。
+
+第三方组件保持各自的原许可，见下。
+
+---
+
 ## 第三方组件与许可
 
 - **Silero VAD**（<https://github.com/snakers4/silero-vad>，MIT）：内嵌的 `silero_vad_16k_op15.onnx` 语音活动检测模型；
@@ -259,11 +282,11 @@ zh en fr de ja ko ru pt th id vi es it ms fil ar
 | 文档 | 内容 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 模块划分、数据流与关键算法 |
-| [docs/decisions.md](docs/decisions.md) | `D1`–`D35` 设计决定与理由 |
+| [docs/decisions.md](docs/decisions.md) | 设计决定与理由（`D<n>` 编号） |
 | [AGENTS.md](AGENTS.md) | AI 编码代理的阅读入口 |
 
 配置字段、默认值与校验规则见 `src/config.rs` 的字段注释、`Default` 实现与 `validate`。
 
 百炼调试 CLI `admin` 仅用于本地开发调试（列出/删除账号下的远程复刻音色与预编译热词列表），**不随发布包分发**，用法见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
-> 发布包只包含本 `README.md` 与 `THIRD_PARTY_NOTICES.md`，上述开发文档不会随 zip 分发。
+> 发布包只包含 `bivox.exe`、本 `README.md`、`THIRD_PARTY_NOTICES.md` 与 `LICENSE-MIT` / `LICENSE-APACHE`；仓库的开发文档与截图（`docs/`）不会随 zip 分发。

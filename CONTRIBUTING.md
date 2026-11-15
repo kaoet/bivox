@@ -2,7 +2,7 @@
 
 本文件面向**开发与贡献者**（以及需要维护本仓库的 AI 编码代理），是项目开发流程、编码规范与发布流程的**唯一权威来源**。
 
-- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D1`–`D35`）
+- 为什么要这样设计：[`docs/decisions.md`](docs/decisions.md)（`D<n>` 编号）
 - 模块、数据流与算法：[`docs/architecture.md`](docs/architecture.md)
 - 用户使用说明：[`README.md`](README.md)
 - AI 代理入口：[`AGENTS.md`](AGENTS.md)（只做导航，不重复本文件规则）
@@ -21,11 +21,16 @@
 
 ### 关于 `.cargo/config.toml`
 
-仓库提交了 `.cargo/config.toml`，其中固定了当前开发机的 MSVC `link.exe` 与 Windows SDK 库路径。换机器构建时：
+仓库**不提交** `.cargo/config.toml`（已加入 `.gitignore`）：它保存的是本机的 MSVC `link.exe` 与 Windows SDK 库路径，提交上来会让别人的构建拿着你的绝对路径去链接。仓库只提交模板 `.cargo/config.toml.example`。
 
-- 如果报错找不到 `link.exe` / 找不到 `kernel32.lib` 等，按本机 Visual Studio 与 Windows SDK 的实际路径修改该文件；
-- 这是本机环境适配，**提交前用 `git diff` 确认没有把与自己环境相关的路径改动混进业务提交**；
-- 不要在没有确认的情况下删除它；如果只是临时让 cargo 自动发现 MSVC，可先移出工作区，构建完恢复。
+- 一般情况下不需要它：cargo 能自动发现已安装的 MSVC 工具链；
+- 只有自动发现失败（多版本 Visual Studio 共存、报找不到 `link.exe` / `kernel32.lib` 等）时，才复制模板并按本机实际路径填写：
+
+  ```powershell
+  Copy-Item .cargo\config.toml.example .cargo\config.toml
+  ```
+
+- `.cargo/config.toml` 属于本机环境适配，不要提交，也不要把它的改动混进业务提交。
 
 ---
 
@@ -176,7 +181,8 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 - 不允许使用 `--no-verify` 或任何方式绕过检查；
 - 如果 `cargo fmt` 顺带改到与本次任务无关的文件，必须把这些纯格式改动一并提交或单独提交，不能为了让 diff 好看而撤销它们（否则全项目 `cargo fmt --check` 会失败）；
 - 一个提交只做一件逻辑上的事；提交信息简洁说明“做了什么、为什么”；
-- 文档改动也应跑完上述门禁（至少 `cargo fmt --check`、`cargo build --bins`、`cargo test`），保持仓库始终可构建。
+- 文档改动也应跑完上述门禁（至少 `cargo fmt --check`、`cargo build --bins`、`cargo test`），保持仓库始终可构建；
+- CI（`.github/workflows/ci.yml`）在 GitHub 上跑同一组检查（`fmt --check` / `build --bins` / `test`），它不能替代本地门禁：提交前仍必须在本机全部跑过。
 
 ---
 
@@ -239,7 +245,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 | 开发流程、规范、测试、发布、调试 | 本文件 | 其它文档只引用，不复制 |
 | AI 代理入口 | `AGENTS.md` | 只做导航与阅读顺序 |
 | 模块/数据流/算法 | `docs/architecture.md` | 当前实现的“怎么做” |
-| 设计决定与理由 | `docs/decisions.md` | `D1`–`D35`，编号稳定 |
+| 设计决定与理由 | `docs/decisions.md` | `D<n>`，编号稳定 |
 | 配置字段、默认值与校验 | `src/config.rs` | 字段注释 + `Default`/常量 + `validate` |
 | 语言代码集合 | `src/language.rs` | README 的用户表格据此维护 |
 | 模块职责概览 | `docs/architecture.md` | 本文件不重复维护目录树 |
@@ -277,7 +283,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
    ```
 
 4. 检查产物 `dist\bivox-<version>-win64.zip`：
-   - 只包含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
+   - 只包含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md` + `LICENSE-MIT` / `LICENSE-APACHE`；
    - 不含 `config.toml`、`cache.json`、日志、`admin` 调试工具；
    - ONNX Runtime 已静态链接进 exe，**不要**再往 zip 里放 DLL；
 5. 冒烟检查（人工）：

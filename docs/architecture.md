@@ -593,7 +593,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
 - 静态截图：glow 变体 + `EFRAME_SCREENSHOT_TO`（wgpu 不支持该调试特性）。
 - 发布前人工冒烟：开始/停止、配置保存、双开单实例、release 启动、便携目录行为。
-- 仓库没有 CI，门禁靠本地手动执行（具体命令与提交规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)）。
+- CI（`.github/workflows/ci.yml`）在 windows-latest 上跑 `cargo fmt --check` / `cargo build --bins` / `cargo test`；提交前仍须在本机执行同一组门禁（具体命令与提交规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)）。
 
 ---
 

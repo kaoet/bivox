@@ -33,7 +33,7 @@
 
 **决定**
 
-- 发布物只有一个 `bivox.exe`；zip 只含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`。
+- 发布物只有一个 `bivox.exe`；zip 只含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md` + `LICENSE-MIT` + `LICENSE-APACHE`。
 - **不**打包 `config.toml`、`cache.json`、日志、调试工具；ONNX Runtime 静态链接进 exe，不带 DLL（D34）。
 - 升级方式：覆盖 exe 与 README，旁边的配置/缓存/日志保持不动。
 - release 构建不弹控制台（`windows_subsystem = "windows"`），debug 保留控制台便于排错。
@@ -43,7 +43,7 @@
 
 - 无需安装器、无需管理员权限；目录整体拷贝即迁移。
 - 避免把开发机密钥带进发布包。
-- MIT（Silero 模型 / ONNX Runtime）要求随分发附带版权与许可声明，因此发布包附带 `THIRD_PARTY_NOTICES.md`。
+- MIT（Silero 模型 / ONNX Runtime）要求随分发附带版权与许可声明，因此发布包附带 `THIRD_PARTY_NOTICES.md`；本项目自身的双许可文本（`LICENSE-MIT` / `LICENSE-APACHE`）同样随包分发。
 
 ---
 
