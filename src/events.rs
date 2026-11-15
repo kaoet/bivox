@@ -1,7 +1,10 @@
-//! 后台管线 → GUI 的事件契约（决策 D6，见 docs/decisions.md）。
+//! 后台管线 → GUI 的事件契约（决策 D6/D39，见 docs/decisions.md）。
 //!
-//! 所有后台任务只通过这条通道向界面汇报；界面每帧排空并转成状态/字幕/日志。
+//! 所有后台任务只通过这条通道向界面汇报；界面每帧排空并转成状态/时间线/日志。
 //! 事件里不带 `egui` 类型，保持可测试、可脱机回放。
+//!
+//! D39 起每条语音事件都带 [`Speaker`]：我方（麦克风/打字）与他人（进程环回）走同一套
+//! 事件与状态机，靠来源字段区分；OSC 与 TTS 只消费 [`Speaker::Local`]。
 
 /// 会话状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,35 @@ impl SessionState {
     }
 }
 
+/// 说话方：我方（麦克风 + 打字输入）或他人（进程环回采集）。
+///
+/// 枚举名与配置字段 `local` / `others` 对应（`Self` 是关键字，不能做变体名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Speaker {
+    /// 我方线路。
+    Local,
+    /// 他人线路。
+    Others,
+}
+
+impl Speaker {
+    /// 时间线里按来源索引（`[bool; 2]`、`[Option<u64>; 2]`）。
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Local => 0,
+            Self::Others => 1,
+        }
+    }
+
+    /// 日志/调试里的稳定写法。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Others => "others",
+        }
+    }
+}
+
 /// 后台 → 界面的消息。
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
@@ -47,11 +79,13 @@ pub enum PipelineEvent {
     /// 界面据此把"已合成 / 尚未合成"两部分用不同颜色显示。
     /// `language`：本句已判定的语言代码（首个 chunk 送出前为 `None`）。
     /// `sentence_id`：服务端句子 id（重复下发同一句时相同，用于字幕去重）。
+    /// `speaker`：这条文本属于哪条线路（D39）。
     ///
     /// 翻译模式下本事件只用于刷新源文与"已送翻译"前缀（`sent_bytes` 改为统计已送翻译的
     /// 源文长度），`is_sentence_end` 恒为 `false`，句终由 [`PipelineEvent::Translation`]
     /// 负责；`language` 是源语言而非目标语言（D26）。
     Asr {
+        speaker: Speaker,
         text: String,
         is_sentence_end: bool,
         sent_bytes: usize,
@@ -63,6 +97,7 @@ pub enum PipelineEvent {
     /// `sent_bytes`：`text` 中已送入 TTS 的字节前缀长度（一定是字符边界）。
     /// `language`：目标语言代码；`sentence_id`：源 ASR 句的服务端 id（用于字幕去重）。
     Translation {
+        speaker: Speaker,
         text: String,
         sent_bytes: usize,
         is_sentence_end: bool,
@@ -72,13 +107,16 @@ pub enum PipelineEvent {
     /// 用户在「实时」页输入框提交的一句**打字输入**，已交给 TTS 排队朗读。
     ///
     /// `language`：本句实际使用的 TTS 语言（与 ASR 句共用同一个粘性语言判定）。
-    /// 它与 ASR 字幕走同一套历史列表，但不按 `sentence_id` 去重。
+    /// 它始终属于我方线路，与 ASR 字幕走同一套历史列表，但不按 `sentence_id` 去重。
     TypedSentence {
         text: String,
         language: String,
     },
-    /// 本地 VAD 是否处于语音段（顶栏指示器用）。
-    VadActive(bool),
+    /// 本地 VAD 是否处于语音段（顶栏指示器用）；两条线路各一个。
+    VadActive {
+        speaker: Speaker,
+        active: bool,
+    },
     /// 用户可感知、但不影响会话继续运行的告警（黄色横幅）。
     ///
     /// 典型场景：配置了预编译热词但注册/更新失败，本次识别降级为不带热词继续跑（D31）。

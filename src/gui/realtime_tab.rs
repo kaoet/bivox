@@ -1,11 +1,11 @@
-//! 实时页：不分段的字幕列表——最新的一句（正在合成的）在最上面，越早越靠下；
-//! 列表顶部对齐、字号放大、页面不显示任何标题（D16）。
+//! 实时页：不放分段的对话列表——最新一条在最上面，越早越靠下；
+//! 列表顶部对齐、字号放大、页面不显示任何标题（D16/D39）。
 //!
-//! 每行布局：最左是语言代码，然后是本句文本；当前句按「已送入 / 尚未送入」分成两种颜色
-//! 且不显示复制按钮；历史句在**悬停整行**时于右端显示复制图标。
+//! 每行布局：最左是语言代码，然后是本句文本；未完成的消息按「已送入 / 尚未送入」分成两种颜色
+//! 且不显示复制按钮；已完成的消息在**悬停整行**时于右端显示复制图标。
 //!
-//! 翻译模式（D26）：一句字幕包含「译文大字行 + 原文小字弱色行」，两种语言各占一列语言代码；
-//! 原文行与译文行**各自**有复制按钮（悬停对应行时显示），`show_source = false` 时只渲染译文行。
+//! 消息可以只有一行（未翻译），也可以两行：原文小字弱色行在上、译文大字行在下（D26）；
+//! `show_source = false` 时只渲染主行。每条消息带来源（我方/他人），P7 会改成左右分栏气泡。
 
 use eframe::egui;
 
@@ -80,82 +80,55 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
 
 /// 字幕列表：从底部输入行上方剩余的空间向下填满。
 fn show_subtitles(app: &mut KaolsApp, ui: &mut egui::Ui) {
-    let subtitles = &app.subtitles;
     let show_source = app.translate_show_source();
 
-    // 显示顺序：当前句（正在处理中）在最上，历史句按 新 → 旧 往下排。
-    // 每个元素是一"条"字幕：普通模式 1 行，翻译模式最多 2 行（译文 + 原文）。
-    let mut entries: Vec<Vec<Row<'_>>> = Vec::with_capacity(subtitles.history.len() + 1);
-
-    if subtitles.translation_mode {
-        if !subtitles.current.is_empty() && show_source {
-            let mut rows = vec![Row::current(
-                subtitles.source_language.as_deref().unwrap_or(""),
-                &subtitles.current,
-                subtitles.sent_bytes,
-                SOURCE_FONT_SIZE,
-                false,
-            )];
-            if !subtitles.current_translation.is_empty() {
-                rows.push(Row::current(
-                    subtitles.language.as_deref().unwrap_or(""),
-                    &subtitles.current_translation,
-                    subtitles.translation_sent_bytes,
-                    SUBTITLE_FONT_SIZE,
+    // 显示顺序：时间线本身就是「最新在前」，直接按顺序渲染。
+    // 每条消息 1–2 行：原文小字行在上（翻译模式且 `show_source`），主行在下。
+    let mut entries: Vec<Vec<Row<'_>>> = Vec::with_capacity(app.timeline.messages().len());
+    for message in app.timeline.messages() {
+        let mut rows = Vec::with_capacity(2);
+        if show_source && !message.source.is_empty() {
+            rows.push(if message.open {
+                Row::current(
+                    &message.source_language,
+                    &message.source,
+                    message.source_sent_bytes,
+                    SOURCE_FONT_SIZE,
                     false,
-                ));
-            }
-            entries.push(rows);
-        } else if !subtitles.current_translation.is_empty() {
-            // 关闭原文时当前句只显示译文行。
-            entries.push(vec![Row::current(
-                subtitles.language.as_deref().unwrap_or(""),
-                &subtitles.current_translation,
-                subtitles.translation_sent_bytes,
-                SUBTITLE_FONT_SIZE,
-                false,
-            )]);
-        }
-
-        for line in subtitles.history.iter().rev() {
-            let mut rows = Vec::with_capacity(2);
-            if show_source && !line.source.is_empty() {
-                rows.push(Row::history(
-                    &line.source_language,
-                    &line.source,
+                )
+            } else {
+                Row::history(
+                    &message.source_language,
+                    &message.source,
                     SOURCE_FONT_SIZE,
                     true,
                     true,
-                ));
-            }
-            rows.push(Row::history(
-                &line.language,
-                &line.text,
-                SUBTITLE_FONT_SIZE,
-                false,
-                true,
-            ));
+                )
+            });
+        }
+        if !message.text.is_empty() {
+            rows.push(if message.open {
+                Row::current(
+                    &message.language,
+                    &message.text,
+                    message.sent_bytes,
+                    SUBTITLE_FONT_SIZE,
+                    false,
+                )
+            } else {
+                Row::history(
+                    &message.language,
+                    &message.text,
+                    SUBTITLE_FONT_SIZE,
+                    false,
+                    true,
+                )
+            });
+        }
+        // 刚建立、还没收到任何文本的消息不占位。
+        if !rows.is_empty() {
             entries.push(rows);
         }
-    } else {
-        if !subtitles.current.is_empty() {
-            entries.push(vec![Row::current(
-                subtitles.language.as_deref().unwrap_or(""),
-                &subtitles.current,
-                subtitles.sent_bytes,
-                SUBTITLE_FONT_SIZE,
-                false,
-            )]);
-        }
-        entries.extend(subtitles.history.iter().rev().map(|line| {
-            vec![Row::history(
-                &line.language,
-                &line.text,
-                SUBTITLE_FONT_SIZE,
-                false,
-                true,
-            )]
-        }));
     }
 
     egui::ScrollArea::vertical()
@@ -166,15 +139,13 @@ fn show_subtitles(app: &mut KaolsApp, ui: &mut egui::Ui) {
             // 否则空状态提示等会贴到字幕区底部。
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 // 0.37 的 ScrollArea 没有 stick_to_top；默认滚动偏移按像素保存，
-                // 停在顶部（偏移 0）时新字幕插入顶部不会把视图顶走，效果就是 stick top。
+                // 停在顶部（偏移 0）时新消息插入顶部不会把视图顶走，效果就是 stick top。
                 if entries.is_empty() {
                     ui.add_space(16.0);
-                    let hint = if subtitles.translation_mode {
-                        "（点工具栏「开始」后，说话或打字即可看到译文与原文）"
-                    } else {
-                        "（点工具栏「开始」后，说话即可看到识别字幕）"
-                    };
-                    ui.label(egui::RichText::new(hint).weak());
+                    ui.label(
+                        egui::RichText::new("（点工具栏「开始」后，说话或打字即可看到字幕）")
+                            .weak(),
+                    );
                     return;
                 }
 

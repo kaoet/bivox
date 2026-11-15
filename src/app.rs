@@ -14,13 +14,13 @@ use crate::config::{
     DEFAULT_VAD_THRESHOLD, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
 };
 use crate::config_edit;
-use crate::events::{PipelineEvent, SessionState};
+use crate::events::{PipelineEvent, SessionState, Speaker};
 use crate::gui;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::osc::{ChatboxService, ChatboxSettings};
 use crate::paths::AppPaths;
 use crate::pipeline::session::{MAX_TYPED_INPUT_CHARS, PipelineSessionHandle, TypedInput};
-use crate::subtitles::SubtitleState;
+use crate::timeline::Timeline;
 use crate::voice::editor::{self, VoiceDraft};
 
 /// 窗口标题。
@@ -40,6 +40,10 @@ pub enum VoiceMode {
 pub enum Tab {
     Realtime,
     Audio,
+    /// 「自己」页：我方线路的专属设置。
+    Local,
+    /// 「他人」页：他人线路的专属设置。
+    Others,
     Asr,
     Tts,
     Vrchat,
@@ -48,9 +52,11 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 9] = [
         Tab::Realtime,
         Tab::Audio,
+        Tab::Local,
+        Tab::Others,
         Tab::Asr,
         Tab::Tts,
         Tab::Vrchat,
@@ -62,6 +68,8 @@ impl Tab {
         match self {
             Self::Realtime => "实时",
             Self::Audio => "音频",
+            Self::Local => "自己",
+            Self::Others => "他人",
             Self::Asr => "语音识别",
             Self::Tts => "语音合成",
             Self::Vrchat => "VRChat",
@@ -124,8 +132,8 @@ pub struct KaolsApp {
     pub config_write_error_tab: Option<Tab>,
     /// 运行中重新加载配置失败的原因（保留旧配置；成功时清空）。
     pub config_reload_error: Option<String>,
-    /// 实时字幕状态（当前句 + 历史句）。
-    pub subtitles: SubtitleState,
+    /// 实时对话时间线（两条线路的消息：最新在前，未完成消息按进度分色）。
+    pub timeline: Timeline,
     /// 语音合成页的音色编辑草稿（保存前只改这里，`config` 不变）。
     pub voice_drafts: Vec<VoiceDraft>,
     /// 音色列表在下一次绘制时滚到底部（新增音色后使用，滚完即清）。
@@ -152,18 +160,35 @@ pub struct KaolsApp {
     pub vad_debug: bool,
     /// 语音识别页的 ASR 模型草稿。
     pub asr_model: String,
-    /// 语音识别页的有序语言列表草稿。
-    pub asr_languages: Vec<String>,
     /// 语音识别页的热词草稿（多行文本，一行一个）。
     pub asr_hotwords: String,
     /// 语音识别页保存/校验错误（红色显示）。
     pub asr_edit_error: Option<String>,
+    /// 「自己」页草稿：麦克风 / 语言列表 / 翻译 / 译文语言 / 合成开关。
+    pub self_mic: bool,
+    pub self_languages: Vec<String>,
+    pub self_translate: bool,
+    pub self_target: String,
+    pub self_tts: bool,
+    /// 「自己」页保存/校验错误（红色显示）。
+    pub self_edit_error: Option<String>,
+    /// 「他人」页草稿：开关 / 语言列表 / 翻译 / 译文语言。
+    pub others_enabled: bool,
+    pub others_languages: Vec<String>,
+    pub others_translate: bool,
+    pub others_target: String,
+    /// 「他人」页保存/校验错误（红色显示）。
+    pub others_edit_error: Option<String>,
+    /// VRChat 页的目标进程草稿（点「应用」写回 `[vrchat] process`）。
+    pub vrchat_process: String,
     /// 运行期告警（顶部黄色横幅显示，可手动清除）。
     pub pipeline_warning: Option<String>,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
     /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
     pub vad_active: bool,
+    /// 他人线路的 VAD 指示（由对方线路上报；对方线路未启用时保持 false）。
+    pub vad_active_others: bool,
     /// 启动检查发现的问题（日志初始化失败等非致命问题）。
     pub startup_error: Option<String>,
     /// 运行期崩溃信息（panic 钩子写入）。
@@ -212,7 +237,7 @@ impl KaolsApp {
             config_write_error: None,
             config_write_error_tab: None,
             config_reload_error: None,
-            subtitles: SubtitleState::default(),
+            timeline: Timeline::default(),
             voice_drafts: Vec::new(),
             voice_list_scroll_to_end: false,
             voice_edit_error: None,
@@ -228,12 +253,24 @@ impl KaolsApp {
             vad_tail_ms: DEFAULT_VAD_TAIL_MS,
             vad_debug: false,
             asr_model: String::new(),
-            asr_languages: Vec::new(),
             asr_hotwords: String::new(),
             asr_edit_error: None,
+            self_mic: true,
+            self_languages: Vec::new(),
+            self_translate: false,
+            self_target: String::new(),
+            self_tts: true,
+            self_edit_error: None,
+            others_enabled: false,
+            others_languages: Vec::new(),
+            others_translate: false,
+            others_target: String::new(),
+            others_edit_error: None,
+            vrchat_process: String::new(),
             pipeline_warning: None,
             pipeline_error: None,
             vad_active: false,
+            vad_active_others: false,
             startup_error,
             crash: None,
             log: VecDeque::new(),
@@ -242,6 +279,8 @@ impl KaolsApp {
         app.sync_from_config();
         app.sync_voice_inputs();
         app.sync_asr_inputs();
+        app.sync_self_inputs();
+        app.sync_others_inputs();
         app.refresh_devices();
         app
     }
@@ -279,6 +318,8 @@ impl KaolsApp {
         self.sync_from_config();
         self.sync_voice_inputs();
         self.sync_asr_inputs();
+        self.sync_self_inputs();
+        self.sync_others_inputs();
         // 选中的音色若仍存在就保留（保存后不丢选择），否则清空
         let selected_exists = self
             .selected_voice
@@ -287,10 +328,9 @@ impl KaolsApp {
         if !selected_exists {
             self.selected_voice = None;
         }
-        // 空闲时让字幕模式立刻跟随配置（运行中的会话等 D20 重启后由 start_session 设置）。
+        // 空闲时让时间线的翻译模式立刻跟随配置（运行中的会话等 D20 重启后由 start_session 设置）。
         if self.session.is_none() {
-            self.subtitles
-                .set_translation_mode(self.config.translate.enabled);
+            self.apply_translation_modes();
         }
         // 运行中改配置（Key/设备/音色等）→ 用新配置自动重启管线
         self.maybe_restart_session();
@@ -310,6 +350,7 @@ impl KaolsApp {
         self.tts_model = self.config.tts.model.clone();
         self.tts_dialect = self.config.tts.dialect.clone();
         self.translate_model = self.config.translate.model.clone();
+        self.vrchat_process = self.config.vrchat.process.clone();
         self.chatbox
             .update_settings(ChatboxSettings::from_config(&self.config));
     }
@@ -346,12 +387,30 @@ impl KaolsApp {
         }
     }
 
-    /// 从配置同步「语音识别」页的草稿值（模型 / 语言列表 / 热词）。
+    /// 从配置同步「语音识别」页的草稿值（模型 / 热词）。
     pub fn sync_asr_inputs(&mut self) {
         self.asr_model = self.config.asr.model.clone();
-        self.asr_languages = self.config.asr.languages.clone();
         self.asr_hotwords = self.config.asr.hotwords.join("\n");
         self.asr_edit_error = None;
+    }
+
+    /// 从配置同步「自己」页的草稿值。
+    pub fn sync_self_inputs(&mut self) {
+        self.self_mic = self.config.local.mic;
+        self.self_languages = self.config.local.languages.clone();
+        self.self_translate = self.config.local.translate;
+        self.self_target = self.config.local.target.clone();
+        self.self_tts = self.config.local.tts;
+        self.self_edit_error = None;
+    }
+
+    /// 从配置同步「他人」页的草稿值。
+    pub fn sync_others_inputs(&mut self) {
+        self.others_enabled = self.config.others.enabled;
+        self.others_languages = self.config.others.languages.clone();
+        self.others_translate = self.config.others.translate;
+        self.others_target = self.config.others.target.clone();
+        self.others_edit_error = None;
     }
 
     /// 顶部「当前音色」的草稿值（`[tts] voice` 形态）。
@@ -513,11 +572,6 @@ impl KaolsApp {
         self.asr_model.trim() != self.config.asr.model
     }
 
-    /// 语音识别页的语言列表是否有改动。
-    pub fn asr_languages_dirty(&self) -> bool {
-        self.asr_languages != self.config.asr.languages
-    }
-
     /// 语音识别页的热词是否有改动（按归一化后的列表比较，空白行不算改动）。
     pub fn asr_hotwords_dirty(&self) -> bool {
         self.hotwords_draft_list() != self.config.asr.hotwords
@@ -525,7 +579,7 @@ impl KaolsApp {
 
     /// 语音识别页是否有未保存改动。
     pub fn asr_tab_dirty(&self) -> bool {
-        self.asr_model_dirty() || self.asr_languages_dirty() || self.asr_hotwords_dirty()
+        self.asr_model_dirty() || self.asr_hotwords_dirty()
     }
 
     /// 保存语音识别页的全部改动（模型 + 语言列表 + 热词，一次原子写回）。
@@ -555,9 +609,6 @@ impl KaolsApp {
         if model.is_empty() {
             anyhow::bail!("识别模型不能为空");
         }
-        if self.asr_languages.is_empty() {
-            anyhow::bail!("语言列表不能为空（至少保留一种语言）");
-        }
         let hotwords = self.hotwords_draft_list();
         crate::config::validate_hotwords(&hotwords)?;
 
@@ -565,7 +616,6 @@ impl KaolsApp {
         let mut config = AppConfig::load(&self.paths.config_file)
             .context("磁盘上的配置已无效，无法保存语音识别设置")?;
         config.asr.model = model.to_string();
-        config.asr.languages = self.asr_languages.clone();
         config.asr.hotwords = hotwords;
         config_edit::save(&self.paths.config_file, &original, &config)
     }
@@ -573,6 +623,108 @@ impl KaolsApp {
     /// 放弃语音识别页的全部改动，恢复为配置文件里的值。
     pub fn reset_asr_tab(&mut self) {
         self.sync_asr_inputs();
+    }
+
+    // ---- 自己页 ----
+
+    /// 「自己」页是否有未保存改动。
+    pub fn self_tab_dirty(&self) -> bool {
+        self.self_mic != self.config.local.mic
+            || self.self_languages != self.config.local.languages
+            || self.self_translate != self.config.local.translate
+            || self.self_target != self.config.local.target
+            || self.self_tts != self.config.local.tts
+    }
+
+    /// 保存「自己」页的全部改动（`[self]` 一次原子写回）。
+    ///
+    /// 成功后重载配置；运行中会按 D20 自动重启实时管线。
+    pub fn save_self_tab(&mut self) {
+        if !self.self_tab_dirty() {
+            return;
+        }
+        match self.try_save_self_tab() {
+            Ok(()) => {
+                self.self_edit_error = None;
+                self.reload_config();
+                info!("已保存「自己」设置（{}）", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.self_edit_error = Some(message.clone());
+                warn!("保存「自己」设置失败：{message}");
+            }
+        }
+    }
+
+    fn try_save_self_tab(&self) -> anyhow::Result<()> {
+        if self.self_languages.is_empty() {
+            anyhow::bail!("语言列表不能为空（至少保留一种语言）");
+        }
+        let original = config_edit::read(&self.paths.config_file)?;
+        let mut config = AppConfig::load(&self.paths.config_file)
+            .context("磁盘上的配置已无效，无法保存「自己」设置")?;
+        config.local.mic = self.self_mic;
+        config.local.languages = self.self_languages.clone();
+        config.local.translate = self.self_translate;
+        config.local.target = self.self_target.clone();
+        config.local.tts = self.self_tts;
+        config_edit::save(&self.paths.config_file, &original, &config)
+    }
+
+    /// 放弃「自己」页的改动，恢复为配置文件里的值。
+    pub fn reset_self_tab(&mut self) {
+        self.sync_self_inputs();
+    }
+
+    // ---- 他人页 ----
+
+    /// 「他人」页是否有未保存改动。
+    pub fn others_tab_dirty(&self) -> bool {
+        self.others_enabled != self.config.others.enabled
+            || self.others_languages != self.config.others.languages
+            || self.others_translate != self.config.others.translate
+            || self.others_target != self.config.others.target
+    }
+
+    /// 保存「他人」页的全部改动（`[others]` 一次原子写回）。
+    ///
+    /// 成功后重载配置；运行中会按 D20 自动重启实时管线。
+    pub fn save_others_tab(&mut self) {
+        if !self.others_tab_dirty() {
+            return;
+        }
+        match self.try_save_others_tab() {
+            Ok(()) => {
+                self.others_edit_error = None;
+                self.reload_config();
+                info!("已保存「他人」设置（{}）", self.paths.config_file.display());
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.others_edit_error = Some(message.clone());
+                warn!("保存「他人」设置失败：{message}");
+            }
+        }
+    }
+
+    fn try_save_others_tab(&self) -> anyhow::Result<()> {
+        if self.others_languages.is_empty() {
+            anyhow::bail!("语言列表不能为空（至少保留一种语言）");
+        }
+        let original = config_edit::read(&self.paths.config_file)?;
+        let mut config = AppConfig::load(&self.paths.config_file)
+            .context("磁盘上的配置已无效，无法保存「他人」设置")?;
+        config.others.enabled = self.others_enabled;
+        config.others.languages = self.others_languages.clone();
+        config.others.translate = self.others_translate;
+        config.others.target = self.others_target.clone();
+        config_edit::save(&self.paths.config_file, &original, &config)
+    }
+
+    /// 放弃「他人」页的改动，恢复为配置文件里的值。
+    pub fn reset_others_tab(&mut self) {
+        self.sync_others_inputs();
     }
 
     /// 重新枚举音频设备（启动时与「刷新设备」按钮调用）。
@@ -690,26 +842,18 @@ impl KaolsApp {
         self.finish_config_write(result, "已保存音频设备");
     }
 
-    /// 更新翻译页负责的 `[translate]` 字段（D3/D27）。
+    /// 更新翻译页负责的共用字段：`[translate]` 的粒度与是否显示原文（D3/D27/D38）。
     ///
-    /// `show_source` 不进配置指纹，改后立即生效、不重启会话；
-    /// 其余字段变化会触发 D20 的「停旧会话 → 用新配置自动重启」。
+    /// 每条线路的翻译开关与目标语言在「自己」/「他人」页；
+    /// `show_source` 不进配置指纹，改后立即生效、不重启会话。
     pub fn update_translate_settings(
         &mut self,
-        enabled: bool,
-        target: &str,
         granularity: TranslateGranularity,
         show_source: bool,
-        model: &str,
     ) {
-        let target = target.trim().to_string();
-        let model = model.trim().to_string();
         let result = self.write_config(|config| {
-            config.translate.enabled = enabled;
-            config.translate.target = target;
             config.translate.granularity = granularity;
             config.translate.show_source = show_source;
-            config.translate.model = model;
             Ok(())
         });
         self.finish_config_write(result, "已保存翻译设置");
@@ -717,7 +861,7 @@ impl KaolsApp {
 
     /// 更新 VRChat 页负责的 `[vrchat.osc]` 字段（D3/D33）。
     ///
-    /// `[vrchat.*]` 不进配置指纹，改设置立即生效、不重启实时管线。
+    /// `[vrchat.osc]` 不进配置指纹，改设置立即生效、不重启实时管线。
     pub fn update_vrchat_settings(&mut self, enabled: bool, port: u16, display: VrchatDisplay) {
         let result = self.write_config(|config| {
             config.vrchat.osc.enabled = enabled;
@@ -726,6 +870,27 @@ impl KaolsApp {
             Ok(())
         });
         self.finish_config_write(result, "已保存 VRChat 设置");
+    }
+
+    /// 保存「VRChat」页的目标进程（`[vrchat] process`）。
+    ///
+    /// 它是对方线路的采集目标、进配置指纹，运行中保存会触发 D20 热重启；
+    /// 因此用「文本框 + 应用」而不是逐键写回。
+    pub fn save_vrchat_process(&mut self) {
+        let process = self.vrchat_process.trim().to_string();
+        if process.is_empty() {
+            self.config_write_error = Some("目标进程不能为空（例如 VRChat.exe）".to_string());
+            self.config_write_error_tab = Some(Tab::Vrchat);
+            return;
+        }
+        if process == self.config.vrchat.process {
+            return;
+        }
+        let result = self.write_config(|config| {
+            config.vrchat.process = process.clone();
+            Ok(())
+        });
+        self.finish_config_write(result, "已保存 VRChat 监听进程");
     }
 
     /// 立即发送一条 VRChat 测试消息（不走 1 秒文本节流）。
@@ -797,6 +962,14 @@ impl KaolsApp {
         self.config.translate.show_source
     }
 
+    /// 把配置里的两条线路翻译开关同步到时间线（空闲时即时生效，启动时供会话解释事件）。
+    fn apply_translation_modes(&mut self) {
+        self.timeline
+            .set_translation(Speaker::Local, self.config.local.translate);
+        self.timeline
+            .set_translation(Speaker::Others, self.config.others.translate);
+    }
+
     /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。
     pub fn start_session(&mut self, ctx: egui::Context) {
         if self.session.is_some() {
@@ -825,11 +998,10 @@ impl KaolsApp {
         self.pipeline_warning = None;
         self.typed_input_error = None;
         self.vad_active = false;
-        // 本次会话是否翻译模式决定字幕如何解释 Asr/Translation 事件（D27）。
-        self.subtitles
-            .set_translation_mode(config.translate.enabled);
-        // 只清当前未完成的句子；历史字幕保留（用户要求停止管线后不清空历史）
-        self.subtitles.reset_current();
+        // 本次会话两条线路各自的翻译模式决定时间线如何解释 Asr/Translation 事件（D26/D39）。
+        self.apply_translation_modes();
+        // 只清当前未完成的消息；历史保留（用户要求停止管线后不清空历史）
+        self.timeline.reset_open();
 
         let runtime = self.runtime.handle().clone();
         let events_for_run = tx.clone();
@@ -867,7 +1039,7 @@ impl KaolsApp {
             session.stop();
             self.state = SessionState::Stopping;
             // 停止按钮立即清空「当前句」（历史保留），不用等下次开始
-            self.subtitles.reset_current();
+            self.timeline.reset_open();
             info!("正在停止实时管线…");
         }
     }
@@ -956,7 +1128,7 @@ impl KaolsApp {
                     self.vad_active = false;
                     self.typed_input_error = None;
                     // 会话结束：清掉可能残留的「当前句」（历史保留）
-                    self.subtitles.reset_current();
+                    self.timeline.reset_open();
                     // 配置变更触发的停止：旧会话已退出，用新配置自动重启
                     if self.restart_pending && !self.closing {
                         self.restart_pending = false;
@@ -972,28 +1144,37 @@ impl KaolsApp {
             }
             PipelineEvent::VoiceInfo { display } => info!("合成音色：{display}"),
             PipelineEvent::Asr {
+                speaker,
                 text,
                 is_sentence_end,
                 sent_bytes,
                 language,
                 sentence_id,
             } => {
-                // 翻译模式下这里只刷新源文与「已送翻译」前缀，句终由 Translation 处理（D27）。
-                self.subtitles
-                    .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id)
+                // 翻译模式下这里只刷新源文与「已送翻译」前缀，句终由 Translation 处理（D26）。
+                self.timeline.apply_asr(
+                    speaker,
+                    &text,
+                    is_sentence_end,
+                    sent_bytes,
+                    language,
+                    sentence_id,
+                );
             }
             PipelineEvent::TypedSentence { text, language } => {
-                self.subtitles.push_typed(text, language);
+                self.timeline.push_typed(text, language);
             }
             PipelineEvent::Translation {
+                speaker,
                 text,
                 sent_bytes,
                 is_sentence_end,
                 language,
                 sentence_id,
             } => {
-                // 翻译模式：译文进大字行，源文来自此前的 Asr 事件；句终时把双语行落进历史。
-                self.subtitles.apply_translation(
+                // 翻译模式：译文进主行，原文来自此前的 Asr 事件；句终时把双语消息定稿。
+                self.timeline.apply_translation(
+                    speaker,
                     &text,
                     sent_bytes,
                     is_sentence_end,
@@ -1001,7 +1182,10 @@ impl KaolsApp {
                     sentence_id,
                 );
             }
-            PipelineEvent::VadActive(active) => self.vad_active = active,
+            PipelineEvent::VadActive { speaker, active } => match speaker {
+                Speaker::Local => self.vad_active = active,
+                Speaker::Others => self.vad_active_others = active,
+            },
             PipelineEvent::Warning { context, detail } => {
                 // 不影响会话继续的告警（如预编译热词降级，D31）：黄色横幅，可手动清除。
                 self.pipeline_warning = Some(format!("{context}：{detail}"));
@@ -1110,6 +1294,8 @@ impl KaolsApp {
         match self.tab {
             Tab::Realtime => gui::realtime_tab::show(self, ui),
             Tab::Audio => gui::audio_tab::show(self, ui),
+            Tab::Local => gui::self_tab::show(self, ui),
+            Tab::Others => gui::others_tab::show(self, ui),
             Tab::Asr => gui::asr_tab::show(self, ui),
             Tab::Tts => gui::tts_tab::show(self, ui),
             Tab::Vrchat => gui::vrchat_tab::show(self, ui),
@@ -1157,12 +1343,44 @@ fn config_signature(config: &AppConfig) -> String {
     let mut signature = String::new();
     let _ = write!(
         signature,
-        "key={:?}\nhost={}\nasr={}\nlangs={:?}\nhotwords={:?}\ntts={}\nvoice={}\ndialect={}\ncache={:?}\ninput={:?}\noutput={:?}\nvad={}/{}/{}/{}/{}\nchunk={}\ntranslate={}/{}/{}/{}\n",
+        "key={:?}\n\
+         host={}\n\
+         asr={}\n\
+         hotwords={:?}\n\
+         self.mic={}\n\
+         self.langs={:?}\n\
+         self.translate={}\n\
+         self.target={}\n\
+         self.tts={}\n\
+         others.enabled={}\n\
+         others.langs={:?}\n\
+         others.translate={}\n\
+         others.target={}\n\
+         vrchat.process={}\n\
+         tts={}\n\
+         voice={}\n\
+         dialect={}\n\
+         cache={:?}\n\
+         input={:?}\n\
+         output={:?}\n\
+         vad={}/{}/{}/{}/{}\n\
+         chunk={}\n\
+         translate.model={}\n\
+         translate.granularity={}\n",
         config.api.key,
         config.api.workspace_host,
         config.asr.model,
-        config.asr.languages,
         config.asr.hotwords,
+        config.local.mic,
+        config.local.languages,
+        config.local.translate,
+        config.local.target,
+        config.local.tts,
+        config.others.enabled,
+        config.others.languages,
+        config.others.translate,
+        config.others.target,
+        config.vrchat.process,
         config.tts.model,
         config.tts.voice,
         config.tts.dialect,
@@ -1175,8 +1393,6 @@ fn config_signature(config: &AppConfig) -> String {
         config.vad.tail_ms,
         config.vad.debug,
         config.chunking.words,
-        config.translate.enabled,
-        config.translate.target,
         config.translate.model,
         config.translate.granularity.label(),
     );
@@ -1387,265 +1603,6 @@ pub fn run(paths: AppPaths) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subtitles::MAX_SUBTITLES;
-
-    fn apply(
-        state: &mut SubtitleState,
-        text: &str,
-        is_end: bool,
-        sent: usize,
-        language: Option<&str>,
-    ) {
-        state.apply_asr(text, is_end, sent, language.map(str::to_string), None);
-    }
-
-    fn apply_with_id(
-        state: &mut SubtitleState,
-        text: &str,
-        is_end: bool,
-        language: Option<&str>,
-        sentence_id: u64,
-    ) {
-        state.apply_asr(
-            text,
-            is_end,
-            0,
-            language.map(str::to_string),
-            Some(sentence_id),
-        );
-    }
-
-    #[test]
-    fn asr_revision_updates_current_sentence() {
-        let mut state = SubtitleState::default();
-
-        apply(&mut state, "今天天气", false, 0, None);
-        assert_eq!(state.current, "今天天气");
-        assert!(state.history.is_empty());
-
-        apply(&mut state, "今天天气真不错。", true, 0, Some("zh"));
-        assert_eq!(state.current, "");
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(state.history[0].text, "今天天气真不错。");
-        assert_eq!(state.history[0].language, "zh");
-    }
-
-    #[test]
-    fn sent_prefix_tracks_tts_progress_and_resets() {
-        let mut state = SubtitleState::default();
-
-        // 已送 TTS 的前 6 个字节 = "今天"
-        apply(
-            &mut state,
-            "今天天气真不错",
-            false,
-            "今天".len(),
-            Some("zh"),
-        );
-        assert_eq!(state.sent_bytes, "今天".len());
-        assert_eq!(state.language.as_deref(), Some("zh"));
-        assert!(state.current.is_char_boundary(state.sent_bytes));
-
-        // 句终时落进历史、前缀清零、语言随句带走
-        apply(&mut state, "今天天气真不错", true, 0, Some("zh"));
-        assert_eq!(state.sent_bytes, 0);
-        assert_eq!(state.language, None);
-        assert_eq!(
-            state.history.last().map(|line| line.text.as_str()),
-            Some("今天天气真不错")
-        );
-        assert_eq!(
-            state.history.last().map(|line| line.language.as_str()),
-            Some("zh")
-        );
-    }
-
-    #[test]
-    fn sent_prefix_is_clamped_to_char_boundary() {
-        let mut state = SubtitleState::default();
-
-        // 1 字节落在汉字中间，应退回到 0，避免 &str 切片 panic
-        apply(&mut state, "今天天气", false, 1, None);
-        assert_eq!(state.sent_bytes, 0);
-
-        // 超过文本长度也会被截断
-        apply(&mut state, "今天天气", false, 999, None);
-        assert_eq!(state.sent_bytes, "今天天气".len());
-    }
-
-    #[test]
-    fn empty_sentence_end_clears_current() {
-        let mut state = SubtitleState {
-            current: "残留".to_string(),
-            sent_bytes: "残留".len(),
-            language: Some("ja".to_string()),
-            ..Default::default()
-        };
-
-        apply(&mut state, "", true, 0, None);
-        assert_eq!(state.current, "");
-        assert_eq!(state.sent_bytes, 0);
-        assert_eq!(state.language, None);
-        assert!(state.history.is_empty());
-    }
-
-    #[test]
-    fn same_sentence_id_is_not_pushed_twice() {
-        let mut state = SubtitleState::default();
-        apply_with_id(&mut state, "重复句。", true, Some("zh"), 1);
-        // 服务端重复下发同一句的最终结果（id 相同）→ 忽略
-        apply_with_id(&mut state, "重复句。", true, Some("zh"), 1);
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(state.history[0].text, "重复句。");
-    }
-
-    #[test]
-    fn translation_mode_builds_bilingual_line_on_sentence_end() {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(true);
-
-        // 源文事件：只刷新原文行与「已送翻译」前缀，不会落历史。
-        apply(&mut state, "今天下午", false, "今天".len(), Some("zh"));
-        assert_eq!(state.current, "今天下午");
-        assert_eq!(state.sent_bytes, "今天".len());
-        assert_eq!(state.source_language.as_deref(), Some("zh"));
-        assert!(state.history.is_empty());
-
-        // 译文分块到达：累积译文并按已送 TTS 前缀分色。
-        state.apply_translation(
-            "This afternoon",
-            "This".len(),
-            false,
-            "en".to_string(),
-            Some(7),
-        );
-        assert_eq!(state.current_translation, "This afternoon");
-        assert_eq!(state.translation_sent_bytes, "This".len());
-        assert_eq!(state.language.as_deref(), Some("en"));
-
-        // 句终：当前句以「原文 + 译文」双语落进历史。
-        state.apply_translation(
-            "This afternoon we go to the movies.",
-            999,
-            true,
-            "en".to_string(),
-            Some(7),
-        );
-        assert_eq!(state.history.len(), 1);
-        let line = &state.history[0];
-        assert_eq!(line.language, "en");
-        assert_eq!(line.text, "This afternoon we go to the movies.");
-        assert_eq!(line.source, "今天下午");
-        assert_eq!(line.source_language, "zh");
-        assert_eq!(line.sentence_id, Some(7));
-        assert!(state.current.is_empty());
-        assert!(state.current_translation.is_empty());
-        assert_eq!(state.language, None);
-        assert_eq!(state.source_language, None);
-    }
-
-    #[test]
-    fn translation_mode_same_sentence_id_is_not_pushed_twice() {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(true);
-        apply(&mut state, "重复句。", false, 0, Some("zh"));
-
-        state.apply_translation("Duplicate.", 0, true, "en".to_string(), Some(3));
-        state.apply_translation("Duplicate.", 0, true, "en".to_string(), Some(3));
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(state.history[0].text, "Duplicate.");
-    }
-
-    #[test]
-    fn translation_mode_typed_source_is_kept_as_bilingual_line() {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(true);
-
-        // 打字翻译路径：先把整句源文交给界面（已全部送翻译），再等译文句终。
-        apply(
-            &mut state,
-            "你好，世界。",
-            false,
-            "你好，世界。".len(),
-            Some("zh"),
-        );
-        state.apply_translation("Hello, world.", 0, true, "en".to_string(), None);
-
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(state.history[0].text, "Hello, world.");
-        assert_eq!(state.history[0].source, "你好，世界。");
-        assert_eq!(state.history[0].source_language, "zh");
-        assert_eq!(state.history[0].sentence_id, None);
-    }
-
-    #[test]
-    fn translation_mode_sentence_end_without_translation_clears_current() {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(true);
-        apply(&mut state, "翻译失败的句子。", false, 0, Some("zh"));
-
-        // 全部译文失败时只发一个空译文的句终事件：当前行清掉，不产生空历史行。
-        state.apply_translation("", 0, true, "en".to_string(), Some(9));
-        assert!(state.current.is_empty());
-        assert!(state.current_translation.is_empty());
-        assert!(state.history.is_empty());
-    }
-
-    #[test]
-    fn translation_mode_asr_sentence_end_does_not_finalize() {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(true);
-
-        // 即使 ASR 事件带了句终（正常路径不会），翻译模式也以 Translation 事件为准。
-        apply(&mut state, "先别收口。", true, 0, Some("zh"));
-        assert!(state.history.is_empty());
-        assert_eq!(state.current, "先别收口。");
-    }
-
-    #[test]
-    fn typed_sentence_goes_to_history_without_touching_current_or_dedup() {
-        let mut state = SubtitleState::default();
-        apply(&mut state, "识别中的半句", false, 0, None);
-
-        state.push_typed("打字输入的句子。".to_string(), "ja".to_string());
-        // 打字输入只进历史，不改当前正在修订的 ASR 句
-        assert_eq!(state.current, "识别中的半句");
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(state.history[0].language, "ja");
-
-        // 同一句输入两次是两次真实朗读，都要保留
-        state.push_typed("打字输入的句子。".to_string(), "ja".to_string());
-        assert_eq!(state.history.len(), 2);
-    }
-
-    #[test]
-    fn identical_sentences_with_different_ids_are_both_kept() {
-        let mut state = SubtitleState::default();
-        apply_with_id(&mut state, "同样的句。", true, Some("zh"), 1);
-        apply_with_id(&mut state, "同样的句。", true, Some("zh"), 2);
-        assert_eq!(state.history.len(), 2);
-        assert_eq!(state.history[0].text, "同样的句。");
-        assert_eq!(state.history[1].text, "同样的句。");
-    }
-
-    #[test]
-    fn history_is_capped() {
-        let mut state = SubtitleState::default();
-        for index in 0..=MAX_SUBTITLES {
-            apply(&mut state, &format!("第 {index} 句。"), true, 0, Some("zh"));
-        }
-
-        assert_eq!(state.history.len(), MAX_SUBTITLES);
-        assert_eq!(
-            state.history.first().map(|line| line.text.as_str()),
-            Some("第 1 句。")
-        );
-        assert_eq!(
-            state.history.last().map(|line| line.text.as_str()),
-            Some(format!("第 {MAX_SUBTITLES} 句。").as_str())
-        );
-    }
-
     #[test]
     fn config_signature_is_stable_across_instances() {
         // `custom_voices` 是 HashMap，两次解析的同内容配置 Debug 顺序可能不同；
@@ -1717,23 +1674,55 @@ rate = 1.0
 
     #[test]
     fn config_signature_detects_translate_changes_but_ignores_show_source() {
-        // 翻译开关/目标语言/模型/粒度影响运行期行为，必须计入指纹（D20 热重启依据）；
-        // show_source 只影响字幕渲染，不应触发重启。
+        // 两条线路的翻译开关/目标语言、共用模型与粒度影响运行期行为，必须计入指纹
+        // （D20 热重启依据）；show_source 只影响字幕渲染，不应触发重启。
         let toml = r#"
 [api]
 key = "sk-test"
 
-[translate]
-enabled = true
+[self]
+translate = true
 target = "en"
+
+[others]
+enabled = true
+translate = true
+target = "zh"
+
+[translate]
 show_source = true
 "#;
         let base = crate::config::AppConfig::from_toml_str(toml).unwrap();
-        let target_changed = crate::config::AppConfig::from_toml_str(
-            &toml.replace(r#"target = "en""#, r#"target = "ja""#),
+
+        let self_target_changed = crate::config::AppConfig::from_toml_str(
+            &toml.replace("target = \"en\"", "target = \"ja\""),
         )
         .unwrap();
-        assert_ne!(config_signature(&base), config_signature(&target_changed));
+        assert_ne!(
+            config_signature(&base),
+            config_signature(&self_target_changed),
+            "我方译文语言必须进指纹"
+        );
+
+        let others_lang_changed = crate::config::AppConfig::from_toml_str(
+            &toml.replace("target = \"zh\"", "target = \"en\""),
+        )
+        .unwrap();
+        assert_ne!(
+            config_signature(&base),
+            config_signature(&others_lang_changed),
+            "对方译文语言必须进指纹"
+        );
+
+        let others_enabled_changed = crate::config::AppConfig::from_toml_str(
+            &toml.replace("enabled = true", "enabled = false"),
+        )
+        .unwrap();
+        assert_ne!(
+            config_signature(&base),
+            config_signature(&others_enabled_changed),
+            "对方线路开关必须进指纹"
+        );
 
         let show_changed = crate::config::AppConfig::from_toml_str(
             &toml.replace("show_source = true", "show_source = false"),
@@ -1813,21 +1802,5 @@ hotwords = ["原神"]
             vec!["原神".to_string(), "Kaoet".to_string()]
         );
         assert!(parse("  \n\n").is_empty());
-    }
-
-    #[test]
-    fn reset_current_keeps_history() {
-        let mut state = SubtitleState::default();
-        apply(&mut state, "第一句。", true, 0, Some("zh"));
-        apply(&mut state, "第二句还没说完", false, 4, Some("zh"));
-
-        state.reset_current();
-
-        assert!(state.current.is_empty());
-        assert_eq!(state.sent_bytes, 0);
-        assert_eq!(state.language, None);
-        // 已结束的句子必须保留（停止/重启管线不清空字幕历史）
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(state.history[0].text, "第一句。");
     }
 }

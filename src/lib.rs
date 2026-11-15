@@ -2,7 +2,8 @@
 //!
 //! - 二进制入口：`src/main.rs`（GUI，见 docs/architecture.md）
 //! - 独立调试工具：`src/bin/admin.rs`（百炼音色/热词管理）、
-//!   `src/bin/vad_debug.rs`（VAD 调参：监听麦克风或重放录音，导出 raw/gated WAV 与逐块报告）
+//!   `src/bin/vad_debug.rs`（VAD 调参：监听麦克风或重放录音，导出 raw/gated WAV 与逐块报告）、
+//!   `src/bin/loopback_debug.rs`（进程环回采集调试：逐秒电平报告 + WAV）
 //!
 //! 本 crate 只支持 Windows，且只支持便携模式：所有可写文件都在 exe 同目录。
 
@@ -28,5 +29,5 @@ pub mod paths;
 pub mod pipeline;
 #[cfg(windows)]
 pub mod single_instance;
-pub mod subtitles;
+pub mod timeline;
 pub mod voice;

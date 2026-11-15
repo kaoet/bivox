@@ -145,7 +145,7 @@ mod tests {
         fs::write(&path, original).unwrap();
 
         let config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = false\n[vad]\nenabled = true\n",
+            "[api]\nkey = \"sk-test\"\n[self]\nmic = true\n[translate]\nshow_source = true\n[vad]\nenabled = true\n",
         )
         .unwrap();
         save(&path, original, &config).unwrap();
@@ -153,6 +153,7 @@ mod tests {
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("[api]"));
         assert!(written.contains("key = \"sk-test\""));
+        assert!(!written.contains("[self]"), "{written}");
         assert!(!written.contains("[translate]"), "{written}");
         assert!(!written.contains("[vad]"), "{written}");
 

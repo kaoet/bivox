@@ -26,7 +26,7 @@ use crate::client::qwen_asr::QwenAsrClient;
 use crate::client::qwen_mt::QwenMtClient;
 use crate::client::qwen_tts::{QwenTtsClient, QwenTtsConfig, TtsChunkRequest};
 use crate::config::{AppConfig, TranslateGranularity};
-use crate::events::{PipelineEvent, SessionState};
+use crate::events::{PipelineEvent, SessionState, Speaker};
 use crate::language::{LanguageTracker, canonical_language};
 use crate::pipeline::chunker::{ChunkPolicy, TextChunker};
 use crate::pipeline::translator::{self, TranslationDone, TranslationJob};
@@ -248,7 +248,7 @@ pub async fn run(
         let api_key = api_key.clone();
         let model = config.asr.model.clone();
         let ws_url = inference_ws_url.clone();
-        let language_hints = config.asr.languages.clone();
+        let language_hints = config.local.languages.clone();
         let vocabulary_id = hotwords.vocabulary_id.clone();
         let vad_enabled = config.vad.enabled;
         let vad_reset = handle.vad_reset_flag();
@@ -313,10 +313,12 @@ pub async fn run(
     // 翻译 worker：开启后 ASR/打字文本先经 MT 再送 TTS。目标语言与音色在会话内固定，
     // 运行中改配置由 D20 热重启处理；主循环只通过通道收发，不 await HTTP。
     let translate = config.translate.clone();
+    let translate_enabled = config.local.translate;
+    let translate_target = canonical_language(&config.local.target).to_string();
     let mut translation: Option<TranslationRuntime> = None;
     let mut rx_mt: Option<UnboundedReceiver<TranslationDone>> = None;
-    if translate.enabled {
-        let target = canonical_language(&translate.target).to_string();
+    if translate_enabled {
+        let target = translate_target.clone();
         let client = QwenMtClient::new(
             api_key.clone(),
             translate.model.clone(),
@@ -340,13 +342,13 @@ pub async fn run(
     // 调度中枢：ASR 事件 -> 句子级语言判定 -> 分块 -> 带 voice/语言推入 TTS；
     // 同时接收「打字输入」命令：排队朗读，不打断播放、不清空播放队列。
     // 翻译模式按粒度选更保守的切分策略；默认路径行为不变。
-    let chunker_policy = match (translate.enabled, translate.granularity) {
+    let chunker_policy = match (translate_enabled, translate.granularity) {
         (true, TranslateGranularity::Clause) => ChunkPolicy::translation_clause(),
         (true, TranslateGranularity::Sentence) => ChunkPolicy::translation_sentence(),
         (false, _) => ChunkPolicy::default(),
     };
     let mut chunker = TextChunker::with_policy(config.chunking.words, chunker_policy);
-    let mut language_state = SentenceLanguageState::new(config.asr.languages.clone());
+    let mut language_state = SentenceLanguageState::new(config.local.languages.clone());
     // 当前 TTS task 的语言（首个 chunk 送出时固定，task 结束后清空）。
     // TTS 每个 task 只认首 chunk 的 voice/language_hints，所以界面字幕语言必须用它，
     // 而不是后续 chunk 的语言判定结果（否则显示与实际合成不一致）。
@@ -408,7 +410,10 @@ pub async fn run(
                 let vad_active = handle.vad_active();
                 if vad_active != last_vad_active {
                     last_vad_active = vad_active;
-                    emit(PipelineEvent::VadActive(vad_active));
+                    emit(PipelineEvent::VadActive {
+                        speaker: Speaker::Local,
+                        active: vad_active,
+                    });
                 }
                 if handle.vad_degraded() && !vad_degraded_reported {
                     vad_degraded_reported = true;
@@ -450,6 +455,7 @@ pub async fn run(
                         // 旧句已有部分译文：先让界面把当前句归档，避免被下一句覆盖。
                         if !runtime.end_event_sent {
                             emit(PipelineEvent::Translation {
+                                speaker: Speaker::Local,
                                 text: runtime.translated.clone(),
                                 sent_bytes: runtime.translated.len(),
                                 is_sentence_end: true,
@@ -480,6 +486,7 @@ pub async fn run(
                         let source_language = language_state.typed_language(&text);
                         // 先把源文交给界面：译文回来之前就能看到原文行，句终仍由 Translation 收口。
                         emit(PipelineEvent::Asr {
+                            speaker: Speaker::Local,
                             text: text.clone(),
                             is_sentence_end: false,
                             sent_bytes: text.len(),
@@ -529,6 +536,7 @@ pub async fn run(
                             if prefix.is_empty() {
                                 // 一个字都还没送 TTS：当前行没有会被朗读的内容，直接清空。
                                 emit(PipelineEvent::Asr {
+                                    speaker: Speaker::Local,
                                     text: String::new(),
                                     is_sentence_end: true,
                                     sent_bytes: 0,
@@ -537,6 +545,7 @@ pub async fn run(
                                 });
                             } else {
                                 emit(PipelineEvent::Asr {
+                                    speaker: Speaker::Local,
                                     text: prefix.clone(),
                                     is_sentence_end: true,
                                     sent_bytes: prefix.len(),
@@ -639,6 +648,7 @@ pub async fn run(
                             chunker.emitted_byte_len(&source_text)
                         };
                         emit(PipelineEvent::Asr {
+                            speaker: Speaker::Local,
                             text: source_text,
                             is_sentence_end: false,
                             sent_bytes: sent,
@@ -670,6 +680,7 @@ pub async fn run(
                                 // 即使没有任何译文（例如全部翻译失败）也要收口当前句，
                                 // 否则界面上的源文行会一直挂着。
                                 emit(PipelineEvent::Translation {
+                                    speaker: Speaker::Local,
                                     text: runtime.translated.clone(),
                                     sent_bytes: runtime.translated.len(),
                                     is_sentence_end: true,
@@ -741,6 +752,7 @@ pub async fn run(
                     // 带上「已送入 TTS 的字节前缀」：界面把这段显示为正常色，其余显示为弱色；
                     // language 取当前 TTS task 实际使用的语言（首 chunk 决定），与实际合成严格一致。
                     emit(PipelineEvent::Asr {
+                        speaker: Speaker::Local,
                         text: event.text.clone(),
                         is_sentence_end: event.is_sentence_end,
                         sent_bytes: chunker.emitted_byte_len(&event.text),
@@ -759,7 +771,10 @@ pub async fn run(
                 let vad_active = handle.vad_active();
                 if vad_active != last_vad_active {
                     last_vad_active = vad_active;
-                    emit(PipelineEvent::VadActive(vad_active));
+                    emit(PipelineEvent::VadActive {
+                        speaker: Speaker::Local,
+                        active: vad_active,
+                    });
                 }
 
                 if handle.is_cancelled() {
@@ -808,6 +823,7 @@ pub async fn run(
                     runtime.tts_open = true;
                     runtime.tts_closed = done.is_sentence_end;
                     emit(PipelineEvent::Translation {
+                        speaker: Speaker::Local,
                         text: runtime.translated.clone(),
                         sent_bytes: runtime.translated.len(),
                         is_sentence_end: done.is_sentence_end,
@@ -829,6 +845,7 @@ pub async fn run(
                     }
                     runtime.tts_closed = true;
                     emit(PipelineEvent::Translation {
+                        speaker: Speaker::Local,
                         text: runtime.translated.clone(),
                         sent_bytes: runtime.translated.len(),
                         is_sentence_end: true,
@@ -855,6 +872,7 @@ pub async fn run(
                     }
                     if !runtime.end_event_sent {
                         emit(PipelineEvent::Translation {
+                            speaker: Speaker::Local,
                             text: runtime.translated.clone(),
                             sent_bytes: runtime.translated.len(),
                             is_sentence_end: true,

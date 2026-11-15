@@ -1,7 +1,7 @@
-//! VRChat 聊天框文本合成与截断（纯逻辑，D33）。
+//! VRChat 聊天框文本合成与截断（纯逻辑，D33/D39）。
 //!
-//! 输入是 [`SubtitleState`]（与 GUI 同一份字幕状态）与 `[vrchat.osc] display`，
-//! 输出要发给 `/chatbox/input` 的文本。这里不碰网络、不依赖时间，便于单测。
+//! 输入是某一条线路的 [`SpeakerView`]（与 GUI 同一份时间线状态里的我方投影）与
+//! `[vrchat.osc] display`，输出要发给 `/chatbox/input` 的文本。这里不碰网络、不依赖时间，便于单测。
 //!
 //! 截断规则（2026-11-09 实测后）：
 //! - VRChat 最多 144 个 UTF-16 码元 / 9 个**显示行**（包含自动换行）；
@@ -12,7 +12,7 @@
 //!   任一侧用不完时把额度借给另一侧，只有两侧都超过配额时才严格 5/4；
 
 use crate::config::VrchatDisplay;
-use crate::subtitles::SubtitleState;
+use crate::timeline::SpeakerView;
 
 /// VRChat ChatBox 的字符预算（按 UTF-16 码元计，最保守）。
 pub const CHATBOX_MAX_UTF16_UNITS: usize = 144;
@@ -37,26 +37,31 @@ pub enum ChatboxText {
     Keep,
 }
 
-/// 根据字幕状态与显示模式合成聊天框文本。
-pub fn compose(state: &SubtitleState, display: VrchatDisplay) -> ChatboxText {
-    if !state.translation_mode {
-        let text = if !state.current.is_empty() {
-            &state.current
-        } else if let Some(line) = state.history.last() {
-            &line.text
-        } else {
+/// 根据某条线路的时间线视图与显示模式合成聊天框文本。
+///
+/// 调用方传入 `timeline.speaker_view(Speaker::Local)`：聊天框只镜像我方。
+pub fn compose(view: &SpeakerView<'_>, display: VrchatDisplay) -> ChatboxText {
+    if !view.translation {
+        let text = view
+            .current
+            .map(|message| message.text.as_str())
+            .filter(|text| !text.is_empty())
+            .or_else(|| view.last.map(|message| message.text.as_str()))
+            .unwrap_or_default();
+        if text.is_empty() {
             return ChatboxText::Keep;
-        };
+        }
         return text_or_keep(fit_single(text));
     }
 
-    let has_current = !state.current.is_empty() || !state.current_translation.is_empty();
-    let (source, translation) = if has_current {
-        (state.current.as_str(), state.current_translation.as_str())
-    } else if let Some(line) = state.history.last() {
-        (line.source.as_str(), line.text.as_str())
-    } else {
-        return ChatboxText::Keep;
+    let (source, translation) = match view.current {
+        Some(current) if !current.text.is_empty() || !current.source.is_empty() => {
+            (current.source.as_str(), current.text.as_str())
+        }
+        _ => match view.last {
+            Some(last) => (last.source.as_str(), last.text.as_str()),
+            None => return ChatboxText::Keep,
+        },
     };
 
     let text = match display {
@@ -345,17 +350,8 @@ fn tail_utf16(text: &str, max_units: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subtitles::{SubtitleLine, SubtitleState};
-
-    fn line(text: &str, source: &str) -> SubtitleLine {
-        SubtitleLine {
-            language: "en".to_string(),
-            text: text.to_string(),
-            source: source.to_string(),
-            source_language: "zh".to_string(),
-            sentence_id: None,
-        }
-    }
+    use crate::events::Speaker;
+    use crate::timeline::Timeline;
 
     #[test]
     fn truncate_keeps_tail_and_prefixes_ellipsis() {
@@ -534,51 +530,84 @@ mod tests {
 
     #[test]
     fn compose_prefers_current_then_last_history() {
-        let mut state = SubtitleState::default();
-        assert_eq!(compose(&state, VrchatDisplay::Source), ChatboxText::Keep);
-
-        state.history.push(line("旧句。", ""));
+        let mut timeline = Timeline::default();
         assert_eq!(
-            compose(&state, VrchatDisplay::Source),
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Source
+            ),
+            ChatboxText::Keep
+        );
+
+        timeline.push_typed("旧句。".to_string(), "zh".to_string());
+        assert_eq!(
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Source
+            ),
             ChatboxText::Text("旧句。".to_string())
         );
 
-        state.current = "当前句。".to_string();
+        timeline.apply_asr(Speaker::Local, "当前句。", false, 0, None, None);
         assert_eq!(
-            compose(&state, VrchatDisplay::Source),
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Source
+            ),
             ChatboxText::Text("当前句。".to_string())
         );
     }
 
     #[test]
     fn compose_translation_modes() {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(true);
-        state.current = "源文".to_string();
-        state.current_translation = "translation".to_string();
+        let mut timeline = Timeline::default();
+        timeline.set_translation(Speaker::Local, true);
+        timeline.apply_asr(Speaker::Local, "源文", false, 0, None, None);
 
+        // 译文还没到：只显示译文时保持现状，双语录只有原文。
         assert_eq!(
-            compose(&state, VrchatDisplay::Source),
-            ChatboxText::Text("源文".to_string())
-        );
-        assert_eq!(
-            compose(&state, VrchatDisplay::Translation),
-            ChatboxText::Text("translation".to_string())
-        );
-        assert_eq!(
-            compose(&state, VrchatDisplay::Bilingual),
-            ChatboxText::Text("translation\n源文".to_string())
-        );
-
-        // 只显示译文且译文未到：不要回退显示原文。
-        state.current_translation.clear();
-        assert_eq!(
-            compose(&state, VrchatDisplay::Translation),
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Translation
+            ),
             ChatboxText::Keep
         );
         assert_eq!(
-            compose(&state, VrchatDisplay::Bilingual),
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Bilingual
+            ),
             ChatboxText::Text("源文".to_string())
+        );
+
+        timeline.apply_translation(
+            Speaker::Local,
+            "translation",
+            0,
+            false,
+            "en".to_string(),
+            None,
+        );
+        assert_eq!(
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Source
+            ),
+            ChatboxText::Text("源文".to_string())
+        );
+        assert_eq!(
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Translation
+            ),
+            ChatboxText::Text("translation".to_string())
+        );
+        assert_eq!(
+            compose(
+                &timeline.speaker_view(Speaker::Local),
+                VrchatDisplay::Bilingual
+            ),
+            ChatboxText::Text("translation\n源文".to_string())
         );
     }
 

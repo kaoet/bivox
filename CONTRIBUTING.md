@@ -163,7 +163,7 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 ```bash
 cargo fmt              # 1. 格式化整个项目（不是只格式化本次改动的文件）
 cargo fmt --check      # 2. 退出码必须为 0
-cargo build --bins     # 3. 三个 bin 都要编译通过
+cargo build --bins     # 3. 全部 bin 都要编译通过
 cargo test             # 4. 全部测试通过
 git diff --check       # 5. 无空白符错误
 git add -A
@@ -200,6 +200,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 ### 配置与便携模式
 
 - `config.toml` 是唯一配置事实源；GUI 覆盖全部字段，修改 `AppConfig` 后整体写回，只序列化非默认值。
+- **新增/修改配置字段时必须同时提供 GUI 编辑入口**（D3）：不允许只存在于 `config.toml`、只能手改的字段；字段归哪个页签见 D22/D27/D32/D38。
 - 写回流程：读原文件 → 解析为 `AppConfig` → 类型化修改 → 校验磁盘原配置和新文本 → 备份 `config.toml.bak` → 写盘；无改动不写盘。
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
 - 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `kaols.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
@@ -346,3 +347,27 @@ cargo run --release --bin vad_debug -- --list-devices
 - `--replay` 只接受 16kHz / 单声道 / PCM16 WAV（本工具产出的 `raw.wav` 即可）；同目录有 `chunks.txt` 时按原始切块边界重放，没有则按固定 100ms；
 - 录音按 `--seconds` 录满自动收尾（数据在内存里缓冲，结束时统一落盘）；直接 Ctrl+C 会丢弃本次录音；
 - 输出目录默认 `target\vad-debug\`（已被 gitignore），`--out` 可指定；不修改生产 VAD 算法与配置 schema。
+
+---
+
+## 11. 进程环回采集调试（`loopback_debug`）
+
+`loopback_debug` 用于确认「对方语音」这条采集链路是否真的抓到了声音：它直接对某个进程树做 WASAPI 进程环回（D36），逐秒打印电平，可选导出 WAV。不随发布包分发，不联网、不需要 API Key。
+
+```bash
+# 抓 VRChat 10 秒（VRChat.exe 必须真的在出声）
+cargo run --release --bin loopback_debug -- --process VRChat.exe --seconds 10
+
+# 指定 PID，并导出 WAV 供二次确认
+cargo run --release --bin loopback_debug -- --pid 12345 --seconds 15 --wav target\vrchat-loopback.wav
+
+# 抓任意进程（例如浏览器）验证采集链路本身
+cargo run --release --bin loopback_debug -- --process chrome.exe --seconds 5
+```
+
+输出：每秒一行 `RMS / 峰值 dBFS` 与电平条；结束打印总块数、静音块数、最大 RMS 与目标进程是否仍在运行。
+
+- 每块固定 100ms / 16 kHz / 单声道 PCM16，安静期由采集层补零（与线上一致），因此「静音块」（峰值低于 −80 dBFS）占多数是正常的；
+- 全程 RMS 都在 −60 dBFS 以下，说明目标进程没有出声，或进程名/ PID 选错了；
+- 需要 Windows 10 2004（build 19041）及以上；激活失败、进程退出、音频不连续、下游积压都会中止本次采集并打印错误链；
+- 采集逻辑在 `src/audio/process_loopback.rs`、`src/audio/process_capture.rs`，bin 只做参数解析、电平统计与 WAV 导出。

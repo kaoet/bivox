@@ -5,8 +5,11 @@
 
 pub mod asr_tab;
 pub mod audio_tab;
+pub mod language_list;
 pub mod log_panel;
+pub mod others_tab;
 pub mod realtime_tab;
+pub mod self_tab;
 pub mod settings_tab;
 pub mod toolbar;
 pub mod translate_tab;

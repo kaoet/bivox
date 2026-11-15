@@ -1,14 +1,16 @@
-//! VRChat 页：OSC 聊天框开关、端口、显示模式与发送测试消息（D33）。
+//! VRChat 页：对方语音的采集目标（`[vrchat] process`）与 OSC 聊天框（D33/D38）。
 //!
-//! 所有改动立即写回 `[vrchat.osc]`，不进配置指纹、不重启实时管线；
-//! 页面刻意保持精简：没有状态行、typing 说明或隐私提示。
+//! 两种写回语义共存，页面内分开写：
+//! - `process` 是文本框 + 「应用」：它进配置指纹，改了会按 D20 重启实时管线；
+//! - OSC 开关/端口/显示模式是改值即保存、不重启（`ChatboxService` 通过 watch 实时读取）。
 
 use eframe::egui;
 
 use crate::app::{KaolsApp, Tab};
-use crate::config::{VrchatDisplay, VrchatOscConfig};
+use crate::config::{DEFAULT_VRCHAT_PROCESS, VrchatDisplay, VrchatOscConfig};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 fn current(app: &KaolsApp) -> VrchatOscConfig {
     app.config.vrchat.osc.clone()
@@ -24,14 +26,58 @@ fn display_label(display: VrchatDisplay) -> &'static str {
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.heading("VRChat");
-    ui.label(egui::RichText::new("把实时字幕发送到 VRChat 的 OSC 聊天框。").weak());
+    ui.label(
+        egui::RichText::new("对方语音从本机哪个进程采集，以及字幕要不要发到 VRChat 聊天框。")
+            .weak(),
+    );
     if let Some(error) = app.config_write_error_for(Tab::Vrchat) {
         ui.colored_label(RED, format!("保存失败：{error}"));
     }
     ui.add_space(8.0);
 
-    let configured = current(app);
+    show_process(app, ui);
+    ui.separator();
+    show_osc(app, ui);
+}
 
+/// 对方语音的采集目标：文本框 + 「应用」（运行中应用会重启实时管线）。
+fn show_process(app: &mut KaolsApp, ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("对方语音").strong());
+    ui.horizontal(|ui| {
+        ui.label("监听进程");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.vrchat_process)
+                .desired_width(220.0)
+                .hint_text(DEFAULT_VRCHAT_PROCESS),
+        );
+        let dirty = app.vrchat_process.trim() != app.config.vrchat.process.as_str();
+        let can_apply = dirty && !app.vrchat_process.trim().is_empty();
+        if ui
+            .add_enabled(can_apply, egui::Button::new("应用"))
+            .clicked()
+        {
+            app.save_vrchat_process();
+        }
+        if dirty {
+            ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "按 exe 文件名匹配进程树（进程环回，D36）。运行中应用会重启实时管线；\
+             进程不在时只告警并自动重连，不会中断会话。",
+        )
+        .weak(),
+    );
+    ui.add_space(8.0);
+}
+
+/// OSC 聊天框设置：改值即保存、不重启实时管线。
+fn show_osc(app: &mut KaolsApp, ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("OSC 聊天框").strong());
+    ui.label(egui::RichText::new("把实时字幕发送到 VRChat 的 OSC 聊天框。").weak());
+
+    let configured = current(app);
     let mut enabled = configured.enabled;
     let mut port = configured.port;
     let mut display = configured.display;

@@ -8,7 +8,7 @@
 
 1. [`CONTRIBUTING.md`](CONTRIBUTING.md) —— 强制门禁、代码/注释规范、测试、文档维护、发布流程；
 2. [`docs/architecture.md`](docs/architecture.md) —— 模块划分、数据流、关键算法与边界；
-3. [`docs/decisions.md`](docs/decisions.md) —— `D1`–`D35` 设计决定；改动涉及这些约束时逐条对照；
+3. [`docs/decisions.md`](docs/decisions.md) —— 稳定编号的 `D<n>` 设计决定（只追加、不重排）；改动涉及这些约束时逐条对照；
 4. 涉及用户可见行为时读 [`README.md`](README.md)；涉及配置字段时读 [`src/config.rs`](src/config.rs) 的字段注释、`Default` 实现与 `validate`；
 5. 具体源码模块顶部的 `//!` 文档注释。
 
@@ -40,6 +40,7 @@
 
 - **配置不做向后兼容**：`config.toml` 的字段/段落变更时直接替换旧 schema，不保留废弃字段、别名或迁移代码。
 - 原因：项目尚未正式发布，目前只有作者本人在用，不存在外部配置兼容负担；发布后是否调整此约定需另行决定。
+- **新增/修改配置字段必须同时提供 GUI 编辑入口**（D3）：不允许只存在于 `config.toml`、只能手改的字段；字段归属哪个页签见 D22/D27/D32/D38。
 - 不编写兼容/迁移测试；也不在代码、README、文档里写「不兼容旧配置」「旧字段已废弃」「请迁移」之类的说明，配置文档只描述**当前** schema。
 - 旧配置按当前 schema 解析，出现未知字段就沿用现有校验直接报错，无需额外提示或迁移路径。
 

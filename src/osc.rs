@@ -1,7 +1,7 @@
-//! VRChat OSC 聊天框后台服务（D33）。
+//! VRChat OSC 聊天框后台服务（D33/D39）。
 //!
 //! 独立于 GUI 重绘：会话把 `PipelineEvent` 克隆一份发到这里，本任务维护自己的
-//! [`SubtitleState`]、1 秒文本节流、typing 跳变和显式清空。
+//! [`Timeline`]（只取我方投影）、1 秒文本节流、typing 跳变和显式清空。
 //!
 //! 关键约束（2026-11-08 实测）：
 //! - `/chatbox/input` 文本最多 1 条/秒；900ms 长跑会跳字；
@@ -17,8 +17,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::chatbox::{self, ChatboxText};
 use crate::config::{AppConfig, VrchatDisplay};
-use crate::events::{PipelineEvent, SessionState};
-use crate::subtitles::SubtitleState;
+use crate::events::{PipelineEvent, SessionState, Speaker};
+use crate::timeline::Timeline;
 
 /// 两次文本发送之间的最小间隔（实测 1000ms 稳定，900ms 长跑跳字）。
 pub const CHATBOX_TEXT_INTERVAL: Duration = Duration::from_secs(1);
@@ -41,7 +41,7 @@ impl ChatboxSettings {
             enabled: config.vrchat.osc.enabled,
             port: config.vrchat.osc.port,
             display: config.vrchat.osc.display,
-            translate_enabled: config.translate.enabled,
+            translate_enabled: config.local.translate,
         }
     }
 }
@@ -154,7 +154,8 @@ async fn run(
 struct Runtime {
     settings: ChatboxSettings,
     sender: ChatboxSender,
-    state: SubtitleState,
+    /// 与我方线路同一套时间线；聊天框只镜像我方（D33/D39）。
+    timeline: Timeline,
     session_active: bool,
     last_sent_text: String,
     last_text_sent_at: Option<Instant>,
@@ -163,13 +164,13 @@ struct Runtime {
 
 impl Runtime {
     fn new(settings: ChatboxSettings) -> Self {
-        let mut state = SubtitleState::default();
-        state.set_translation_mode(settings.translate_enabled);
+        let mut timeline = Timeline::default();
+        timeline.set_translation(Speaker::Local, settings.translate_enabled);
         let sender = ChatboxSender::new(settings.port);
         Self {
             settings,
             sender,
-            state,
+            timeline,
             session_active: false,
             last_sent_text: String::new(),
             last_text_sent_at: None,
@@ -203,9 +204,9 @@ impl Runtime {
         match event {
             PipelineEvent::StateChanged(SessionState::Running) => {
                 self.session_active = true;
-                self.state = SubtitleState::default();
-                self.state
-                    .set_translation_mode(self.settings.translate_enabled);
+                self.timeline = Timeline::default();
+                self.timeline
+                    .set_translation(Speaker::Local, self.settings.translate_enabled);
                 self.last_sent_text.clear();
                 self.last_text_sent_at = None;
                 self.typing_sent = false;
@@ -218,7 +219,7 @@ impl Runtime {
             }
             PipelineEvent::StateChanged(SessionState::Idle | SessionState::Failed) => {
                 self.session_active = false;
-                self.state = SubtitleState::default();
+                self.timeline = Timeline::default();
                 if self.settings.enabled {
                     self.clear(now);
                 } else {
@@ -229,15 +230,26 @@ impl Runtime {
             }
             PipelineEvent::StateChanged(_) => {}
             PipelineEvent::Asr {
+                speaker,
                 text,
                 is_sentence_end,
                 sent_bytes,
                 language,
                 sentence_id,
             } => {
+                // 只镜像我方；他人线路的文本不进聊天框（D39）。
+                if speaker != Speaker::Local {
+                    return;
+                }
                 let had_current = self.has_current();
-                self.state
-                    .apply_asr(&text, is_sentence_end, sent_bytes, language, sentence_id);
+                self.timeline.apply_asr(
+                    speaker,
+                    &text,
+                    is_sentence_end,
+                    sent_bytes,
+                    language,
+                    sentence_id,
+                );
                 if !had_current && self.has_current() {
                     // 新的一段显示：允许同样的文本再次显示（上一段可能已自然过期）。
                     self.last_sent_text.clear();
@@ -245,14 +257,19 @@ impl Runtime {
                 self.tick(now);
             }
             PipelineEvent::Translation {
+                speaker,
                 text,
                 sent_bytes,
                 is_sentence_end,
                 language,
                 sentence_id,
             } => {
+                if speaker != Speaker::Local {
+                    return;
+                }
                 let had_current = self.has_current();
-                self.state.apply_translation(
+                self.timeline.apply_translation(
+                    speaker,
                     &text,
                     sent_bytes,
                     is_sentence_end,
@@ -265,13 +282,13 @@ impl Runtime {
                 self.tick(now);
             }
             PipelineEvent::TypedSentence { text, language } => {
-                self.state.push_typed(text, language);
+                self.timeline.push_typed(text, language);
                 self.last_sent_text.clear();
                 self.tick(now);
             }
             PipelineEvent::Devices { .. }
             | PipelineEvent::VoiceInfo { .. }
-            | PipelineEvent::VadActive(_)
+            | PipelineEvent::VadActive { .. }
             | PipelineEvent::Warning { .. }
             | PipelineEvent::Error { .. } => {}
         }
@@ -297,8 +314,10 @@ impl Runtime {
             self.typing_sent = current_exists;
         }
 
-        let ChatboxText::Text(desired) = chatbox::compose(&self.state, self.settings.display)
-        else {
+        let ChatboxText::Text(desired) = chatbox::compose(
+            &self.timeline.speaker_view(Speaker::Local),
+            self.settings.display,
+        ) else {
             return;
         };
 
@@ -340,7 +359,10 @@ impl Runtime {
     }
 
     fn has_current(&self) -> bool {
-        !self.state.current.is_empty() || !self.state.current_translation.is_empty()
+        self.timeline
+            .speaker_view(Speaker::Local)
+            .current
+            .is_some_and(|message| !message.text.is_empty() || !message.source.is_empty())
     }
 }
 
@@ -460,7 +482,7 @@ mod tests {
         config.vrchat.osc.enabled = true;
         config.vrchat.osc.port = 9100;
         config.vrchat.osc.display = VrchatDisplay::Translation;
-        config.translate.enabled = true;
+        config.local.translate = true;
         let settings = ChatboxSettings::from_config(&config);
         assert!(settings.enabled);
         assert_eq!(settings.port, 9100);
@@ -518,6 +540,7 @@ mod tests {
 
     fn asr_event(text: &str) -> PipelineEvent {
         PipelineEvent::Asr {
+            speaker: Speaker::Local,
             text: text.to_string(),
             is_sentence_end: false,
             sent_bytes: 0,

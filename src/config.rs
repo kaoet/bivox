@@ -21,7 +21,7 @@ pub const DEFAULT_WORKSPACE_HOST: &str = "dashscope.aliyuncs.com";
 /// 实时识别模型默认值。
 pub const DEFAULT_ASR_MODEL: &str = "qwen-audio-3.1-asr-flash-streaming";
 
-/// 识别语言列表默认值（用户保证只会说其中一种；首个为默认）。
+/// 识别语言列表默认值（有序，首个为默认；`[self]` 与 `[others]` 共用这个默认值）。
 pub const DEFAULT_ASR_LANGUAGE: &str = "zh";
 
 /// 合成模型默认值（Qwen-Audio-3.1-TTS-Flash，低延迟实时语音合成）。
@@ -77,14 +77,20 @@ pub const DEFAULT_CHUNK_WORDS: usize = 6;
 /// 翻译模型默认值（qwen-mt-flash：低延迟文本翻译，支持 92 种语言互译）。
 pub const DEFAULT_TRANSLATE_MODEL: &str = "qwen-mt-flash";
 
-/// 翻译目标语言默认值（英语）。
-pub const DEFAULT_TRANSLATE_TARGET: &str = "en";
+/// 我方译文语言的默认值（英语）：`[self] target`。
+pub const DEFAULT_SELF_TARGET: &str = "en";
+
+/// 对方译文语言的默认值（中文）：`[others] target`。
+pub const DEFAULT_OTHERS_TARGET: &str = "zh";
 
 /// 默认翻译粒度：标点/句终即翻（低延迟，可能翻碎句）。
 pub const DEFAULT_TRANSLATE_GRANULARITY: TranslateGranularity = TranslateGranularity::Clause;
 
 /// 默认 VRChat OSC 接收端口（VRChat 的默认 inPort）。
 pub const DEFAULT_VRCHAT_OSC_PORT: u16 = 9000;
+
+/// 对方线路默认监听的目标进程（VRChat 的 exe 文件名）。
+pub const DEFAULT_VRCHAT_PROCESS: &str = "VRChat.exe";
 
 /// 应用配置，对应 `config.toml` 的顶层结构。
 ///
@@ -99,6 +105,13 @@ pub struct AppConfig {
     pub tts: TtsConfig,
     pub cache: CacheConfig,
     pub translate: TranslateConfig,
+    /// `[self]`：我方线路（麦克风 + 打字输入）。
+    ///
+    /// TOML 段名用 `self`，Rust 字段用 `local`（`self` 是关键字）。
+    #[serde(rename = "self")]
+    pub local: LocalConfig,
+    /// `[others]`：对方线路（侦听本机另一个进程的音频输出，D36）。
+    pub others: OthersConfig,
     pub vrchat: VrchatConfig,
     pub audio: AudioConfig,
     pub vad: VadConfig,
@@ -136,23 +149,18 @@ impl Default for ApiConfig {
     }
 }
 
-/// `[asr]`：实时语音识别。
+/// `[asr]`：实时语音识别中**两条线路共用**的部分。
+///
+/// 语言列表不在这里：每条线路各有一份（`[self] languages` / `[others] languages`）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrConfig {
-    /// 实时识别模型 ID；必须非空。
+    /// 实时识别模型 ID；必须非空。我方与对方线路共用。
     ///
     /// 更换模型会改变预编译热词列表的归属。
     pub model: String,
 
-    /// 有序语言列表，首项为默认语言。
-    ///
-    /// - 只列一种 = 强提示只按该语言识别；
-    /// - 语言判定以完整列表为范围，整份列表作为 ASR 的 `language_hints`；
-    /// - 取值见 [`language::ASR_LANGUAGES`]；不能为空、不能重复，归一化去空白并转小写。
-    pub languages: Vec<String>,
-
-    /// 预编译热词列表，空 = 不使用热词。
+    /// 预编译热词列表，空 = 不使用热词。我方与对方线路共用一个词表。
     ///
     /// 词条丢弃空项、去重保序；权重固定 50（超级热词）；最多
     /// [`MAX_ASR_HOTWORDS`] 条；单条含非 ASCII 字符时 ≤ [`MAX_HOTWORD_CHARS`]
@@ -165,7 +173,6 @@ impl Default for AsrConfig {
     fn default() -> Self {
         Self {
             model: DEFAULT_ASR_MODEL.to_string(),
-            languages: vec![DEFAULT_ASR_LANGUAGE.to_string()],
             hotwords: Vec::new(),
         }
     }
@@ -245,36 +252,26 @@ impl TranslateGranularity {
     }
 }
 
-/// `[translate]`：翻译模式。
+/// `[translate]`：两条线路**共用**的翻译设置。
 ///
-/// 开启后输入先翻成 `target` 语言，再交给 TTS 合成并以字幕显示；
-/// 关闭时走原有识别/合成链路。运行期行为见 docs/architecture.md §15。
+/// 每条线路是否翻译、译成什么语言在 `[self] translate/target` 与
+/// `[others] translate/target`；这里只保留共用的模型与粒度。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranslateConfig {
-    /// 是否启用翻译模式；关闭时走原有识别/合成链路。
-    pub enabled: bool,
-
-    /// 目标语言代码，必须是 [`language::TRANSLATION_LANGUAGES`] 之一。
-    ///
-    /// 启用翻译时校验；别名会归一（如 `tl` → `fil`），不能为空。
-    pub target: String,
-
     /// 翻译模型 ID；必须非空。
     pub model: String,
 
     /// 翻译粒度，取值见 [`TranslateGranularity`]。
     pub granularity: TranslateGranularity,
 
-    /// 字幕是否同时显示原文；只影响渲染，不触发会话重启。
+    /// 字幕/气泡是否同时显示原文；只影响渲染，不触发会话重启。
     pub show_source: bool,
 }
 
 impl Default for TranslateConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            target: DEFAULT_TRANSLATE_TARGET.to_string(),
             model: DEFAULT_TRANSLATE_MODEL.to_string(),
             granularity: DEFAULT_TRANSLATE_GRANULARITY,
             show_source: true,
@@ -282,11 +279,99 @@ impl Default for TranslateConfig {
     }
 }
 
-/// `[vrchat]`：VRChat 相关功能的父段（预留给以后的 avatar 等功能）。
-#[derive(Debug, Clone, Deserialize, Default)]
+/// `[self]`：我方线路——麦克风采集与打字输入。
+///
+/// 这条线路没有总开关：`mic` / `tts` / `[vrchat.osc] enabled` 各自控制一个能力；
+/// 三者都关时仍然可以打字上屏。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalConfig {
+    /// 是否采集麦克风；关闭后只能用打字输入（不采集、不上传，也不启动本地 VAD）。
+    pub mic: bool,
+
+    /// 有序语言列表，首项为默认语言。
+    ///
+    /// - 只列一种 = 强提示只按该语言识别；
+    /// - 语言判定以完整列表为范围，整份列表作为本方 ASR 的 `language_hints`；
+    /// - 打字输入的语言判定也用它；
+    /// - 取值见 [`language::ASR_LANGUAGES`]；不能为空、不能重复，归一化去空白并转小写。
+    pub languages: Vec<String>,
+
+    /// 是否把我方文本翻译成 [`Self::target`]；关闭时原文直接送 TTS / OSC / 字幕。
+    pub translate: bool,
+
+    /// 我方译文语言代码，必须是 [`language::TRANSLATION_LANGUAGES`] 之一。
+    ///
+    /// 启用翻译时校验；别名会归一（如 `tl` → `fil`），不能为空。
+    pub target: String,
+
+    /// 是否把我方文本合成语音；关闭时不解析音色、不建 TTS，只上屏（可继续发 OSC）。
+    pub tts: bool,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            mic: true,
+            languages: vec![DEFAULT_ASR_LANGUAGE.to_string()],
+            translate: false,
+            target: DEFAULT_SELF_TARGET.to_string(),
+            tts: true,
+        }
+    }
+}
+
+/// `[others]`：对方线路——侦听 `[vrchat] process` 的音频输出（D36）。
+///
+/// 这条线路只上屏：不写 OSC、不做 TTS；目标进程不可达按临时错误处理。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OthersConfig {
+    /// 是否启用对方线路；关闭时不采集进程音频、不建第二条 ASR 连接。
+    pub enabled: bool,
+
+    /// 对方语言列表，语义与 [`LocalConfig::languages`] 相同，用于对方线路的 ASR。
+    pub languages: Vec<String>,
+
+    /// 是否把对方文本翻译成 [`Self::target`]；关闭时只显示原文。
+    pub translate: bool,
+
+    /// 对方译文语言代码，必须是 [`language::TRANSLATION_LANGUAGES`] 之一。
+    ///
+    /// 启用翻译时校验；别名会归一，不能为空。
+    pub target: String,
+}
+
+impl Default for OthersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            languages: vec![DEFAULT_ASR_LANGUAGE.to_string()],
+            translate: false,
+            target: DEFAULT_OTHERS_TARGET.to_string(),
+        }
+    }
+}
+
+/// `[vrchat]`：VRChat 相关设置。
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VrchatConfig {
+    /// 对方线路要侦听的进程（exe 文件名，含其子进程，见 D36）；不能为空。
+    ///
+    /// 进程不在时按临时错误处理：界面告警 + 自动重连，不算会话失败。
+    pub process: String,
+
     pub osc: VrchatOscConfig,
+}
+
+impl Default for VrchatConfig {
+    fn default() -> Self {
+        Self {
+            process: DEFAULT_VRCHAT_PROCESS.to_string(),
+            osc: VrchatOscConfig::default(),
+        }
+    }
 }
 
 /// `[vrchat.osc]`：OSC 聊天框输出。
@@ -530,13 +615,58 @@ impl AppConfig {
         if self.asr.model != default.asr.model {
             asr.insert("model".to_string(), Value::String(self.asr.model.clone()));
         }
-        if self.asr.languages != default.asr.languages {
-            asr.insert("languages".to_string(), string_array(&self.asr.languages));
-        }
         if !self.asr.hotwords.is_empty() {
             asr.insert("hotwords".to_string(), string_array(&self.asr.hotwords));
         }
         insert_table(&mut root, "asr", asr);
+
+        let mut local = Table::new();
+        if self.local.mic != default.local.mic {
+            local.insert("mic".to_string(), Value::Boolean(self.local.mic));
+        }
+        if self.local.languages != default.local.languages {
+            local.insert("languages".to_string(), string_array(&self.local.languages));
+        }
+        if self.local.translate != default.local.translate {
+            local.insert(
+                "translate".to_string(),
+                Value::Boolean(self.local.translate),
+            );
+        }
+        if self.local.target != default.local.target {
+            local.insert(
+                "target".to_string(),
+                Value::String(self.local.target.clone()),
+            );
+        }
+        if self.local.tts != default.local.tts {
+            local.insert("tts".to_string(), Value::Boolean(self.local.tts));
+        }
+        insert_table(&mut root, "self", local);
+
+        let mut others = Table::new();
+        if self.others.enabled != default.others.enabled {
+            others.insert("enabled".to_string(), Value::Boolean(self.others.enabled));
+        }
+        if self.others.languages != default.others.languages {
+            others.insert(
+                "languages".to_string(),
+                string_array(&self.others.languages),
+            );
+        }
+        if self.others.translate != default.others.translate {
+            others.insert(
+                "translate".to_string(),
+                Value::Boolean(self.others.translate),
+            );
+        }
+        if self.others.target != default.others.target {
+            others.insert(
+                "target".to_string(),
+                Value::String(self.others.target.clone()),
+            );
+        }
+        insert_table(&mut root, "others", others);
 
         let mut tts = Table::new();
         if self.tts.model != default.tts.model {
@@ -638,18 +768,6 @@ impl AppConfig {
         insert_table(&mut root, "chunking", chunking);
 
         let mut translate = Table::new();
-        if self.translate.enabled != default.translate.enabled {
-            translate.insert(
-                "enabled".to_string(),
-                Value::Boolean(self.translate.enabled),
-            );
-        }
-        if self.translate.target != default.translate.target {
-            translate.insert(
-                "target".to_string(),
-                Value::String(self.translate.target.clone()),
-            );
-        }
         if self.translate.model != default.translate.model {
             translate.insert(
                 "model".to_string(),
@@ -670,6 +788,13 @@ impl AppConfig {
         }
         insert_table(&mut root, "translate", translate);
 
+        let mut vrchat = Table::new();
+        if self.vrchat.process != default.vrchat.process {
+            vrchat.insert(
+                "process".to_string(),
+                Value::String(self.vrchat.process.clone()),
+            );
+        }
         let mut osc = Table::new();
         if self.vrchat.osc.enabled != default.vrchat.osc.enabled {
             osc.insert(
@@ -690,10 +815,9 @@ impl AppConfig {
             );
         }
         if !osc.is_empty() {
-            let mut vrchat = Table::new();
             vrchat.insert("osc".to_string(), Value::Table(osc));
-            root.insert("vrchat".to_string(), Value::Table(vrchat));
         }
+        insert_table(&mut root, "vrchat", vrchat);
 
         root
     }
@@ -706,20 +830,16 @@ impl AppConfig {
         self.api.key = trim_optional(self.api.key.take());
         self.api.workspace_host = self.api.workspace_host.trim().to_string();
         self.asr.model = self.asr.model.trim().to_string();
-        self.asr.languages = self
-            .asr
-            .languages
-            .iter()
-            .map(|language| language.trim().to_lowercase())
-            .collect();
         self.asr.hotwords = normalize_hotwords(&self.asr.hotwords);
         self.tts.model = self.tts.model.trim().to_string();
         self.tts.voice = self.tts.voice.trim().to_string();
         self.tts.dialect = self.tts.dialect.trim().to_string();
-        self.translate.target =
-            language::canonical_language(self.translate.target.trim().to_lowercase().as_str())
-                .to_string();
+        normalize_languages(&mut self.local.languages);
+        normalize_target(&mut self.local.target);
+        normalize_languages(&mut self.others.languages);
+        normalize_target(&mut self.others.target);
         self.translate.model = self.translate.model.trim().to_string();
+        self.vrchat.process = self.vrchat.process.trim().to_string();
         self.audio.input_device = trim_optional(self.audio.input_device.take());
         self.audio.output_device = trim_optional(self.audio.output_device.take());
         for custom in self.tts.custom_voices.values_mut() {
@@ -742,8 +862,15 @@ impl AppConfig {
         if self.asr.model.is_empty() {
             bail!("配置项 [asr] model 不能为空");
         }
-        self.validate_asr_languages()?;
         validate_hotwords(&self.asr.hotwords)?;
+        validate_languages(&self.local.languages, "[self] languages")?;
+        validate_target(&self.local.target, self.local.translate, "[self] target")?;
+        validate_languages(&self.others.languages, "[others] languages")?;
+        validate_target(
+            &self.others.target,
+            self.others.translate,
+            "[others] target",
+        )?;
         if self.tts.model.is_empty() {
             bail!("配置项 [tts] model 不能为空");
         }
@@ -778,27 +905,6 @@ impl AppConfig {
         if self.vad.tail_ms > 5_000 {
             bail!("配置项 [vad] tail_ms 不能超过 5000");
         }
-        Ok(())
-    }
-
-    fn validate_asr_languages(&self) -> Result<()> {
-        if self.asr.languages.is_empty() {
-            bail!("配置项 [asr] languages 不能为空（至少填写一种语言，如 [\"zh\"]）");
-        }
-        let mut seen = std::collections::HashSet::new();
-        for lang in &self.asr.languages {
-            if !is_asr_language(lang) {
-                bail!(
-                    "配置项 [asr] languages 含有不支持的语言代码 {lang:?}；\
-                     可用代码（部分）: zh/en/ja/ko/vi/th/id/ms/tl/hi/ar/fr/de/es/pt/ru/it/...（见文档）"
-                );
-            }
-            if !seen.insert(lang.as_str()) {
-                bail!("配置项 [asr] languages 中存在重复语言 {lang:?}");
-            }
-        }
-        // language_hints 原样传给 ASR API（数量上限由服务端处理），
-        // 本地语言判定也使用完整列表。
         Ok(())
     }
 
@@ -875,30 +981,18 @@ impl AppConfig {
         Ok(())
     }
 
-    /// 校验 `[translate]`：模型与目标语言必须有值；启用翻译时目标语言必须可合成。
-    ///
-    /// 关闭翻译时只允许“暂不校验语言代码合法性”，但显式空字符串始终非法；
-    /// 真正启用时会在下一次配置加载/写回校验中报错。
+    /// 校验 `[translate]`：模型必须有值（开关与目标语言在 `[self]` / `[others]`）。
     fn validate_translate(&self) -> Result<()> {
         if self.translate.model.is_empty() {
             bail!("配置项 [translate] model 不能为空");
-        }
-        if self.translate.target.is_empty() {
-            bail!("配置项 [translate] target 不能为空");
-        }
-        if self.translate.enabled
-            && !language::is_cloning_language(language::canonical_language(&self.translate.target))
-        {
-            bail!(
-                "配置项 [translate] target {:?} 不是可合成的目标语言；可用代码: {:?}",
-                self.translate.target,
-                language::TRANSLATION_LANGUAGES
-            );
         }
         Ok(())
     }
 
     fn validate_vrchat(&self) -> Result<()> {
+        if self.vrchat.process.is_empty() {
+            bail!("配置项 [vrchat] process 不能为空（填入目标进程的 exe 名，如 \"VRChat.exe\"）");
+        }
         if self.vrchat.osc.port == 0 {
             bail!("配置项 [vrchat.osc] port 必须在 1–65535 之间");
         }
@@ -1013,6 +1107,55 @@ pub fn normalize_hotwords(hotwords: &[String]) -> Vec<String> {
         normalized.push(word.to_string());
     }
     normalized
+}
+
+/// 语言列表归一：逐项去首尾空白并转小写（别名由 [`language::canonical_language`] 处理）。
+fn normalize_languages(languages: &mut [String]) {
+    for language in languages.iter_mut() {
+        *language = language.trim().to_lowercase();
+    }
+}
+
+/// 译文语言归一：去首尾空白、转小写，并做别名归一（如 `tl` → `fil`）。
+fn normalize_target(target: &mut String) {
+    *target = language::canonical_language(target.trim().to_lowercase().as_str()).to_string();
+}
+
+/// 校验一条线路的语言列表：非空、代码合法、不重复。
+///
+/// 列表原样作为该线路 ASR 的 `language_hints`（数量上限由服务端处理），
+/// 本地语言判定也使用完整列表。
+fn validate_languages(languages: &[String], field: &str) -> Result<()> {
+    if languages.is_empty() {
+        bail!("配置项 {field} 不能为空（至少填写一种语言，如 [\"zh\"]）");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for lang in languages {
+        if !is_asr_language(lang) {
+            bail!(
+                "配置项 {field} 含有不支持的语言代码 {lang:?}；\
+                 可用代码（部分）: zh/en/ja/ko/vi/th/id/ms/tl/hi/ar/fr/de/es/pt/ru/it/...（见文档）"
+            );
+        }
+        if !seen.insert(lang.as_str()) {
+            bail!("配置项 {field} 中存在重复语言 {lang:?}");
+        }
+    }
+    Ok(())
+}
+
+/// 校验一条线路的译文语言：不能为空；启用翻译时必须落在可合成语言集合内。
+fn validate_target(target: &str, translate_enabled: bool, field: &str) -> Result<()> {
+    if target.is_empty() {
+        bail!("配置项 {field} 不能为空");
+    }
+    if translate_enabled && !is_cloning_language(language::canonical_language(target)) {
+        bail!(
+            "配置项 {field} {target:?} 不是可合成的目标语言；可用代码: {:?}",
+            language::TRANSLATION_LANGUAGES
+        );
+    }
+    Ok(())
 }
 
 /// 校验热词列表是否符合百炼预编译热词的限制（数量 + 单条长度）。
@@ -1148,7 +1291,15 @@ mod tests {
             "未配置 workspace_host 时应使用百炼通用域名"
         );
         assert_eq!(config.asr.model, DEFAULT_ASR_MODEL);
-        assert_eq!(config.asr.languages, vec!["zh".to_string()]);
+        assert_eq!(config.local.languages, vec!["zh".to_string()]);
+        assert!(config.local.mic, "默认采集麦克风");
+        assert!(!config.local.translate, "默认不翻译我方文本");
+        assert_eq!(config.local.target, DEFAULT_SELF_TARGET);
+        assert!(config.local.tts, "默认合成我方语音");
+        assert!(!config.others.enabled, "默认不侦听对方线路");
+        assert_eq!(config.others.languages, vec!["zh".to_string()]);
+        assert!(!config.others.translate);
+        assert_eq!(config.others.target, DEFAULT_OTHERS_TARGET);
         assert!(config.asr.hotwords.is_empty(), "未配置热词时为空列表");
         assert_eq!(config.tts.model, DEFAULT_TTS_MODEL);
         assert_eq!(config.tts.voice, DEFAULT_VOICE);
@@ -1166,8 +1317,6 @@ mod tests {
         assert_eq!(config.vad.tail_ms, DEFAULT_VAD_TAIL_MS);
         assert!(!config.vad.debug);
         assert_eq!(config.chunking.words, DEFAULT_CHUNK_WORDS);
-        assert!(!config.translate.enabled);
-        assert_eq!(config.translate.target, DEFAULT_TRANSLATE_TARGET);
         assert_eq!(config.translate.model, DEFAULT_TRANSLATE_MODEL);
         assert_eq!(
             config.translate.granularity,
@@ -1175,6 +1324,7 @@ mod tests {
             "默认翻译粒度是标点即翻"
         );
         assert!(config.translate.show_source);
+        assert_eq!(config.vrchat.process, DEFAULT_VRCHAT_PROCESS);
         assert!(!config.vrchat.osc.enabled);
         assert_eq!(config.vrchat.osc.port, DEFAULT_VRCHAT_OSC_PORT);
         assert_eq!(config.vrchat.osc.display, VrchatDisplay::Bilingual);
@@ -1198,8 +1348,20 @@ workspace_host = "ws-test.cn-beijing.maas.aliyuncs.com"
 
 [asr]
 model = "asr-test"
-languages = ["ja", "zh", "en"]
 hotwords = ["原神", "崩坏：星穹铁道", "Kaoet"]
+
+[self]
+mic = false
+languages = ["ja", "zh", "en"]
+translate = true
+target = "ja"
+tts = false
+
+[others]
+enabled = true
+languages = ["en"]
+translate = true
+target = "zh"
 
 [tts]
 model = "tts-test"
@@ -1210,10 +1372,11 @@ dialect = "四川话"
 file = "cache/kaols.json"
 
 [translate]
-enabled = true
-target = "ja"
 granularity = "sentence"
 show_source = false
+
+[vrchat]
+process = "VRChat-test.exe"
 
 [audio]
 input_device = "Microphone"
@@ -1237,10 +1400,18 @@ words = 10
             "wss://ws-test.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
         );
         assert_eq!(config.asr.model, "asr-test");
+        assert!(!config.local.mic);
         assert_eq!(
-            config.asr.languages,
+            config.local.languages,
             vec!["ja".to_string(), "zh".to_string(), "en".to_string()]
         );
+        assert!(config.local.translate);
+        assert_eq!(config.local.target, "ja");
+        assert!(!config.local.tts);
+        assert!(config.others.enabled);
+        assert_eq!(config.others.languages, vec!["en".to_string()]);
+        assert!(config.others.translate);
+        assert_eq!(config.others.target, "zh");
         assert_eq!(
             config.asr.hotwords,
             vec![
@@ -1260,11 +1431,10 @@ words = 10
         assert_eq!(config.tts.model, "tts-test");
         assert_eq!(config.tts.voice, "voice-test");
         assert_eq!(config.tts.dialect, "四川话");
-        assert!(config.translate.enabled);
-        assert_eq!(config.translate.target, "ja");
         assert_eq!(config.translate.model, DEFAULT_TRANSLATE_MODEL);
         assert_eq!(config.translate.granularity, TranslateGranularity::Sentence);
         assert!(!config.translate.show_source);
+        assert_eq!(config.vrchat.process, "VRChat-test.exe");
         assert_eq!(config.audio.input_device.as_deref(), Some("Microphone"));
         assert_eq!(config.audio.output_device.as_deref(), Some("CABLE Input"));
         assert!(!config.vad.enabled);
@@ -1296,11 +1466,25 @@ words = 10
 key = "sk-test"
 
 [translate]
-enabled = false
-target = "en"
 model = "qwen-mt-flash"
 granularity = "clause"
 show_source = true
+
+[self]
+mic = true
+languages = ["zh"]
+translate = false
+target = "en"
+tts = true
+
+[others]
+enabled = false
+languages = ["zh"]
+translate = false
+target = "zh"
+
+[vrchat]
+process = "VRChat.exe"
 
 [vad]
 enabled = true
@@ -1315,6 +1499,9 @@ debug = false
         assert!(out.contains("[api]"));
         assert!(out.contains("key = \"sk-test\""));
         assert!(!out.contains("[translate]"), "{out}");
+        assert!(!out.contains("[self]"), "{out}");
+        assert!(!out.contains("[others]"), "{out}");
+        assert!(!out.contains("[vrchat]"), "{out}");
         assert!(!out.contains("[vad]"), "{out}");
     }
 
@@ -1327,8 +1514,23 @@ workspace_host = "ws-test.cn-beijing.maas.aliyuncs.com"
 
 [asr]
 model = "asr-test"
-languages = ["ja", "zh"]
 hotwords = ["原神", "Kaoet"]
+
+[self]
+mic = false
+languages = ["ja", "zh"]
+translate = true
+target = "ja"
+tts = false
+
+[others]
+enabled = true
+languages = ["en"]
+translate = true
+target = "zh"
+
+[vrchat]
+process = "VRChat-test.exe"
 
 [tts]
 model = "tts-test"
@@ -1365,8 +1567,6 @@ debug = true
 words = 10
 
 [translate]
-enabled = true
-target = "ja"
 model = "mt-test"
 granularity = "sentence"
 show_source = false
@@ -1378,14 +1578,28 @@ display = "translation"
 "#;
         let config = AppConfig::from_toml_str(text).unwrap();
         let out = config.to_toml_string().unwrap();
+        assert!(
+            out.contains("[self]"),
+            "段名必须是 self（不是 local）: {out}"
+        );
+        assert!(out.contains("[others]"), "{out}");
         let round = AppConfig::from_toml_str(&out).unwrap();
 
         assert_eq!(round.api.workspace_host, config.api.workspace_host);
         assert_eq!(round.asr.model, "asr-test");
+        assert!(!round.local.mic);
         assert_eq!(
-            round.asr.languages,
+            round.local.languages,
             vec!["ja".to_string(), "zh".to_string()]
         );
+        assert!(round.local.translate);
+        assert_eq!(round.local.target, "ja");
+        assert!(!round.local.tts);
+        assert!(round.others.enabled);
+        assert_eq!(round.others.languages, vec!["en".to_string()]);
+        assert!(round.others.translate);
+        assert_eq!(round.others.target, "zh");
+        assert_eq!(round.vrchat.process, "VRChat-test.exe");
         assert_eq!(
             round.asr.hotwords,
             vec!["原神".to_string(), "Kaoet".to_string()]
@@ -1405,8 +1619,6 @@ display = "translation"
         assert_eq!(round.vad.tail_ms, 800);
         assert!(round.vad.debug);
         assert_eq!(round.chunking.words, 10);
-        assert!(round.translate.enabled);
-        assert_eq!(round.translate.target, "ja");
         assert_eq!(round.translate.model, "mt-test");
         assert_eq!(round.translate.granularity, TranslateGranularity::Sentence);
         assert!(!round.translate.show_source);
@@ -1464,14 +1676,16 @@ display = "translation"
 
     #[test]
     fn explicit_empty_translate_target_is_rejected_even_when_disabled() {
-        let err = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = false\ntarget = \"\"\n",
-        )
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("[translate] target"),
-            "显式空目标语言应被拒绝: {err:#}"
-        );
+        for text in [
+            "[api]\nkey = \"sk-test\"\n[self]\ntarget = \"\"\n",
+            "[api]\nkey = \"sk-test\"\n[others]\ntarget = \"\"\n",
+        ] {
+            let err = AppConfig::from_toml_str(text).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("target 不能为空"),
+                "显式空目标语言应被拒绝: {err:#}"
+            );
+        }
     }
 
     #[test]
@@ -1512,20 +1726,28 @@ display = "translation"
 
     #[test]
     fn asr_languages_are_validated() {
-        let empty = AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[asr]\nlanguages = []\n")
+        for section in ["[self]", "[others]"] {
+            let empty = AppConfig::from_toml_str(&format!(
+                "[api]\nkey = \"sk-test\"\n{section}\nlanguages = []\n"
+            ))
             .unwrap_err();
-        assert!(format!("{empty:#}").contains("[asr] languages 不能为空"));
+            assert!(
+                format!("{empty:#}").contains("languages 不能为空"),
+                "{section} 的空语言列表应被拒绝: {empty:#}"
+            );
 
-        let bad =
-            AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[asr]\nlanguages = [\"xx\"]\n")
-                .unwrap_err();
-        assert!(format!("{bad:#}").contains("不支持的语言代码"));
+            let bad = AppConfig::from_toml_str(&format!(
+                "[api]\nkey = \"sk-test\"\n{section}\nlanguages = [\"xx\"]\n"
+            ))
+            .unwrap_err();
+            assert!(format!("{bad:#}").contains("不支持的语言代码"));
 
-        let duplicate = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[asr]\nlanguages = [\"ja\",\"ja\"]\n",
-        )
-        .unwrap_err();
-        assert!(format!("{duplicate:#}").contains("重复"));
+            let duplicate = AppConfig::from_toml_str(&format!(
+                "[api]\nkey = \"sk-test\"\n{section}\nlanguages = [\"ja\",\"ja\"]\n"
+            ))
+            .unwrap_err();
+            assert!(format!("{duplicate:#}").contains("重复"));
+        }
     }
 
     #[test]
@@ -1611,7 +1833,7 @@ display = "translation"
 [api]
 key = "sk-test"
 
-[asr]
+[self]
 languages = ["zh", "ja"]
 
 [tts]
@@ -1816,31 +2038,49 @@ rate = 1.25
     }
 
     #[test]
+    fn vrchat_process_must_not_be_empty() {
+        let err =
+            AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[vrchat]\nprocess = \"  \"\n")
+                .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[vrchat] process 不能为空"),
+            "显式空进程名应被拒绝: {err:#}"
+        );
+    }
+
+    #[test]
     fn translate_target_is_normalized_and_validated() {
         let config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = true\ntarget = \" TL \"\n",
+            "[api]\nkey = \"sk-test\"\n[self]\ntranslate = true\ntarget = \" TL \"\n\
+             \n[others]\nenabled = true\ntranslate = true\ntarget = \" TL \"\n",
         )
         .unwrap();
-        assert_eq!(
-            config.translate.target, "fil",
-            "tl 应归一为 fil，并去掉空白"
-        );
+        assert_eq!(config.local.target, "fil", "tl 应归一为 fil，并去掉空白");
+        assert_eq!(config.others.target, "fil");
 
         let err = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = true\ntarget = \"xx\"\n",
+            "[api]\nkey = \"sk-test\"\n[self]\ntranslate = true\ntarget = \"xx\"\n",
         )
         .unwrap_err();
         assert!(
-            format!("{err:#}").contains("[translate] target"),
+            format!("{err:#}").contains("[self] target"),
             "启用翻译时非法目标语言应被拒绝: {err:#}"
         );
 
-        // 关闭翻译时不校验目标语言，允许先填错、之后再改
-        let config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n[translate]\nenabled = false\ntarget = \"xx\"\n",
+        let err = AppConfig::from_toml_str(
+            "[api]\nkey = \"sk-test\"\n[others]\nenabled = true\ntranslate = true\ntarget = \"xx\"\n",
         )
-        .unwrap();
-        assert_eq!(config.translate.target, "xx");
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("[others] target"),
+            "对方线路启用翻译时非法目标语言应被拒绝: {err:#}"
+        );
+
+        // 关闭翻译时不校验目标语言，允许先填错、之后再改
+        let config =
+            AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n[self]\ntarget = \"xx\"\n")
+                .unwrap();
+        assert_eq!(config.local.target, "xx");
     }
 
     #[test]

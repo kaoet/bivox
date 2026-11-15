@@ -52,6 +52,7 @@
 **决定**
 
 - `config.toml` 是唯一配置事实源，GUI 不引入第二种配置格式；字段语义见 `src/config.rs`。
+- **所有配置字段都必须有 GUI 编辑入口**：新增/修改字段时同步给出界面入口，不允许存在“只能手改 `config.toml`”的字段；字段归哪个页签由 D22/D27/D32/D38 决定。调试 CLI（`admin`）不算入口——它只做远程资源管理，不编辑配置。
 - 写回以 `AppConfig` 为中间模型：GUI 覆盖全部字段，修改后整体序列化，只输出与默认值不同的字段。
 - 写回流程：读原文本 → 解析为 `AppConfig` → 类型化修改 → 校验磁盘原配置与新文本 → 备份 `config.toml.bak` → 写盘。没有实际改动时不写盘、不产生备份；校验失败不落盘。
 - API Key 以**明文**保存在 `config.toml`；界面与 README 都提示该文件含密钥、勿分享。
@@ -64,6 +65,7 @@
 
 - 单事实源避免 GUI 与文件两份配置漂移；类型化写回避免逐字段维护文本修改逻辑。
 - 只写非默认值让配置文件保持最小；写前校验 + 备份把“写坏配置”的风险降到最低。
+- “所有字段都能在 GUI 改”是“GUI 是唯一编辑器”这条前提的配套约束：只存在于文件里的字段等于隐藏配置——用户不知道它存在，改了也没有校验与错误提示，还会让 README/配置注释与实际能力对不上。哪怕只是 `[vad] debug`、`[translate] show_source` 这种次要字段，也要有可见入口。
 
 ---
 
@@ -353,7 +355,7 @@
   2. 收到旧会话的 `StateChanged(Idle)` 后，用新配置自动 `start_session()`。
 - `Stopping`/`Idle`/`Failed` 不触发自动重启；关窗时清除 pending；重启失败只报一次错，不自动重试（避免坏配置/不可用设备形成重启循环）。
 - 指纹必须**顺序稳定**：手工拼接会影响运行的字段，自定义音色按配置名排序；不能直接 `format!("{config:?}")`（`HashMap` 的 Debug 顺序随实例随机，会导致每次保存都误判为变化）。
-- **例外**：`[vrchat.*]` 全部不进指纹（D33）。OSC 聊天框是旁路文本输出，开关/端口/显示模式由独立后台任务通过 watch 实时读取，改设置不重启实时管线。
+- **例外**：`[vrchat.osc]` 全部不进指纹（D33）。OSC 聊天框是旁路文本输出，开关/端口/显示模式由独立后台任务通过 watch 实时读取，改设置不重启实时管线。（`[vrchat] process` 是对方线路采集的运行配置，计入指纹，见 D37。）
 
 **理由**
 
@@ -441,7 +443,7 @@
 
 **边界**
 
-- 打字输入句的语言仍受 `[asr] languages` 约束（与 ASR 相同），列表外的语言回退到列表首个。
+- 打字输入句的语言仍受 `[self] languages` 约束（与 ASR 相同），列表外的语言回退到列表首个。
 - 排队期间停止或热重启会话时，尚未播放的打字输入句随会话丢弃，字幕历史保留。
 - 被打断的 ASR 句剩余部分不会补读；字幕只保留已送 TTS 的前缀。
 
@@ -479,7 +481,7 @@
 **决定**
 
 - 翻译模式下一"条"字幕由两行组成：**译文大字行**（24pt）在上、**原文小字行**（15pt，弱色）在下；两行各自有语言列（译文行=目标语言，原文行=源语言）。`show_source = false` 时只渲染译文行，行为与 M1 相同。
-- 字幕 reducer（`subtitles::SubtitleState`）在 `translation_mode` 下拆成两个纯函数：`apply_source`（只刷新原文与「已送翻译」前缀，不句终）与 `apply_translation`（累积译文；句终时把「原文 + 译文」作为一条历史记录落库；同一 `sentence_id` 去重；空译文句终只清当前行、不落历史）。
+- 字幕 reducer（D39 起为 `timeline::Timeline`，逐条消息带来源；语义不变）在翻译模式下拆成两个纯函数：`apply_source`（只刷新原文与「已送翻译」前缀，不句终）与 `apply_translation`（累积译文；句终时把「原文 + 译文」作为一条消息落库；同一 `sentence_id` 去重；空译文句终只清当前行、不落历史）。
 - 事件契约：翻译模式下 `PipelineEvent::Asr` 的 `sent_bytes` = 已送翻译的**源文**字节长度、`is_sentence_end` 恒为 `false`、`language` = 源语言；句终与当前行收口由 `PipelineEvent::Translation` 负责（其 `sent_bytes` = 已送 TTS 的**译文**字节长度）。非翻译模式下 `Asr` 语义与行为不变。
 - 原文行与译文行**各自**可复制：悬停对应行时该行右端显示复制图标，复制的是该行完整文本（原文行复制源文、译文行复制译文）。
 - `show_source` **不进**配置指纹：修改后「重新加载配置」即时改变渲染，不重启会话；`enabled/target/model/granularity` 进指纹，运行中变更按 D20 热重启。
@@ -500,12 +502,14 @@
 
 ## D27 翻译模式 M3：独立「翻译」页与配置写回范围
 
+> 由 D38 细化：翻译开关与目标语言已移到「自己」/「他人」页；本页只保留两条线路共用的粒度、显示原文与模型。
+
 **决定**
 
 - 新增独立「翻译」页（`Tab::Translate`，`src/gui/translate_tab.rs`），翻译相关选项集中于此；顶栏工具栏不新增翻译开关，保持现状。
 - 翻译页负责开关、目标语言、粒度与显示原文；字段语义见 `src/config.rs`。写回统一走现有「校验 → `.bak` → 写盘」流程；未启用翻译时目标语言与粒度控件禁用，`show_source` 仍可改。
 - 改值即保存：`show_source` 不进配置指纹，重载后立即改变渲染、**不重启**；`enabled` / `target` / `granularity` / `model` 进指纹，运行中变更按 D20「停旧会话 → 用新配置自动重启」，当前句会丢失。
-- 空闲时改配置只影响下次开始；`reload_config` 在会话未运行时把 `SubtitleState::translation_mode` 同步为新配置，空状态提示与后续渲染一致。运行中则仍由 `start_session` 在重启后设置。
+- 空闲时改配置只影响下次开始；`reload_config` 在会话未运行时把时间线的翻译开关（`Timeline::set_translation`）同步为新配置，空状态提示与后续渲染一致。运行中则仍由 `start_session` 在重启后设置。
 
 **理由**
 
@@ -623,6 +627,8 @@
 
 ## D32 「语音识别」页与 `[asr]` 图形化写回
 
+> 由 D38 细化：页签顺序改为「实时 / 音频 / 自己 / 他人 / 语音识别 / 语音合成 / VRChat / 翻译 / 设置」；语言列表已移到「自己」/「他人」页，本页只保留共用的模型与热词。
+
 **决定**
 
 - 页签顺序固定为：**实时 / 音频 / 语音识别 / 语音合成 / 翻译 / 设置**；「语音识别」页放在「语音合成」左侧。
@@ -681,7 +687,7 @@
   - `translation` 模式译文未到时保留上一帧，不临时显示原文。
 - 架构：独立 tokio 任务 `ChatboxService` 消费 `PipelineEvent` 的克隆，不依赖 GUI 重绘；
   - 会话 `emit` 同时发 GUI 与 OSC 两个通道；
-  - 设置通过 `watch` 实时同步；`[vrchat.*]` 不进配置指纹（D20 例外），改设置不重启实时管线；
+  - 设置通过 `watch` 实时同步；`[vrchat.osc]` 不进配置指纹（D20 例外），改设置不重启实时管线；
   - VRChat 未运行是正常状态，UDP 发送失败只记 debug 日志，不弹错误横幅。
 
 **理由**
@@ -690,7 +696,7 @@
 - 本机实测 900ms 长跑跳字、1000ms 稳定，因此固定 1 秒；社区 1500ms 偏保守，但作为边界参考保留在调研文档中。
 - typing 只在跳变时发，既能让观众区分当前句/历史文本，又不增加可感知的限流压力。
 - 30 秒自然过期是 VRChat 的兜底行为；放弃 5 秒清空可减少无意义消息，停止/关闭仍显式清空避免残留。
-- 截断保尾是因为句尾信息量最大；复用 `SubtitleState` 归约语义避免 D16/D26 字幕行为在聊天框侧漂移。
+- 截断保尾是因为句尾信息量最大；复用 `timeline::Timeline` 的归约语义避免 D16/D26 字幕行为在聊天框侧漂移。
 - 双语从“译文优先”改为软 5:4：两侧都有内容时更均匀，避免长译文把源文压到只剩一两行；未用额度可借用，因此不会为了凑 5/4 浪费已有空间。
 
 ---
@@ -738,6 +744,123 @@
 - “未配置 Key”是正常的首次使用状态，不是配置损坏；把它当非法会让用户一启动就面对错误。
 - 显式空字符串和“省略”语义不同：前者几乎总是误写，静默回退默认值会掩盖错误。
 - 非法配置不进入 GUI，才能保证 GUI 写回不会把不认识的字段/值覆盖掉；运行期 reload 失败也保留旧配置并拒绝写回，避免二次破坏。
+
+---
+
+## D36 对方语音的音源：Windows 进程环回（WASAPI PROCESS_LOOPBACK）
+
+**决定**
+
+- 「对方语音」的音源固定为 **Windows 进程环回**：`ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, …)` + `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`，目标为某个 exe 名（默认 `VRChat.exe`）的**进程树**（`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`）。
+- 输出格式在 `IAudioClient::Initialize` 时固定为 **16 kHz / 单声道 / PCM16**，声道混合与重采样交给 WASAPI（`AUTOCONVERTPCM` + `SRC_DEFAULT_QUALITY`），与麦克风采集后的格式一致。
+- PID 用 ToolHelp 进程快照按 exe 文件名匹配（不引入 `sysinfo`）；进程存活也用同一份快照判断，避免跨完整性级别时 `OpenProcess` 被拒绝导致误判。
+- 采集是**一次性会话**：一个 `std::thread` 持有 `ProcessLoopback`，线程退出即返回错误，由上层退避重连。目标进程退出、`DATA_DISCONTINUITY`、下游积压超过 1 秒都按「会话结束」处理。
+- 安静期按**墙钟补静音**：WASAPI 不保证持续送包，而 ASR 的 run-task 约 23 秒没有音频就会失败，因此采集层保证「已送出的采样数 ≈ 经过时间 × 采样率」，落后超过 1 秒时重置时间基准而不是一次性追补。
+- 依赖 `windows = "0.62"`（`Win32_Media_Audio`、`Win32_System_Com_StructuredStorage`、`Win32_System_Diagnostics_ToolHelp` 等）；`windows 0.62.2` 已由 wgpu 30 引入，不新增版本。
+- 采集线程不放进 tokio runtime，也不放进任何实时音频回调（内部有 50 ms 粒度的阻塞等待）。
+
+**理由**
+
+- **系统环回**（录某个输出设备）会把本机所有声音都采进来，包括 kaols 自己播放的 TTS，必须靠虚拟声卡与路由把「别人的声音」和「我的声音」分开才可用；进程环回只取目标进程树，天然没有自听，也不要求用户配置路由。
+- **非实时录音文件转写**路线（`*_filetrans`）是「提交整段音频 → 拿结果」，延迟是秒级到分钟级，不能用于对话。
+- 采集层必须能按墙钟补静音：现有 VAD 的 keepalive 依赖「有 chunk 进来」，环回空闲时如果什么都不补，ASR 任务会在 23 秒后被服务端断掉。
+- 用进程快照而不是进程句柄：VRChat 由 Steam 启动，跨完整性级别/不同权限的句柄打开失败会让「进程是否存活」判断失真。
+
+**边界**
+
+- 仅 Windows 10 2004（build 19041）及以上；项目本身已只支持 Windows。
+- 只支持本机进程，且目标进程必须真的在渲染音频。
+- 拿到的只是该进程树的**混音结果**：多人同时说话会混成一条流，没有说话人信息；VRChat 语音经过 Opus 压缩与空间衰减，远处/小声玩家识别率明显低于麦克风。
+- 游戏音效、BGM 也会进入同一条流；VAD 只能过滤静音，无法区分人声与音乐。
+- 不提供系统级/设备级环回（那是另一种实现），也不做音频路由检测。
+
+---
+
+## D37 双线路对称配置：`[self]` / `[others]`，`[asr]` / `[translate]` 只留共用项
+
+**决定**
+
+- `[asr]` 只保留两条线路共用的 `model` 与 `hotwords`；**语言列表按线路各一份**。
+- `[self]`（我方线路）：`mic`、`languages`、`translate`、`target`、`tts`。
+  - **没有总开关**：`mic` / `tts` / `[vrchat.osc] enabled` 各自控制一个能力，三者都关时仍可打字上屏；多一个 `enabled` 只会产生自相矛盾的状态。
+  - `languages` 同时用于我方 ASR 的 `language_hints` 与打字输入的本地语言判定。
+- `[others]`（对方线路）：`enabled`、`languages`、`translate`、`target`。
+  - 保留 `enabled`：这条线路只有一个维度，没有别的字段能推导出开关。
+- `[translate]` 只保留两条线路共用的 `model`、`granularity`、`show_source`；开关与译文语言在线路段。
+- `[vrchat] process`（默认 `VRChat.exe`）不属于 `[others]`：进程环回目标是 VRChat 专属的采集参数，与对方语言/翻译无关（D36）。
+- 配置指纹：`[self]` / `[others]` / `[vrchat] process` **计入**（改了就停旧会话、用新配置重启，D20）；`[translate] show_source` 与 `[vrchat.osc]` 仍**不计入**。
+- 配置 schema 直接替换，不保留旧字段、不写迁移代码（AGENTS.md「配置变更」）。
+
+**理由**
+
+- 两条线路各有自己的「源语言列表 + 是否翻译 + 译文语言」，`[asr] languages` 这种单份列表无法表达，容易让人误以为两条线共用一个列表。
+- 对称的字段让「这条线读哪个语言列表」不需要查文档：`[self] languages` 就是我方，`[others] languages` 就是对方。
+- 模型与热词共用是合理的：热词按 ASR 模型缓存 `vocabulary_id`（D31），两条线用同一份词表；模型选择同样是全局的。
+- 能力开关（`mic`/`tts`/OSC）比「线路总开关 + 子开关」更难出现矛盾配置。
+
+**边界**
+
+- 我方语言列表与对方语言列表相互独立：自己说中文、对方说日语时，两份 `language_hints` 不同，本地语言判定也各有一个粘性 `LanguageTracker`。
+- `[others] target` 与 `[self] languages` 之间没有任何强绑定（允许不相等）。
+- 空语言列表、重复语言、非法语言代码在各自段内报错，错误文案带段名（`[self]` / `[others]`）。
+- 打字输入始终可用，不挂在 `mic`/`tts`/OSC 任何一个开关上。
+
+---
+
+## D38 设置页签按线路拆分：「自己」「他人」
+
+**决定**
+
+- 页签顺序固定为：**实时 / 音频 / 自己 / 他人 / 语音识别 / 语音合成 / VRChat / 翻译 / 设置**（细化 D32 的旧顺序）。
+- 新增两个页：
+  - 「自己」= `[self]` 的 `mic` / `languages` / `translate` / `target` / `tts`；
+  - 「他人」= `[others]` 的 `enabled` / `languages` / `translate` / `target`。
+- 共用设置留在原页：`语音识别` 只剩 `[asr] model` / `hotwords`；`翻译` 只剩 `[translate] model` / `granularity` / `show_source`；`语音合成`（`[tts]` 全部）**不并入**「自己」页。
+- `[vrchat] process` 归「VRChat」页（与 `[vrchat.osc]` 同页），但用**文本框 + 「应用」**写回：它进配置指纹，逐键写回会让输入过程中反复触发 D20 重启；该页 OSC 字段仍是改值即保存、不重启。
+- 两个新页沿用 Tab 级「保存 / 放弃更改」（D22/D32 的交互）：一次类型化写回、一次校验、一份 `.bak`；所有字段进配置指纹，运行中保存按 D20 热重启。
+- 语言列表控件抽到 `gui/language_list.rs` 供两页复用：有序、拖拽排序、首个为默认，超过 4 种时提示 `language_hints` 只用前 4 个。
+
+**理由**
+
+- 两条线路各有独立的「语言 / 翻译 / 输出」语义；放在「语音识别」「翻译」页里，用户无法一眼看出某个语言列表属于哪条线路。
+- 共用项（模型、热词、翻译模型与粒度、音色）保持独立页，避免同一字段出现在两处。
+- `mic` / `tts` / `[others] *` 在拆分前没有 GUI 入口，只能手改 `config.toml`。
+- `process` 用「应用」而不是逐键保存，是因为它是文本框且进配置指纹（见上）。
+
+**边界**
+
+- 页签变成 9 个；默认窗口宽度（1100px）实测仍能一行放下。
+- 「语音合成」页与「自己」页语义上有重叠（音色只作用于我方），本决定明确不合并；以后若要合并，必须先改 D22。
+- 拆分后「语音识别」「翻译」页内容较少，但它们是两条线路共用设置的唯一入口。
+
+---
+
+## D39 事件来源与对话时间线：两条线路共用一套事件与状态机
+
+**决定**
+
+- `PipelineEvent::Asr` / `Translation` / `VadActive` 增加 `speaker: Speaker`（`Local` 我方 / `Others` 他人）；`TypedSentence` 始终属于我方，不加来源字段。
+- 字幕状态机从「单栏 `SubtitleState`」换成 `timeline::Timeline`：
+  - 每条消息带 `speaker`；同一时刻每条线路最多一条未完成消息（`open = true`）；
+  - `messages[0]` 是最新一条；新消息插到最前，未完成消息**原地更新**（修订不改变位置）；
+  - `sent_bytes` = 主行已送下游的字节前缀，`source_sent_bytes` = 副行（原文）已送翻译的前缀；
+  - 去重按 `(speaker, sentence_id)`；历史上限 500 条（两条线路合并计算）；`reset_open` 只清未完成消息。
+- OSC 与 TTS 只消费 `Speaker::Local`：`ChatboxService` 直接跳过他人事件，`chatbox::compose(&SpeakerView, display)` 用 `timeline.speaker_view(Speaker::Local)`。
+- 翻译开关按线路生效：`Timeline::set_translation(speaker, enabled)`，两条线路对 `Asr` 事件的解释各自独立。
+- `speaker` 不参与渲染结构的抽象：界面按来源决定位置/对齐（P7 的气泡时间线）。
+
+**理由**
+
+- 两条线路要共用「当前句 / 历史 / 去重 / 翻译累积」这套复杂状态机；复制一份必然漂移（D16/D26 的语义已经踩过）。
+- 事件里加来源字段比「每个来源一套事件变体」改动小：GUI 与 OSC 的 `match` 只多一个字段，新增来源不必再加变体。
+- 按 `(speaker, sentence_id)` 去重是必须的：两条 ASR 连接的 `sentence_id` 各自独立，全局按 id 去重会把另一条线路的首句丢掉。
+- 聊天框只镜像我方是既定需求（他人文本不进 OSC）。
+
+**边界**
+
+- `timeline` 是纯逻辑（不依赖 egui / 时间），单测覆盖；GUI 渲染在 P7 改成左右分栏气泡。
+- `Speaker` 变体叫 `Local` / `Others`（`Self` 是 Rust 关键字），与配置字段 `local` / `others` 对应。
+- `VadActive` 也带来源，但顶栏两个指示器分别在对方线路（P4）与界面（P7）落地。
 
 ---
 
