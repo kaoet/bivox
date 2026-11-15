@@ -13,3 +13,5 @@
 cache.json
 cache.json.tmp
 cache.json.bak
+# 本机构建配置（MSVC / Windows SDK 绝对路径），不要提交；模板见 .cargo/config.toml.example
+.cargo/config.toml
