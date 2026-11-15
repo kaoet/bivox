@@ -1,135 +1,51 @@
-//! 实时页：不放分段的对话列表——最新一条在最上面，越早越靠下；
-//! 列表顶部对齐、字号放大、页面不显示任何标题（D16/D39）。
+//! 实时页：气泡时间线（D16/D39）。最新一条在最上面，越早越靠下。
 //!
-//! 每行布局：最左是语言代码，然后是本句文本；未完成的消息按「已送入 / 尚未送入」分成两种颜色
-//! 且不显示复制按钮；已完成的消息在**悬停整行**时于右端显示复制图标。
-//!
-//! 消息可以只有一行（未翻译），也可以两行：原文小字弱色行在上、译文大字行在下（D26）；
-//! `show_source = false` 时只渲染主行。每条消息带来源（我方/他人），P7 会改成左右分栏气泡。
+//! 布局：我方靠右、他人靠左；气泡宽度贴合内容、上限为可用宽度的一部分，长句在气泡内换行。
+//! 气泡内容自上而下是「原文小字行（翻译模式且显示原文）」→「主行大字」；语言代码画在气泡外侧、朝对话中线的一边。
+//! 未完成的消息按「已送入 / 尚未送入」分色；所有文本（原文与译文）都可以拖动选中、Ctrl+C 复制，
+//! 不提供复制按钮。
 
 use eframe::egui;
 
 use crate::app::KaolsApp;
+use crate::events::Speaker;
+use crate::timeline::Message;
 
-/// 译文字号（比正文大，方便远看）。
-const SUBTITLE_FONT_SIZE: f32 = 24.0;
+/// 主行字号（比正文大，方便远看）。
+const MAIN_FONT_SIZE: f32 = 20.0;
 /// 原文小字号。
-const SOURCE_FONT_SIZE: f32 = 15.0;
+const SOURCE_FONT_SIZE: f32 = 13.0;
 /// 语言代码字号。
-const LANGUAGE_FONT_SIZE: f32 = 13.0;
-/// 左侧语言列宽（当前句与历史句共用，保证文本左端对齐；够 3 字母代码如 `fil`）。
-const LANGUAGE_COL_WIDTH: f32 = 32.0;
-/// 右侧复制图标占位宽（只为历史居留出，避免图标压住文字）。
-const COPY_SLOT_WIDTH: f32 = 24.0;
-/// 复制图标点击区边长。
-const COPY_BUTTON_SIZE: f32 = 20.0;
+const LANGUAGE_FONT_SIZE: f32 = 11.0;
+/// 语言标签与气泡之间的间距（标签在气泡外侧）。
+const LANGUAGE_LABEL_GAP: f32 = 6.0;
+/// 原文行与主行之间的间距。
+const SOURCE_GAP: f32 = 3.0;
+/// 气泡最大宽度占总宽度的比例。
+const BUBBLE_WIDTH_RATIO: f32 = 0.72;
+/// 气泡最小内容宽度。
+const BUBBLE_MIN_WIDTH: f32 = 120.0;
+/// 气泡内边距。
+const BUBBLE_PADDING_X: f32 = 11.0;
+const BUBBLE_PADDING_Y: f32 = 8.0;
+/// 气泡圆角。
+const BUBBLE_CORNER_RADIUS: u8 = 10;
+/// 两条消息之间的间距。
+const BUBBLE_GAP: f32 = 6.0;
 /// 「尚未送入」部分的文字颜色衰减系数。
 const UNSENT_COLOR_SCALE: f32 = 0.45;
-/// 历史原文行的弱化系数。
-const SOURCE_DIM_SCALE: f32 = 0.7;
-
-/// 一行字幕。
-struct Row<'a> {
-    /// 本行语言代码（空串 = 尚未判定，显示 `…`）。
-    language: &'a str,
-    text: &'a str,
-    /// `Some(sent_bytes)` = 当前正在处理的行（分色显示进度，不可复制）。
-    sent_bytes: Option<usize>,
-    font_size: f32,
-    /// 原文行用弱色。
-    dim: bool,
-    /// 历史行可复制（悬停时显示复制图标）。
-    copy: bool,
-}
-
-impl<'a> Row<'a> {
-    fn current(
-        language: &'a str,
-        text: &'a str,
-        sent_bytes: usize,
-        font_size: f32,
-        dim: bool,
-    ) -> Self {
-        Self {
-            language,
-            text,
-            sent_bytes: Some(sent_bytes),
-            font_size,
-            dim,
-            copy: false,
-        }
-    }
-
-    fn history(language: &'a str, text: &'a str, font_size: f32, dim: bool, copy: bool) -> Self {
-        Self {
-            language,
-            text,
-            sent_bytes: None,
-            font_size,
-            dim,
-            copy,
-        }
-    }
-}
+/// 原文行的弱化系数。
+const SOURCE_DIM_SCALE: f32 = 0.72;
 
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
-    // 底部输入行先占位（嵌套 Panel 从当前 Ui 底部切走输入行高度），剩余空间给字幕列表。
+    // 底部输入行先占位（嵌套 Panel 从当前 Ui 底部切走输入行高度），剩余空间给气泡列表。
     super::typed_input::show(app, ui);
-    show_subtitles(app, ui);
+    show_timeline(app, ui);
 }
 
-/// 字幕列表：从底部输入行上方剩余的空间向下填满。
-fn show_subtitles(app: &mut KaolsApp, ui: &mut egui::Ui) {
+/// 气泡列表：从底部输入行上方剩余的空间向下填满。
+fn show_timeline(app: &mut KaolsApp, ui: &mut egui::Ui) {
     let show_source = app.translate_show_source();
-
-    // 显示顺序：时间线本身就是「最新在前」，直接按顺序渲染。
-    // 每条消息 1–2 行：原文小字行在上（翻译模式且 `show_source`），主行在下。
-    let mut entries: Vec<Vec<Row<'_>>> = Vec::with_capacity(app.timeline.messages().len());
-    for message in app.timeline.messages() {
-        let mut rows = Vec::with_capacity(2);
-        if show_source && !message.source.is_empty() {
-            rows.push(if message.open {
-                Row::current(
-                    &message.source_language,
-                    &message.source,
-                    message.source_sent_bytes,
-                    SOURCE_FONT_SIZE,
-                    false,
-                )
-            } else {
-                Row::history(
-                    &message.source_language,
-                    &message.source,
-                    SOURCE_FONT_SIZE,
-                    true,
-                    true,
-                )
-            });
-        }
-        if !message.text.is_empty() {
-            rows.push(if message.open {
-                Row::current(
-                    &message.language,
-                    &message.text,
-                    message.sent_bytes,
-                    SUBTITLE_FONT_SIZE,
-                    false,
-                )
-            } else {
-                Row::history(
-                    &message.language,
-                    &message.text,
-                    SUBTITLE_FONT_SIZE,
-                    false,
-                    true,
-                )
-            });
-        }
-        // 刚建立、还没收到任何文本的消息不占位。
-        if !rows.is_empty() {
-            entries.push(rows);
-        }
-    }
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -138,9 +54,7 @@ fn show_subtitles(app: &mut KaolsApp, ui: &mut egui::Ui) {
             // ScrollArea 的内容 Ui 会继承外层 bottom_up 布局，必须显式改为 top_down，
             // 否则空状态提示等会贴到字幕区底部。
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                // 0.37 的 ScrollArea 没有 stick_to_top；默认滚动偏移按像素保存，
-                // 停在顶部（偏移 0）时新消息插入顶部不会把视图顶走，效果就是 stick top。
-                if entries.is_empty() {
+                if app.timeline.messages().is_empty() {
                     ui.add_space(16.0);
                     ui.label(
                         egui::RichText::new("（点工具栏「开始」后，说话或打字即可看到字幕）")
@@ -149,124 +63,204 @@ fn show_subtitles(app: &mut KaolsApp, ui: &mut egui::Ui) {
                     return;
                 }
 
-                let normal_color = ui.visuals().text_color();
-                let language_color = normal_color.gamma_multiply(0.55);
-
-                for (index, rows) in entries.iter().enumerate() {
+                // 时间线本身就是「最新在前」，直接按顺序渲染。
+                for (index, message) in app.timeline.messages().iter().enumerate() {
                     if index > 0 {
-                        ui.separator();
+                        ui.add_space(BUBBLE_GAP);
                     }
-                    for (row_index, row) in rows.iter().enumerate() {
-                        if row_index > 0 {
-                            ui.add_space(2.0);
-                        }
-                        let inner = ui.horizontal_top(|ui| {
-                            language_column(ui, row.language, language_color);
-                            show_text_row(ui, row, normal_color);
-                        });
-
-                        // 历史行：只有鼠标悬停这一行时，才在右端显示复制图标。
-                        if row.copy {
-                            // 注意不能拿 inner.response.rect 当整行矩形：水平布局里
-                            // allocate_ui 只按内容尺寸结算，短句时矩形会短于整行。
-                            // 用外层 Ui 的 max_rect（整行宽）拼竖直范围才是整行。
-                            let row_band = egui::Rect::from_x_y_ranges(
-                                ui.max_rect().x_range(),
-                                inner.response.rect.y_range(),
-                            );
-                            let hovered = ui
-                                .ctx()
-                                .pointer_hover_pos()
-                                .is_some_and(|pos| row_band.contains(pos));
-                            if hovered {
-                                let center = egui::pos2(
-                                    row_band.right() - COPY_SLOT_WIDTH * 0.55,
-                                    row_band.center().y,
-                                );
-                                let icon_rect = egui::Rect::from_center_size(
-                                    center,
-                                    egui::vec2(COPY_BUTTON_SIZE, COPY_BUTTON_SIZE),
-                                );
-                                copy_icon_button(ui, icon_rect, row.text);
-                            }
-                        }
-
-                        ui.add_space(if row_index + 1 == rows.len() {
-                            4.0
-                        } else {
-                            0.0
-                        });
-                    }
+                    message_bubble(ui, message, show_source, index);
                 }
             });
         });
 }
 
-/// 画一行文本：当前句按已送入字节前缀分色，历史行整行单色。
-fn show_text_row(ui: &mut egui::Ui, row: &Row<'_>, normal_color: egui::Color32) {
-    let primary_color = if row.dim {
-        normal_color.gamma_multiply(SOURCE_DIM_SCALE)
-    } else {
-        normal_color
-    };
-    let unsent_color = primary_color.gamma_multiply(UNSENT_COLOR_SCALE);
-    let font_id = egui::FontId::proportional(row.font_size);
-
-    match row.sent_bytes {
-        // 当前句：已送前缀用正常色，其余用弱色。
-        Some(sent_bytes) => {
-            let sent = clamp_prefix(row.text, sent_bytes);
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                &row.text[..sent],
-                0.0,
-                egui::TextFormat {
-                    font_id: font_id.clone(),
-                    color: primary_color,
-                    ..Default::default()
-                },
-            );
-            job.append(
-                &row.text[sent..],
-                0.0,
-                egui::TextFormat {
-                    font_id,
-                    color: unsent_color,
-                    ..Default::default()
-                },
-            );
-            // 必须显式 .wrap()：水平布局里 Label 的默认 wrap_mode 是 Extend，
-            // 会把我们设好的 max_width 覆盖成 INFINITY（长句不换行、直接溢出）。
-            job.wrap.max_width = ui.available_width();
-            ui.add(egui::Label::new(job).wrap());
-        }
-        // 历史句：右侧为复制图标留出空位，文本按剩余宽度换行。
-        None => {
-            let text_width = if row.copy {
-                (ui.available_width() - COPY_SLOT_WIDTH - ui.spacing().item_spacing.x).max(40.0)
-            } else {
-                ui.available_width()
-            };
-            ui.allocate_ui_with_layout(
-                egui::vec2(text_width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(row.text)
-                                .size(row.font_size)
-                                .color(primary_color),
-                        )
-                        .wrap(),
-                    );
-                },
-            );
-            if row.copy {
-                // 把右侧空位真正占掉，行矩形才包含图标位置（悬停判定/图标不压字）
-                ui.add_space(COPY_SLOT_WIDTH);
-            }
-        }
+/// 一条消息气泡：按来源决定左右，悬停显示复制图标。
+fn message_bubble(ui: &mut egui::Ui, message: &Message, show_source: bool, index: usize) {
+    // 刚建立、还没收到任何文本的消息不占位。
+    if message.text.is_empty() && message.source.is_empty() {
+        return;
     }
+
+    let is_self = message.speaker == Speaker::Local;
+    let max_width = (ui.available_width() * BUBBLE_WIDTH_RATIO).max(BUBBLE_MIN_WIDTH);
+    let wrap_width = (max_width - 2.0 * BUBBLE_PADDING_X).max(64.0);
+
+    // 半透明底：我方偏强调色，他人偏中性；未完成时整体更暗，暗示仍在变化。
+    let base_fill = if is_self {
+        ui.visuals().selection.bg_fill.gamma_multiply(0.55)
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    let fill = if message.open {
+        base_fill.gamma_multiply(0.75)
+    } else {
+        base_fill
+    };
+
+    let normal = ui.visuals().text_color();
+    let source_color = normal.gamma_multiply(SOURCE_DIM_SCALE);
+
+    // 先排版好两行文本、量出气泡尺寸；文本行随后用 `Label` 放置，才能拖动选中。
+    let source_job = (show_source && !message.source.is_empty()).then(|| {
+        row_job(
+            &message.source,
+            message.open,
+            message.source_sent_bytes,
+            SOURCE_FONT_SIZE,
+            source_color,
+            wrap_width,
+        )
+    });
+    let main_job = (!message.text.is_empty()).then(|| {
+        row_job(
+            &message.text,
+            message.open,
+            message.sent_bytes,
+            MAIN_FONT_SIZE,
+            normal,
+            wrap_width,
+        )
+    });
+    let source_size = source_job
+        .as_ref()
+        .map(|job| ui.painter().layout_job(job.clone()).size());
+    let main_size = main_job
+        .as_ref()
+        .map(|job| ui.painter().layout_job(job.clone()).size());
+
+    let source_h = source_size.map_or(0.0, |size| size.y);
+    let main_h = main_size.map_or(0.0, |size| size.y);
+    let gap = if source_h > 0.0 && main_h > 0.0 {
+        SOURCE_GAP
+    } else {
+        0.0
+    };
+    let text_width = source_size
+        .map_or(0.0, |size| size.x)
+        .max(main_size.map_or(0.0, |size| size.x))
+        .max(BUBBLE_MIN_WIDTH - 2.0 * BUBBLE_PADDING_X);
+
+    let content_size = egui::vec2(
+        text_width + 2.0 * BUBBLE_PADDING_X,
+        source_h + gap + main_h + 2.0 * BUBBLE_PADDING_Y,
+    );
+
+    // 我方靠右、他人靠左：外层布局负责，气泡内容始终左对齐。
+    let align = if is_self {
+        egui::Layout::right_to_left(egui::Align::TOP)
+    } else {
+        egui::Layout::left_to_right(egui::Align::TOP)
+    };
+
+    ui.with_layout(align, |ui| {
+        let (rect, response) = ui.allocate_exact_size(content_size, egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(BUBBLE_CORNER_RADIUS), fill);
+
+        // 文字统一放在气泡内边距里，宽度固定成量好的内容宽度：
+        // `Label` 支持拖动选中与 Ctrl+C，`Sense::hover` 的气泡本身不抢拖拽。
+        let text_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(BUBBLE_PADDING_X, BUBBLE_PADDING_Y),
+            egui::vec2(text_width, source_h + gap + main_h),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min))
+                .id_salt(("bubble_text", index)),
+            |ui| {
+                ui.set_width(text_width);
+                if let Some(job) = source_job {
+                    ui.add(egui::Label::new(job).selectable(true));
+                    ui.add_space(gap);
+                }
+                if let Some(job) = main_job {
+                    ui.add(egui::Label::new(job).selectable(true));
+                }
+            },
+        );
+
+        // 语言代码画在气泡外侧、朝着对话中线的那一边：他人气泡在右、我方气泡在左。
+        // 这样气泡内不用单独留一行给标签（下面 `label_language` 里是取值规则）。
+        let label_pos = if is_self {
+            egui::pos2(rect.left() - LANGUAGE_LABEL_GAP, rect.center().y)
+        } else {
+            egui::pos2(rect.right() + LANGUAGE_LABEL_GAP, rect.center().y)
+        };
+        ui.painter().text(
+            label_pos,
+            if is_self {
+                egui::Align2::RIGHT_CENTER
+            } else {
+                egui::Align2::LEFT_CENTER
+            },
+            label_language(message),
+            egui::FontId::monospace(LANGUAGE_FONT_SIZE),
+            normal.gamma_multiply(0.5),
+        );
+
+        // 未完成的气泡只给一句悬停提示（不抢拖拽，选中的文本仍可复制）。
+        if message.open {
+            response.on_hover_text("正在识别 / 翻译…");
+        }
+    });
+}
+
+/// 生成一行文本的排版任务：未完成时按「已送入 / 尚未送入」分色，已完成时单色。
+///
+/// 同一份 job 既用来量气泡尺寸，也直接交给 `Label` 渲染（可拖动选中、Ctrl+C 复制）。
+fn row_job(
+    text: &str,
+    open: bool,
+    sent_bytes: usize,
+    font_size: f32,
+    color: egui::Color32,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let font_id = egui::FontId::proportional(font_size);
+    let mut job = egui::text::LayoutJob::default();
+    let sent = if open {
+        clamp_prefix(text, sent_bytes)
+    } else {
+        text.len()
+    };
+
+    job.append(
+        &text[..sent],
+        0.0,
+        egui::TextFormat {
+            font_id: font_id.clone(),
+            color,
+            ..Default::default()
+        },
+    );
+    if sent < text.len() {
+        job.append(
+            &text[sent..],
+            0.0,
+            egui::TextFormat {
+                font_id,
+                color: color.gamma_multiply(UNSENT_COLOR_SCALE),
+                ..Default::default()
+            },
+        );
+    }
+    job.wrap.max_width = wrap_width;
+    job
+}
+
+/// 气泡外侧的语言代码该取哪个字段。
+///
+/// 翻译模式下消息的 `language` 是译文语言、`source_language` 是原文语言；用户要看的是
+/// 「对方/自己说的是什么语言」，所以优先取原文语言。未翻译的消息 `source_language`
+/// 为空，回落到识别语言（两者此时相同语义）。
+fn label_language(message: &Message) -> &str {
+    let language = if message.source_language.is_empty() {
+        &message.language
+    } else {
+        &message.source_language
+    };
+    if language.is_empty() { "…" } else { language }
 }
 
 /// 把「已送入前缀长度」夹到字符边界，避免切片 panic。
@@ -278,82 +272,36 @@ fn clamp_prefix(text: &str, sent: usize) -> usize {
     sent
 }
 
-/// 左侧语言代码列：固定宽度，保证当前句与历史句的文本左端对齐。
-///
-/// 注意：不能用 `allocate_ui_with_layout` + 标签实现——外层拿的是子 Ui 的 `min_rect`
-/// （会缩到内容宽度），语言代码 "…" 比 "ja" 窄时文本就会左移几个像素。这里显式
-/// 分配固定宽度并自己画文字，宽度才是稳定的。
-fn language_column(ui: &mut egui::Ui, language: &str, color: egui::Color32) {
-    let (rect, _response) = ui.allocate_exact_size(
-        egui::vec2(LANGUAGE_COL_WIDTH, ui.spacing().interact_size.y),
-        egui::Sense::hover(),
-    );
-    let code = if language.is_empty() { "…" } else { language };
-    ui.painter().text(
-        rect.left_center(),
-        egui::Align2::LEFT_CENTER,
-        code,
-        egui::FontId::monospace(LANGUAGE_FONT_SIZE),
-        color,
-    );
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::Message;
 
-/// 复制图标按钮（无文字）：悬停高亮，点击复制整行文本。
-fn copy_icon_button(ui: &mut egui::Ui, rect: egui::Rect, text: &str) {
-    // 用位置参与 id，避免两条文本内容相同的字幕共享交互状态
-    let id = ui
-        .scope_id()
-        .with(("subtitle_copy", text, rect.min.x as i32, rect.min.y as i32));
-    let response = ui.interact(rect, id, egui::Sense::click());
-
-    let color = if response.hovered() {
-        ui.visuals().text_color()
-    } else {
-        ui.visuals().text_color().gamma_multiply(0.55)
-    };
-    if response.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(4),
-            ui.visuals().widgets.hovered.bg_fill,
-        );
+    fn message(language: &str, source_language: &str) -> Message {
+        Message {
+            speaker: Speaker::Local,
+            open: false,
+            text: "hello".to_string(),
+            language: language.to_string(),
+            sent_bytes: 5,
+            source: "こんにちは".to_string(),
+            source_language: source_language.to_string(),
+            source_sent_bytes: 15,
+            sentence_id: Some(1),
+        }
     }
-    paint_copy_icon(
-        ui.painter(),
-        rect.shrink(4.0),
-        color,
-        ui.visuals().panel_fill,
-    );
 
-    if response.clicked() {
-        ui.ctx().copy_text(text.to_string());
+    #[test]
+    fn language_label_shows_source_language_in_translation_mode() {
+        // 翻译模式：主行是译文（ja），角标要显示原文语言（zh）。
+        assert_eq!(label_language(&message("ja", "zh")), "zh");
     }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+
+    #[test]
+    fn language_label_falls_back_to_text_language() {
+        // 未翻译：source_language 为空，用主行语言。
+        assert_eq!(label_language(&message("zh", "")), "zh");
+        // 两者都未知：显示占位符。
+        assert_eq!(label_language(&message("", "")), "…");
     }
-}
-
-/// 画一个「两张叠纸」的复制图标（不依赖字体是否带 emoji）。
-fn paint_copy_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    color: egui::Color32,
-    background: egui::Color32,
-) {
-    let stroke = egui::Stroke::new(1.2, color);
-    let corner = egui::CornerRadius::same(2);
-
-    let back = egui::Rect::from_min_size(
-        rect.min + egui::vec2(rect.width() * 0.25, rect.height() * 0.25),
-        egui::vec2(rect.width() * 0.7, rect.height() * 0.7),
-    );
-    painter.rect_filled(back, corner, background);
-    painter.rect_stroke(back, corner, stroke, egui::StrokeKind::Inside);
-
-    let front = egui::Rect::from_min_size(
-        rect.min,
-        egui::vec2(rect.width() * 0.7, rect.height() * 0.7),
-    );
-    painter.rect_filled(front, corner, background);
-    painter.rect_stroke(front, corner, stroke, egui::StrokeKind::Inside);
 }

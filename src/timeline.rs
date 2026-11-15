@@ -86,7 +86,7 @@ impl Timeline {
         if text.is_empty() {
             return;
         }
-        self.insert_front(Message {
+        self.insert_before_history(Message {
             speaker: Speaker::Local,
             open: false,
             text,
@@ -236,6 +236,9 @@ impl Timeline {
     }
 
     /// 把某条线路的未完成消息定稿：重复的最终结果或空译文直接丢弃。
+    ///
+    /// 定稿后消息要沉到所有未完成消息之后——未完成消息永远占据列表最前面，
+    /// 这样「当前句」不会被别的新消息顶下去，只有它自己定稿时才让位（D39）。
     fn finalize_open(&mut self, speaker: Speaker, sentence_id: Option<u64>) {
         let Some(index) = self.open_index(speaker) else {
             return;
@@ -255,12 +258,34 @@ impl Timeline {
         message.sent_bytes = 0;
         message.source_sent_bytes = 0;
         message.sentence_id = sentence_id;
+
+        // 剩下的未完成消息仍排在最前，把这条挪到它们后面。
+        let remaining_open = self.messages.iter().filter(|message| message.open).count();
+        if index != remaining_open {
+            let message = self.messages.remove(index);
+            self.messages.insert(remaining_open, message);
+        }
     }
 
     /// 插到最前面并裁剪到上限（丢最旧的）。
     fn insert_front(&mut self, message: Message) {
         self.messages.insert(0, message);
         self.messages.truncate(MAX_MESSAGES);
+    }
+
+    /// 插到第一条历史消息之前（未完成消息之后），并裁剪到上限。
+    fn insert_before_history(&mut self, message: Message) {
+        let index = self.open_count();
+        self.messages.insert(index, message);
+        self.messages.truncate(MAX_MESSAGES);
+    }
+
+    /// 未完成消息数量：它们永远连续排在列表最前面。
+    fn open_count(&self) -> usize {
+        self.messages
+            .iter()
+            .take_while(|message| message.open)
+            .count()
     }
 }
 
@@ -415,18 +440,46 @@ mod tests {
     }
 
     #[test]
-    fn typed_sentence_goes_to_history_without_touching_open() {
+    fn typed_sentence_goes_to_history_below_open_message() {
         let mut timeline = Timeline::default();
         asr(&mut timeline, Speaker::Local, "正在识别", 0, false);
         timeline.push_typed("打字输入。".to_string(), "ja".to_string());
         assert_eq!(timeline.messages().len(), 2);
-        assert_eq!(
-            timeline.messages()[0].text,
-            "打字输入。",
-            "打字输入插到最前"
-        );
+        assert!(timeline.messages()[0].open, "当前句仍钉在最上面");
+        assert_eq!(timeline.messages()[1].text, "打字输入。");
+        assert!(!timeline.messages()[1].open);
+    }
+
+    #[test]
+    fn open_sentence_stays_on_top_while_other_side_finishes() {
+        let mut timeline = Timeline::default();
+        timeline.apply_asr(Speaker::Local, "我在说话", false, 0, None, None);
+        // 对方开始并立刻完成一句：不能把我方当前句顶下去
+        timeline.apply_asr(Speaker::Others, "对方说话。", true, 0, None, None);
+        assert_eq!(timeline.messages().len(), 2);
+        assert!(timeline.messages()[0].open, "我方当前句仍在最上面");
+        assert_eq!(timeline.messages()[0].text, "我在说话");
+        assert_eq!(timeline.messages()[1].text, "对方说话。");
+        assert!(!timeline.messages()[1].open, "定稿的消息在未完成消息之后");
+
+        // 我方定稿后才让位到历史区（仍是历史里最新的一条）
+        timeline.apply_asr(Speaker::Local, "我在说话。", true, 0, None, None);
         assert!(!timeline.messages()[0].open);
-        assert!(timeline.messages()[1].open, "ASR 当前句不受影响");
+        assert_eq!(timeline.messages()[0].text, "我在说话。");
+        assert_eq!(timeline.messages()[1].text, "对方说话。");
+    }
+
+    #[test]
+    fn both_open_sentences_stay_below_each_other() {
+        let mut timeline = Timeline::default();
+        timeline.apply_asr(Speaker::Local, "我方", false, 0, None, None);
+        timeline.apply_asr(Speaker::Others, "对方", false, 0, None, None);
+        // 两条未完成消息都在开头，后开始的一条在上面
+        assert_eq!(timeline.messages().len(), 2);
+        assert!(timeline.messages()[0].open);
+        assert!(timeline.messages()[1].open);
+        assert_eq!(timeline.messages()[0].text, "对方");
+        assert_eq!(timeline.messages()[1].text, "我方");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 > 用户可见行为进 [`README.md`](../README.md)；本文件随后删除（git 历史保留）。
 > 配置字段的最终事实源仍然是 [`src/config.rs`](../src/config.rs)，本文件中的 TOML 只是方案快照。
 
-**状态**：需求已冻结；P0–P6 已完成，P7（气泡时间线）待开工。
+**状态**：需求已冻结；P0–P7 已完成，P8（收尾）待开工。
 
 ---
 
@@ -248,12 +248,12 @@ pub struct Message {
 
 pub struct Timeline {
     pub translation: [bool; 2],              // 按方向的翻译开关
-    pub messages: Vec<Message>,              // 索引 0 = 最新
+    pub messages: Vec<Message>,              // 未完成在前，其余新→旧
     pub last_finalized: [Option<u64>; 2],    // 按方向的 sentence_id 去重记忆
 }
 ```
 
-- 不变量：每个方向至多一条 `open` 消息；新消息插入 `messages[0]`；同一 `open` 消息原地更新（不改位置）。
+- 不变量：每个方向至多一条 `open` 消息，且未完成消息连续排在列表最前；新建的未完成消息插到它们中间（最新一条在上），定稿后沉到未完成区之后；同一 `open` 消息原地更新（不改位置）。
 - 去重按 `(方向, sentence_id)`——两条线来自不同 ASR 服务，id 空间互不相干。
 - 上限 500 条，超出丢弃最旧（队尾）。
 - 接口：`apply_source` / `apply_translation` / `push_typed` / `reset_open` / `speaker_view(Speaker)`。
@@ -301,7 +301,7 @@ pub struct Timeline {
   落地内容：`gui/self_tab.rs`、`gui/others_tab.rs`、`gui/language_list.rs`（两页复用的有序语言列表）；`Tab::Local` / `Tab::Others`，顺序 **实时 / 音频 / 自己 / 他人 / 语音识别 / 语音合成 / VRChat / 翻译 / 设置**；`[vrchat] process` 用文本框 + 「应用」；语音识别页只剩模型/热词，翻译页只剩粒度/显示原文/模型。
   GUI 验证（2026-11-15）：九个页签顺序与截图一致；「自己」页关「合成语音并播放」→ 保存后 `[self] tts = false` 落盘、恢复后该键消失；「他人」页开/关「侦听他人语音」→ 保存后 `[others] enabled` 正确写入；VRChat 页改监听进程并「应用」→ `[vrchat] process` 落盘；语音识别页不再有语言列表、翻译页不再有开关与目标语言。
 - [x] **P3 契约与纯逻辑**：`Speaker` + 事件来源；`timeline.rs`；`chatbox` 投影；单测。D39 已落地。
-  落地内容：`events::Speaker { Local, Others }`，`Asr` / `Translation` / `VadActive` 带 `speaker`；`timeline::Timeline` 替代 `subtitles.rs`（消息带来源、每条线路至多一条未完成消息、按 `(speaker, sentence_id)` 去重、合并上限 500）；`chatbox::compose(&SpeakerView, display)`；OSC 只消费 `Local`；实时页改为按时间线渲染（布局暂不变，P7 再改气泡）。
+  落地内容：`events::Speaker { Local, Others }`，`Asr` / `Translation` / `VadActive` 带 `speaker`；`timeline::Timeline` 替代 `subtitles.rs`（消息带来源、每条线路至多一条未完成消息、按 `(speaker, sentence_id)` 去重、合并上限 500）；`chatbox::compose(&SpeakerView, display)`；OSC 只消费 `Local`；实时页改为按时间线渲染。
   验证（2026-11-15）：门禁全绿（lib 244）；GUI 启动后实时页空状态正常；真实启动会话后用打字输入提交一句，消息以 `zh` 语言列 + 大字行出现在时间线顶部、输入框清空。
 - [x] **P4 会话拆分**：`asr_line` / `self_line` / 会话瘦身；我方行为零变化；全门禁 + GUI 冒烟。
   落地内容：`pipeline/asr_line.rs`（chunk → VAD 线程 → ASR 任务 → `AsrEvent`，我方与他人线路共用）、`pipeline/self_line.rs`（我方调度循环原样搬移：语言判定/分块/翻译/打字输入/TTS 边界，886 行）、`pipeline/session.rs` 从 1174 行降到 377 行，只做建连、设备、音色、翻译 worker 与收尾。
@@ -314,7 +314,9 @@ pub struct Timeline {
     验证（2026-11-15）：`tts=false + translate=true` 打字输入 → 时间线显示 `zh` 原文 + `ja` 译文、日志「未启用语音合成：跳过音色解析与 TTS」、无 TTS WebSocket；`mic=false + tts=false` → 日志「输入设备：（未启用麦克风）；输出设备：（未启用语音合成）」、无 ASR 连接、打字输入仍上屏。
   - [x] 他人线路翻译：第二个 MT worker（目标 `[others] target`）+ 复用 `self_line` 的句子状态/分块器/`TranslationRuntime` + 句终屏障，译文以 `Speaker::Others` 进时间线。
     验证（2026-11-15 真机 VRChat）：`[others] languages = ["ja"]`、`translate = true`、`target = "zh"`，开始会话后 `他人语音：已连接进程 VRChat.exe（PID 25940）`，VRChat 内真实日语语音连续产出四条「`ja` 原文 + `zh` 译文」的消息，`他人 ●` 指示器随语音亮起，停止后干净退出。
-- [ ] **P7 界面**：气泡时间线重写（最新在上、左右对齐、角标、分色、复制）。
+- [x] **P7 界面**：气泡时间线重写（最新在上、左右对齐、角标、分色、复制）。
+  落地内容：`gui/realtime_tab.rs` 全量重写为气泡渲染——先按可用宽度排版 galley、再按实际尺寸画气泡（`Frame` / `Label` 会把内容撑满可用宽度）；我方用强调色底、他人用中性底，未完成时整体压暗；气泡内「原文小字（13pt）+ 主行大字（20pt）」，`zh` / `ja` 代码画在气泡外侧（他人气泡右侧 / 我方气泡左侧，未判定显示 `…`），不占气泡内的行高；当前句按「已送入 / 尚未送入」前缀分色；气泡里的原文与译文都用 `Label::selectable` 渲染，可拖动选中并用 Ctrl+C 复制，不再提供复制按钮（按钮会抢走拖拽）；消息间距取代分隔线。
+  验证（2026-11-15，egui_mcp + 真机 VRChat）：左右分栏、宽度贴合内容、双语气泡、原文语言代码位置均正确；拖动可选中文本（高亮可见），真实键盘 Ctrl+C 能把选中文字写入剪贴板（egui_mcp 的合成按键不产生 `Event::Copy`，需用真实按键验证）；新消息插入顶部不顶走视图。
 - [ ] **P8 收尾**：文档四件套、门禁、真机冒烟。
 
 每阶段结束跑 `CONTRIBUTING.md` 第 5 节门禁；GUI 改动用 egui_mcp + 截图验证。
