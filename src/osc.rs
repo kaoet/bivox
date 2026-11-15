@@ -289,6 +289,7 @@ impl Runtime {
             PipelineEvent::Devices { .. }
             | PipelineEvent::VoiceInfo { .. }
             | PipelineEvent::VadActive { .. }
+            | PipelineEvent::OthersStatus(_)
             | PipelineEvent::Warning { .. }
             | PipelineEvent::Error { .. } => {}
         }

@@ -847,7 +847,7 @@
   - 去重按 `(speaker, sentence_id)`；历史上限 500 条（两条线路合并计算）；`reset_open` 只清未完成消息。
 - OSC 与 TTS 只消费 `Speaker::Local`：`ChatboxService` 直接跳过他人事件，`chatbox::compose(&SpeakerView, display)` 用 `timeline.speaker_view(Speaker::Local)`。
 - 翻译开关按线路生效：`Timeline::set_translation(speaker, enabled)`，两条线路对 `Asr` 事件的解释各自独立。
-- `speaker` 不参与渲染结构的抽象：界面按来源决定位置/对齐（P7 的气泡时间线）。
+- `speaker` 不参与渲染结构的抽象：界面按来源决定位置/对齐（后续的气泡时间线）。
 
 **理由**
 
@@ -858,9 +858,37 @@
 
 **边界**
 
-- `timeline` 是纯逻辑（不依赖 egui / 时间），单测覆盖；GUI 渲染在 P7 改成左右分栏气泡。
+- `timeline` 是纯逻辑（不依赖 egui / 时间），单测覆盖；GUI 目前仍按单列列表渲染，后续再做左右分栏气泡。
 - `Speaker` 变体叫 `Local` / `Others`（`Self` 是 Rust 关键字），与配置字段 `local` / `others` 对应。
-- `VadActive` 也带来源，但顶栏两个指示器分别在对方线路（P4）与界面（P7）落地。
+- `VadActive` 也带来源；两个指示器随各自线路接入而启用。
+
+---
+
+## D40 他人线路的重连与状态横幅
+
+**决定**
+
+- 他人线路是会话里的独立 tokio 任务（`pipeline::others_line`）：进程不可达、进程退出、采集断流、该线路 ASR 退出都只让它自己重连，**不影响会话本身**。
+- 状态机 `Connecting → Capturing ⇄ Waiting`：`Connecting` 按 `[vrchat] process` 找 PID 并打开环回采集；`Capturing` 表示采集与对方 ASR 正常；`Waiting` 表示失败后退避等待。
+- 退避 1s → 2s → 4s → 8s → 10s 封顶、**无限重试**；每次成功进入 `Capturing` 复位退避。
+- 事件与日志都**按状态跳变**：进入 `Waiting` 发一次 `OthersStatus{retry_in}` + 一条 warn；恢复进 `Capturing` 发一次状态 + 一条 info；`Waiting` 期间每次重试失败不重复记日志。用户主动停止导致的采集结束不算失败。
+- 界面：黄色**实时状态**横幅（不是一次性告警，不可手动关闭），`Waiting` 时显示「原因；N 秒后重试」并每 500ms 重绘倒计时，`Capturing` 时自动消失，会话结束时清空。
+- `Waiting` 期间拆掉该线路的 ASR 连接（让 run-task `finish-task`），重连成功后重建，避免拿一条没有音频的 WS 空转计费。
+- 顶栏新增 `他人 ● 状态` 指示器：只在 `[others] enabled = true` 时显示。
+- 他人线路的 ASR 错误**不升级为会话级 `Error`**：`asr_line` 的错误出口由调用方传入，他人线路给它一条私有通道，只用于触发重连。
+
+**理由**
+
+- 需求明确把「VRChat 进程连不上」当临时错误：VRChat 未启动、退房、重启都极常见，按会话级错误处理会让用户每退一次房就手动重新开始。
+- 用户需要知道「现在到底连上没有」：状态事件 + 倒计时横幅比日志直接，又不刷告警条。
+- 状态跳变才记日志/发事件：`Waiting` 期间每秒重试会产生大量重复噪声。
+- 拆掉空闲 ASR 连接：run-task 约 23 秒没有音频会被服务端判失败，挂着只会白计费并引入重连风暴。
+
+**边界**
+
+- 状态横幅只描述他人线路；我方线路的错误仍走红色错误条与会话 `Failed`。
+- 退避上限 10s：VRChat 启动通常几秒内完成，10s 足够快又不至于频繁开环回。
+- 他人线路的 VAD 参数暂时复用 `[vad]`（与我方相同），没有独立配置。
 
 ---
 

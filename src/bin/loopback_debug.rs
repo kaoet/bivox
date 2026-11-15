@@ -72,6 +72,10 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    let mut chunks = capture
+        .take_chunks()
+        .ok_or_else(|| anyhow!("采集句柄缺少音频块接收端"))?;
+
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     let mut second = 0u32;
     let mut level = Level::default();
@@ -81,7 +85,7 @@ fn main() -> Result<()> {
     let mut loudest = f64::NEG_INFINITY;
 
     while Instant::now() < deadline {
-        let Some(chunk) = capture.chunks.blocking_recv() else {
+        let Some(chunk) = chunks.blocking_recv() else {
             break;
         };
         total_chunks += 1;

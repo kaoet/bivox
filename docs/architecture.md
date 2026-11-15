@@ -18,6 +18,7 @@ kaols 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 - 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口、声音复刻 HTTP 接口，以及 ASR 预编译热词管理 HTTP 接口（D31）；
 - 翻译模式（`[self] translate`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成，字幕以「译文 + 原文」双语呈现（M2，D26；独立 GUI 翻译页是 M3）；
 - VRChat OSC 聊天框（`[vrchat.osc]`，D33）：会话事件额外喂给独立后台任务，按固定 1 秒文本间隔、typing 跳变和约 30 秒自然过期更新本机 `127.0.0.1:9000` 的 ChatBox；
+- 他人线路（`[others]`，D36/D40）：独立 tokio 任务用进程环回采集 VRChat 的音频 → 本地 VAD → 第二条 ASR，文本只进时间线上屏（不发 OSC、不做 TTS）；进程不可达时按退避自动重连，不影响会话；
 - 没有本地语音模型，运行必须联网并配置 API Key。
 
 ### 数据流
@@ -105,6 +106,7 @@ src/
 ├── pipeline/
 │   ├── asr_line.rs      识别线路接线：chunk → VAD 线程 → ASR 任务 → AsrEvent（两条线路共用）
 │   ├── self_line.rs     我方调度：ASR → 语言判定 → 分块 → 翻译/TTS/字幕 + 打字输入
+│   ├── others_line.rs   他人线路：进程环回采集 → ASR → 只上屏；自带退避重连（D40）
 │   ├── chunker.rs       流式文本分块（含翻译模式 ChunkPolicy）
 │   ├── translator.rs    翻译 worker（单 in-flight 保序，generation 丢弃旧结果）
 │   └── session.rs       会话编排：建连、设备、音色、翻译 worker 与生命周期收尾
@@ -146,6 +148,7 @@ src/
 | `pipeline::session` | 一次实时会话的编排：建连、设备、音色、翻译 worker、生命周期与收尾 | 依赖 audio/client/voice/asr + `asr_line` / `self_line` |
 | `pipeline::asr_line` | 「chunk → VAD → ASR」的共用接线，产出 `AsrEvent` 流 | 依赖 audio/client |
 | `pipeline::self_line` | 我方文本流转：语言判定、分块、翻译、TTS 边界、打字输入 | 依赖 client/chunker/translator/voice/language |
+| `pipeline::others_line` | 他人线路：进程环回采集 → 识别 → 只上屏，自带退避重连 | 依赖 audio/process_capture + `asr_line` + language |
 | `client` | 协议实现；不感知 GUI，通过 channel 上报 | 依赖 `ws` 骨架与 `language` |
 | `audio` | 采集/播放/VAD；不感知 GUI | 独立 |
 | `voice` | 配置 → 音色解析/注册/缓存 | 依赖 config + `cache` + 自身 HTTP 客户端 |
@@ -228,9 +231,10 @@ main()
 5. 创建播放引擎（TTS 输出 22050Hz）、启动采集（16kHz）；
 6. 用 `pipeline::asr_line::spawn` 启动 VAD 线程与 ASR 任务（带 `vocabulary_id`），并启动 TTS 任务；
 7. 需要翻译时建 `QwenMtClient` + 翻译 worker，得到 `TranslationRuntime`；
-8. 状态置 `Running`；
-9. 把上述对象交给 `pipeline::self_line::run`（我方调度循环），直到停止或出错；
-10. 收尾（见 3.5）。
+8. `[others] enabled = true` 时 spawn `pipeline::others_line::run`（独立任务，不阻塞启动）；
+9. 状态置 `Running`；
+10. 把上述对象交给 `pipeline::self_line::run`（我方调度循环），直到停止或出错；
+11. 收尾（见 3.5）。
 
 ### 3.5 停止、失败与关闭
 
@@ -320,6 +324,7 @@ pipeline::self_line ──(经 session::emit 克隆, unbounded)──▶ Chatbox
 
 - `PipelineEvent` 字段以 `src/events.rs` 为唯一事实源；事件不携带 egui 类型。
 - `Asr` / `Translation` / `VadActive` 带 `speaker`（`Local` 我方 / `Others` 他人，D39）：两条线路共用同一套事件与时间线，靠来源区分；OSC 与 TTS 只消费 `Local`。
+- `OthersStatus`：他人线路的状态跳变（`Connecting` / `Capturing` / `Waiting` + `retry_in`，D40），界面据此显示带倒计时的状态横幅与顶栏指示器。
 - 会话的 `emit` 同时向 GUI 与 OSC 两个无界通道发送事件克隆；OSC 任务不依赖 GUI 重绘（D33）。
 - `Warning`：用户可感知但不影响会话继续的降级（例如预编译热词注册失败，D31），界面显示黄色「运行告警」条，可手动清除。
 - `TypedSentence`：会话接受一句打字输入、已交给 TTS 排队后发给界面（进字幕历史）。
@@ -555,7 +560,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 12. GUI 结构
 
-- 顶栏：应用名、会话状态灯、VAD 指示器、开始/停止、版本号。
+- 顶栏：应用名、会话状态灯、我方 VAD 指示器（`[others] enabled` 时还有 `他人 ●` 指示器）、开始/停止、版本号。
 - 底部日志面板：可拖拽高度（默认 180，最小 60），等宽字体、按级别着色，只渲染最近 500 行。
 - 中央页签：
 
@@ -571,7 +576,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 | VRChat | 采集进程 + OSC 聊天框 | `[vrchat] process` 文本框 + 「应用」（D36/D38：进指纹，运行中应用会重启会话）；OSC 启用开关、发送端口（1–65535）、三种显示模式、发送测试消息（D33；改值即保存、不重启）；测试消息立即发送、不走 1 秒文本节流 |
 | 设置 | 百炼 + 高级设置 | 整页「保存 / 放弃更改」：百炼（API Key 留空 = 清除、接入域名）与高级设置（缓存文件、分块词数）一次写回；底部「重新加载配置」「打开程序目录」；未配置 Key 时显示弱提示 |
 
-- 错误展示：启动横幅（黄）、配置重新加载失败（红）、运行告警（黄，可清除，D8/D31）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。配置启动失败不会进入主界面，而是原生错误弹窗后退出（D35）。
+- 错误展示：启动横幅（黄）、配置重新加载失败（红）、他人线路状态横幅（黄，实时状态、带倒计时、不可手动关闭，D40）、运行告警（黄，可清除，D8/D31）、管线错误（红，可清除）、写回错误（页内红字）、崩溃信息（红）。配置启动失败不会进入主界面，而是原生错误弹窗后退出（D35）。
 - 语音合成页的“脏”状态 = 合成模型 / 音色草稿 / 当前音色 / 中文方言任一与配置不一致；保存/放弃按钮只在脏时可用；`● 未保存` 为琥珀色提示。
 - 语音识别页的“脏”状态 = 模型 / 归一化后的热词列表任一与配置不一致（空行/重复项不算改动）。
 - 「自己」「他人」页的“脏”状态 = 该页所有草稿字段与 `[self]` / `[others]` 任一不一致；保存写成一次类型化写回（D38）。
@@ -700,3 +705,36 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 2026-11-09 真机复核：144 ASCII 显示 6 行；160 ASCII 在 144 字符处裁尾；12 个显式行只显示 L01–L09；默认 UI 每行约 24 ASCII / 15 中文 / 12 emoji；144 纯中文约 10 行，双语 144 字符会因自动换行超过 9 行而裁掉源文尾。修复后 `chatbox` 按显示宽度估算换行，客户端发的 144 中文/双语样例均为 9 行且保留尾部标记。
 - GUI：egui_mcp 验证页签、开关/模式/端口写回、测试消息发包。
 - 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、30 秒自然过期与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。
+
+---
+
+## 18. 他人线路（进程环回 ASR，D36/D40）
+
+`pipeline/others_line` 是会话里的独立 tokio 任务：按 `[vrchat] process` 找到本机进程，用 WASAPI 进程环回采它的音频（`audio/process_capture.rs`），走与麦克风相同的 `asr_line` 接线（VAD → ASR），文本只作为 `Speaker::Others` 事件进时间线。
+
+### 18.1 状态机与重连
+
+```text
+Connecting ──成功──▶ Capturing
+    ▲                   │ 进程退出 / 采集断流 / ASR 退出
+    └───── Waiting ◀────┘
+```
+
+- `Connecting`：ToolHelp 找 PID → `ProcessCapture::start(pid)` → 等待环回激活（≤10s）。
+- `Capturing`：`asr_line` 在跑，识别事件转发到时间线；本地 VAD 状态发 `VadActive{Others}`。
+- `Waiting`：退避 1s → 2s → 4s → 8s → 10s（封顶，无限重试）；每次成功进入 `Capturing` 复位退避。
+- **状态跳变才发事件/日志**：进入 `Waiting` 发 `OthersStatus{retry_in}` + 一条 warn；恢复发状态 + 一条 info；等待期间重试失败不重复记。
+- 用户主动停止导致的采集结束不算失败（不记告警、不发 `Waiting`）。
+- `Waiting` 时该线路的 ASR 任务被停止（run-task `finish-task`），重连后重建，避免空转计费。
+- 该线路的 ASR 致命错误走私有错误通道，只触发重连，不升级为会话级 `Error`。
+
+### 18.2 界面
+
+- 顶部黄色**实时状态**横幅：`Waiting` 显示「原因；N 秒后重试」（每 500ms 重绘刷新倒计时），`Connecting` 显示「正在连接…」，`Capturing` 自动消失；不可手动关闭，会话结束时清空。
+- 顶栏 `他人 ● 状态` 指示器：只在 `[others] enabled = true` 时显示。
+- 文本只上屏：`Speaker::Others` 事件进 GUI 时间线；OSC 与 TTS 都只消费 `Speaker::Local`，他人翻译尚未接入（先显示原文）。
+
+### 18.3 验证
+
+- 单测：倒计时换算（`retry_seconds`）、时间线的双来源交错与去重。
+- 真机（2026-11-15）：`[vrchat] process` 设为不存在的进程 → 会话照常运行、横幅显示倒计时、日志只记一条 warn；改成 `explorer.exe` 并「应用」→ 触发 D20 重启后他人线路进入 `Capturing`、横幅消失、顶栏出现两个 ASR 就绪日志；停止会话后横幅与指示器清空。

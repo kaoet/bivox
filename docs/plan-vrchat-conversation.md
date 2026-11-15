@@ -5,7 +5,7 @@
 > 用户可见行为进 [`README.md`](../README.md)；本文件随后删除（git 历史保留）。
 > 配置字段的最终事实源仍然是 [`src/config.rs`](../src/config.rs)，本文件中的 TOML 只是方案快照。
 
-**状态**：需求已冻结；P0–P4 已完成，P5（对方线路）待开工。
+**状态**：需求已冻结；P0–P5 已完成，P6（对方翻译 + 打字输入）待开工。
 
 ---
 
@@ -306,7 +306,9 @@ pub struct Timeline {
 - [x] **P4 会话拆分**：`asr_line` / `self_line` / 会话瘦身；我方行为零变化；全门禁 + GUI 冒烟。
   落地内容：`pipeline/asr_line.rs`（chunk → VAD 线程 → ASR 任务 → `AsrEvent`，我方与他人线路共用）、`pipeline/self_line.rs`（我方调度循环原样搬移：语言判定/分块/翻译/打字输入/TTS 边界，886 行）、`pipeline/session.rs` 从 1174 行降到 377 行，只做建连、设备、音色、翻译 worker 与收尾。
   验证（2026-11-15）：门禁全绿（lib 244）；GUI 冒烟：开启翻译 → 开始会话 → 打字输入「你好，今天天气不错。」→ 时间线显示 `zh` 原文行 + `ja` 译文行（走完 self_line 的翻译 → TTS 路径）；停止后状态回空闲、配置已恢复。
-- [ ] **P5 对方线路**：采集 + 重连状态机 + `OthersStatus` + 倒计时横幅 + 双 VAD 指示器（不含翻译）。
+- [x] **P5 对方线路**：采集 + 重连状态机 + `OthersStatus` + 倒计时横幅 + 双 VAD 指示器（不含翻译）。D40 已落地。
+  落地内容：`pipeline/others_line.rs`（独立 tokio 任务：找 PID → 进程环回 → 复用 `asr_line` → 只上屏；`Connecting/Capturing/Waiting` 状态机、1→2→4→8→10s 退避、按跳变发状态与日志、等待时拆掉 ASR 连接）；`events::OthersStatus`；顶部带倒计时的实时状态横幅（不可手动关闭、恢复自动消失）；顶栏 `他人 ●` 指示器；他人 ASR 错误走私有通道只触发重连。
+  验证（2026-11-15）：门禁全绿（lib 245，新增倒计时换算测试）；GUI：`[others] enabled` 后顶栏出现 `他人 ●`；进程设为不存在的名字 → 会话正常运行、横幅「未找到进程 NoSuchApp.exe；1 秒后重试」且日志只记一条 warn；改为 `explorer.exe` 并应用 → D20 重启后 `已连接进程 explorer.exe（PID …）`、横幅消失、两条 ASR 就绪日志；停止后横幅与指示器清空。
 - [ ] **P6 对方翻译 + 打字输入**：对方 MT worker；`tts=false` 时的打字输入输出路径；双向联调。
 - [ ] **P7 界面**：气泡时间线重写（最新在上、左右对齐、角标、分色、复制）。
 - [ ] **P8 收尾**：文档四件套、门禁、真机冒烟。

@@ -75,11 +75,11 @@ pub fn process_alive(pid: u32) -> bool {
 /// 一次采集会话句柄。
 ///
 /// 上层拿到 `chunks` 后要**持续消费**：积压超过 1 秒时采集线程会自行结束（返回错误）。
-/// `ready` / `done` 是一次性接收端（`take()` 后为空），异步调用方 `.await`、同步调用方
-/// `blocking_recv()`。
+/// `chunks` / `ready` / `done` 都是一次性取出的字段（`take_*` 后为空），方便把接收端
+/// 交给别的任务；异步调用方 `.await`、同步调用方 `blocking_recv()`。
 pub struct ProcessCapture {
     /// 门控前的 100ms PCM16 块。
-    pub chunks: mpsc::Receiver<Vec<u8>>,
+    chunks: Option<mpsc::Receiver<Vec<u8>>>,
     /// 采集线程是否已成功启动环回；`Err` 表示激活/初始化失败。
     pub ready: Option<oneshot::Receiver<Result<()>>>,
     /// 采集线程的最终结果（正常停止为 `Ok`）。
@@ -105,12 +105,17 @@ impl ProcessCapture {
             })
             .context("创建进程环回采集线程失败")?;
         Ok(Self {
-            chunks: chunk_rx,
+            chunks: Some(chunk_rx),
             ready: Some(ready_rx),
             done: Some(done_rx),
             stop,
             join: Some(join),
         })
+    }
+
+    /// 取出音频块接收端（只能取一次）；交给识别线路消费。
+    pub fn take_chunks(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.chunks.take()
     }
 
     /// 请求采集线程退出（线程最多再等 50ms 的音频事件）。

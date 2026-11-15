@@ -51,6 +51,41 @@ fn vad_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
     response.on_hover_text(hint);
 }
 
+/// 他人线路的 VAD 指示：只在「他人」页启用侦听时显示（未启用时不占位）。
+fn others_indicator(app: &KaolsApp, ui: &mut egui::Ui) {
+    if !app.config.others.enabled {
+        return;
+    }
+    let (color, state_text, hint) = if app.session.is_none() {
+        (
+            egui::Color32::GRAY,
+            "静音",
+            "实时管线未运行，没有他人线路的 VAD 状态",
+        )
+    } else if !app.config.vad.enabled {
+        (
+            egui::Color32::GRAY,
+            "关闭",
+            "本地 VAD 已关闭（config.toml 的 [vad] enabled = false，音频将全量上传）",
+        )
+    } else if app.vad_active_others {
+        (
+            egui::Color32::from_rgb(0x3c, 0xc9, 0x6f),
+            "激活",
+            "他人线路检测到语音（本地 VAD 已激活，正在上传语音段）",
+        )
+    } else {
+        (
+            egui::Color32::GRAY,
+            "静音",
+            "他人线路未检测到语音（本地 VAD 未激活）",
+        )
+    };
+
+    let response = ui.label(egui::RichText::new(format!("他人 ● {state_text}")).color(color));
+    response.on_hover_text(hint);
+}
+
 pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -66,6 +101,7 @@ pub fn show(app: &mut KaolsApp, ui: &mut egui::Ui) {
 
         // VAD 指示器：就在开始/停止按钮左边
         vad_indicator(app, ui);
+        others_indicator(app, ui);
         ui.add_space(4.0);
 
         if ui

@@ -6,6 +6,8 @@
 //! D39 起每条语音事件都带 [`Speaker`]：我方（麦克风/打字）与他人（进程环回）走同一套
 //! 事件与状态机，靠来源字段区分；OSC 与 TTS 只消费 [`Speaker::Local`]。
 
+use std::time::Duration;
+
 /// 会话状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -60,6 +62,32 @@ impl Speaker {
             Self::Others => "others",
         }
     }
+}
+
+/// 他人线路状态机（D40）。
+///
+/// `Connecting → Capturing ⇄ Waiting`：进程不可达或采集断流都退回 `Waiting`，
+/// 按退避重试；这不影响我方线路与会话本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OthersLineState {
+    /// 正在按进程名找 PID 并尝试打开环回采集。
+    Connecting,
+    /// 采集正常，对方 ASR 在跑。
+    Capturing,
+    /// 进程不可达 / 采集断流，等待重试。
+    Waiting,
+}
+
+/// 他人线路的状态快照（界面用；只在状态跳变时发）。
+#[derive(Debug, Clone)]
+pub struct OthersStatus {
+    pub state: OthersLineState,
+    /// 给用户看的原因（`Waiting` 时的失败原因）。
+    pub detail: String,
+    /// 下一次重试的倒计时；仅 `Waiting` 有值。
+    pub retry_in: Option<Duration>,
+    /// 目标进程 PID；`Connecting` / `Capturing` 时有值。
+    pub pid: Option<u32>,
 }
 
 /// 后台 → 界面的消息。
@@ -117,6 +145,10 @@ pub enum PipelineEvent {
         speaker: Speaker,
         active: bool,
     },
+    /// 他人线路的状态跳变（`Connecting` / `Capturing` / `Waiting`，D40）。
+    ///
+    /// 只在跳变时发：`Waiting` 带 `retry_in`，界面据此显示倒计时；`Capturing` 表示恢复。
+    OthersStatus(OthersStatus),
     /// 用户可感知、但不影响会话继续运行的告警（黄色横幅）。
     ///
     /// 典型场景：配置了预编译热词但注册/更新失败，本次识别降级为不带热词继续跑（D31）。

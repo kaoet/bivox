@@ -2,10 +2,11 @@
 
 use std::collections::VecDeque;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use eframe::egui;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
@@ -14,7 +15,7 @@ use crate::config::{
     DEFAULT_VAD_THRESHOLD, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
 };
 use crate::config_edit;
-use crate::events::{PipelineEvent, SessionState, Speaker};
+use crate::events::{OthersLineState, OthersStatus, PipelineEvent, SessionState, Speaker};
 use crate::gui;
 use crate::log_sink::{self, LogLine, MAX_LOG_LINES};
 use crate::osc::{ChatboxService, ChatboxSettings};
@@ -84,6 +85,11 @@ fn normalize_device(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// 横幅倒计时：把「下一次重试时刻」换算成向上取整的秒数（已过期按 0）。
+fn retry_seconds(deadline: Instant, now: Instant) -> u64 {
+    deadline.saturating_duration_since(now).as_secs_f64().ceil() as u64
 }
 
 /// 应用状态。
@@ -189,6 +195,10 @@ pub struct KaolsApp {
     pub vad_active: bool,
     /// 他人线路的 VAD 指示（由对方线路上报；对方线路未启用时保持 false）。
     pub vad_active_others: bool,
+    /// 他人线路的最近状态（`None` = 未启用或会话未运行）。
+    pub others_status: Option<OthersStatus>,
+    /// 他人线路下一次重试的相对时刻（由 `retry_in` 换算，界面倒计时用）。
+    pub others_retry_deadline: Option<Instant>,
     /// 启动检查发现的问题（日志初始化失败等非致命问题）。
     pub startup_error: Option<String>,
     /// 运行期崩溃信息（panic 钩子写入）。
@@ -271,6 +281,8 @@ impl KaolsApp {
             pipeline_error: None,
             vad_active: false,
             vad_active_others: false,
+            others_status: None,
+            others_retry_deadline: None,
             startup_error,
             crash: None,
             log: VecDeque::new(),
@@ -966,8 +978,8 @@ impl KaolsApp {
     fn apply_translation_modes(&mut self) {
         self.timeline
             .set_translation(Speaker::Local, self.config.local.translate);
-        self.timeline
-            .set_translation(Speaker::Others, self.config.others.translate);
+        // 他人线路目前只显示原文（它的翻译尚未接入），时间线按「不翻译」解释它的事件。
+        self.timeline.set_translation(Speaker::Others, false);
     }
 
     /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。
@@ -1126,6 +1138,9 @@ impl KaolsApp {
                     self.session = None;
                     self.running_config_signature = None;
                     self.vad_active = false;
+                    self.vad_active_others = false;
+                    self.others_status = None;
+                    self.others_retry_deadline = None;
                     self.typed_input_error = None;
                     // 会话结束：清掉可能残留的「当前句」（历史保留）
                     self.timeline.reset_open();
@@ -1186,6 +1201,20 @@ impl KaolsApp {
                 Speaker::Local => self.vad_active = active,
                 Speaker::Others => self.vad_active_others = active,
             },
+            PipelineEvent::OthersStatus(status) => {
+                // 他人线路状态是实时状态（带倒计时），不是一次性告警：恢复后自动消失。
+                self.others_retry_deadline = status.retry_in.map(|retry| Instant::now() + retry);
+                if status.state == OthersLineState::Capturing {
+                    debug!("他人语音：采集中（PID {:?}）", status.pid);
+                } else {
+                    debug!("他人语音：{:?} {}", status.state, status.detail.trim());
+                }
+                if status.state != OthersLineState::Capturing && self.config.others.enabled {
+                    self.others_status = Some(status);
+                } else {
+                    self.others_status = None;
+                }
+            }
             PipelineEvent::Warning { context, detail } => {
                 // 不影响会话继续的告警（如预编译热词降级，D31）：黄色横幅，可手动清除。
                 self.pipeline_warning = Some(format!("{context}：{detail}"));
@@ -1234,6 +1263,45 @@ impl KaolsApp {
         false
     }
 
+    /// 他人线路的实时状态横幅：等待/连接中显示原因与倒计时，恢复后自动消失。
+    ///
+    /// 与「运行告警」不同：它是实时状态（不可手动关闭），所以每 500ms 请求重绘刷新倒计时。
+    fn others_status_banner(&self, ui: &mut egui::Ui) {
+        let Some(status) = &self.others_status else {
+            return;
+        };
+        let detail = status.detail.trim();
+        let text = match status.state {
+            OthersLineState::Capturing => return,
+            OthersLineState::Connecting => {
+                if detail.is_empty() {
+                    "正在连接…".to_string()
+                } else {
+                    format!("正在连接…（{detail}）")
+                }
+            }
+            OthersLineState::Waiting => {
+                let seconds = self
+                    .others_retry_deadline
+                    .map(|deadline| retry_seconds(deadline, Instant::now()));
+                match (detail.is_empty(), seconds) {
+                    (true, Some(seconds)) => format!("{seconds} 秒后重试"),
+                    (false, Some(seconds)) => format!("{detail}；{seconds} 秒后重试"),
+                    (true, None) => "等待重试".to_string(),
+                    (false, None) => detail.to_string(),
+                }
+            }
+        };
+        gui::widgets::banner(
+            ui,
+            "他人语音",
+            &text,
+            egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
+        );
+        // 倒计时每秒都在变：即使没有新事件也要让界面继续刷新。
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
         if let Some(detail) = self.crash.clone() {
             gui::widgets::banner(
@@ -1259,6 +1327,7 @@ impl KaolsApp {
                 egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
             );
         }
+        self.others_status_banner(ui);
         if let Some(detail) = self.pipeline_warning.clone() {
             gui::widgets::banner(
                 ui,
@@ -1603,6 +1672,19 @@ pub fn run(paths: AppPaths) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_countdown_rounds_up() {
+        let now = Instant::now();
+        assert_eq!(retry_seconds(now + Duration::from_millis(1), now), 1);
+        assert_eq!(retry_seconds(now + Duration::from_millis(2_500), now), 3);
+        assert_eq!(retry_seconds(now, now), 0);
+        assert_eq!(
+            retry_seconds(now - Duration::from_secs(5), now),
+            0,
+            "已过期的倒计时按 0 处理"
+        );
+    }
+
     #[test]
     fn config_signature_is_stable_across_instances() {
         // `custom_voices` 是 HashMap，两次解析的同内容配置 Debug 顺序可能不同；

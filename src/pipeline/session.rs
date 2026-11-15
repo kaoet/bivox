@@ -239,7 +239,7 @@ pub async fn run(
         let tts_config = QwenTtsConfig {
             api_key: api_key.clone(),
             tts_model: config.tts.model.clone(),
-            ws_url: inference_ws_url,
+            ws_url: inference_ws_url.clone(),
             dialect: config.tts.dialect.clone(),
         };
         let tts_playback = playback.clone();
@@ -288,6 +288,24 @@ pub async fn run(
     } else {
         (None, None)
     };
+
+    // 他人线路（D36/D40）：独立任务，进程不可达时自己退避重连，不影响本会话。
+    if config.others.enabled {
+        tasks.push(tokio::spawn(crate::pipeline::others_line::run(
+            crate::pipeline::others_line::Params {
+                api_key: api_key.clone(),
+                model: config.asr.model.clone(),
+                ws_url: inference_ws_url,
+                vocabulary_id: hotwords.vocabulary_id.clone(),
+                vad: config.vad.clone(),
+                process: config.vrchat.process.clone(),
+                languages: config.others.languages.clone(),
+                running: handle.running.clone(),
+                events: events.clone(),
+                repaint: repaint.clone(),
+            },
+        )));
+    }
 
     emit(PipelineEvent::StateChanged(SessionState::Running));
 
