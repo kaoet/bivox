@@ -1,9 +1,13 @@
-//! 他人线路：进程环回采集 → 本地 VAD → ASR → 只上屏（D36/D39/D40）。
+//! 他人线路：进程环回采集 → 本地 VAD → ASR →（可选翻译）→ 只上屏（D36/D39/D40）。
 //!
 //! 与 [`crate::pipeline::self_line`] 不同，这条线路没有 TTS、不写 OSC，也没有打字输入；
 //! 它要处理的是「目标进程随时可能不在」：找不到进程、进程退出、采集断流都退回
 //! [`OthersLineState::Waiting`]，按 1s → 2s → 4s → 8s → 10s 退避**无限重连**。这些都属于
 //! 临时错误，只发 [`PipelineEvent::OthersStatus`] 与日志，不影响会话本身。
+//!
+//! 翻译（`[others] translate`）：复用 `self_line` 的句子级语言状态、分块器与
+//! `TranslationRuntime`；译文只进时间线，不产生 TTS 请求。翻译 worker 在整个运行期
+//! 只建一次，重连不重建。
 //!
 //! 状态跳变才发状态事件与日志：进入 `Waiting` 记一条 warn，恢复到 `Capturing` 记一条 info，
 //! `Waiting` 期间的每次重试不重复记。
@@ -14,14 +18,18 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use eframe::egui;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::audio::process_capture::{self, ProcessCapture};
 use crate::client::AsrEvent;
-use crate::config::VadConfig;
+use crate::client::qwen_mt::QwenMtClient;
+use crate::config::{TranslateGranularity, VadConfig};
 use crate::events::{OthersLineState, OthersStatus, PipelineEvent, Speaker};
-use crate::language::LanguageTracker;
+use crate::language::{LanguageTracker, canonical_language};
 use crate::pipeline::asr_line::{self, AsrLineParams};
+use crate::pipeline::chunker::{ChunkPolicy, TextChunker};
+use crate::pipeline::self_line::{SentenceLanguageState, TranslationRuntime};
+use crate::pipeline::translator::{self, TranslationDone, TranslationJob};
 
 /// 重连退避：1s → 2s → 4s → 8s → 10s（封顶，之后一直用 10s）。
 const BACKOFF: [Duration; 5] = [
@@ -37,6 +45,16 @@ const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// 该线路 ASR 任务收尾的上限。
 const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// 翻译 worker 收尾的上限。
+const MT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 他人线路的翻译设置（与 `[translate]` 共用模型，目标语言取 `[others] target`）。
+pub struct OthersTranslate {
+    pub model: String,
+    pub chat_url: String,
+    pub target: String,
+    pub granularity: TranslateGranularity,
+}
 
 /// 启动他人线路所需的参数（由会话准备好后传入）。
 pub struct Params {
@@ -45,10 +63,14 @@ pub struct Params {
     pub ws_url: String,
     pub vocabulary_id: Option<String>,
     pub vad: VadConfig,
+    /// 分块词数阈值（`[chunking] words`，翻译分块用）。
+    pub chunk_words: usize,
     /// 要采集的进程（exe 文件名，含子进程）。
     pub process: String,
     /// 他人语言列表（有序，首个为默认）。
     pub languages: Vec<String>,
+    /// 翻译设置；`None` = 只显示原文。
+    pub translate: Option<OthersTranslate>,
     /// 会话级取消标志：置 false 时本任务尽快退出。
     pub running: Arc<AtomicBool>,
     pub events: UnboundedSender<PipelineEvent>,
@@ -107,6 +129,12 @@ struct ActiveLine {
     vad_degraded: Arc<AtomicBool>,
 }
 
+/// 翻译模式下每条采集会话的句子状态。
+struct TranslateState {
+    chunker: TextChunker,
+    sentence: SentenceLanguageState,
+}
+
 /// 运行他人线路，直到会话被取消。内部自己负责重连。
 pub async fn run(params: Params) {
     let Params {
@@ -115,21 +143,47 @@ pub async fn run(params: Params) {
         ws_url,
         vocabulary_id,
         vad,
+        chunk_words,
         process,
         languages,
+        translate,
         running,
         events,
         repaint,
     } = params;
     let emit = Emitter { events, repaint };
     let config = LineConfig {
-        api_key,
+        api_key: api_key.clone(),
         model,
         ws_url,
         vocabulary_id,
         vad,
-        languages,
+        languages: languages.clone(),
         repaint: emit.repaint.clone(),
+    };
+
+    // 翻译 worker：整个运行期共用一份，重连不重建。
+    let (mut translation, mut rx_mt, mut mt_worker) = match &translate {
+        Some(cfg) => match QwenMtClient::new(api_key, cfg.model.clone(), cfg.chat_url.clone()) {
+            Ok(client) => {
+                let (tx_job, done_rx, worker) =
+                    translator::spawn(client, cfg.target.clone(), running.clone());
+                (
+                    Some(TranslationRuntime::new(cfg.target.clone(), tx_job)),
+                    Some(done_rx),
+                    Some(worker),
+                )
+            }
+            Err(err) => {
+                log::error!("他人语音：翻译客户端初始化失败，本次只显示原文：{err:#}");
+                emit.send(PipelineEvent::Warning {
+                    context: "他人语音翻译未启用".to_string(),
+                    detail: format!("翻译客户端初始化失败，本次只显示原文：{err:#}"),
+                });
+                (None, None, None)
+            }
+        },
+        None => (None, None, None),
     };
 
     let mut backoff_index = 0usize;
@@ -138,7 +192,7 @@ pub async fn run(params: Params) {
 
     loop {
         if !running.load(Ordering::SeqCst) {
-            return;
+            break;
         }
 
         // 1) 找进程并尝试开采集。
@@ -151,12 +205,25 @@ pub async fn run(params: Params) {
                         // 成功：复位退避。
                         backoff_index = 0;
                         failing = false;
+                        if let Some(runtime) = translation.as_mut() {
+                            runtime.reset_sentence();
+                        }
                         log::info!("他人语音：已连接进程 {process}（PID {pid}）");
                         emit.status(OthersLineState::Capturing, String::new(), None, Some(pid));
-                        drive(active, &running, &emit, &config.languages).await;
+                        drive(
+                            active,
+                            &running,
+                            &emit,
+                            &languages,
+                            chunk_words,
+                            translate.as_ref(),
+                            &mut translation,
+                            &mut rx_mt,
+                        )
+                        .await;
                         // 用户停止会话导致的采集结束不算失败：不记告警、不发 Waiting。
                         if !running.load(Ordering::SeqCst) {
-                            return;
+                            break;
                         }
                         failure = "采集已断开".to_string();
                     }
@@ -177,7 +244,22 @@ pub async fn run(params: Params) {
         emit.status(OthersLineState::Waiting, failure, Some(delay), None);
 
         if !sleep_cancellable(delay, &running).await {
-            return;
+            break;
+        }
+    }
+
+    // 收尾：放掉翻译 runtime（关闭 job 通道），再等 worker 退出。
+    drop(translation);
+    drop(rx_mt);
+    if let Some(worker) = mt_worker.take() {
+        if tokio::time::timeout(MT_SHUTDOWN_TIMEOUT, worker)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "他人语音：等待翻译 worker 收尾超时（{}s）",
+                MT_SHUTDOWN_TIMEOUT.as_secs()
+            );
         }
     }
 }
@@ -236,12 +318,17 @@ async fn start(pid: u32, config: &LineConfig) -> Result<ActiveLine> {
     })
 }
 
-/// 采集建立后持续转发识别事件，直到采集结束 / 会话取消 / ASR 任务退出。
+/// 采集建立后持续转发识别/翻译事件，直到采集结束 / 会话取消 / ASR 任务退出。
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     mut active: ActiveLine,
     session_running: &Arc<AtomicBool>,
     emit: &Emitter,
     languages: &[String],
+    chunk_words: usize,
+    translate: Option<&OthersTranslate>,
+    translation: &mut Option<TranslationRuntime>,
+    rx_mt: &mut Option<UnboundedReceiver<TranslationDone>>,
 ) {
     let mut done = match active.capture.done.take() {
         Some(done) => done,
@@ -251,12 +338,37 @@ async fn drive(
         }
     };
 
+    // 只上屏（不翻译）时用轻量语言跟踪；翻译模式复用 self_line 的句子状态与分块器。
     let mut tracker = LanguageTracker::new(languages.to_vec());
     let mut sentence_language: Option<String> = None;
+    let mut translate_state = match (translate, translation.as_ref()) {
+        (Some(cfg), Some(_)) => {
+            let policy = match cfg.granularity {
+                TranslateGranularity::Clause => ChunkPolicy::translation_clause(),
+                TranslateGranularity::Sentence => ChunkPolicy::translation_sentence(),
+            };
+            Some(TranslateState {
+                chunker: TextChunker::with_policy(chunk_words, policy),
+                sentence: SentenceLanguageState::new(languages.to_vec()),
+            })
+        }
+        _ => None,
+    };
+    let mut backlog: std::collections::VecDeque<AsrEvent> = std::collections::VecDeque::new();
     let mut last_vad_active = false;
     let mut degraded_reported = false;
 
     loop {
+        // 句终屏障解除后，先按序处理缓存的 ASR 事件。
+        if let (Some(cfg), Some(state), Some(runtime)) =
+            (translate, translate_state.as_mut(), translation.as_mut())
+            && !runtime.finish_pending
+            && let Some(event) = backlog.pop_front()
+        {
+            on_asr_translated(event, emit, state, runtime, cfg);
+            continue;
+        }
+
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {
                 if !session_running.load(Ordering::SeqCst) {
@@ -290,8 +402,32 @@ async fn drive(
             }
             event = active.asr.events.recv() => {
                 match event {
-                    Some(event) => forward_asr(event, emit, &mut tracker, &mut sentence_language),
+                    Some(event) => {
+                        if let (Some(cfg), Some(state), Some(runtime)) = (
+                            translate,
+                            translate_state.as_mut(),
+                            translation.as_mut(),
+                        ) {
+                            if runtime.finish_pending {
+                                backlog.push_back(event);
+                            } else {
+                                on_asr_translated(event, emit, state, runtime, cfg);
+                            }
+                        } else {
+                            forward_asr(event, emit, &mut tracker, &mut sentence_language);
+                        }
+                    }
                     None => break,
+                }
+            }
+            done_mt = async {
+                match rx_mt.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<TranslationDone>>().await,
+                }
+            } => {
+                if let (Some(runtime), Some(done)) = (translation.as_mut(), done_mt) {
+                    on_translation_done(done, emit, runtime);
                 }
             }
             line_event = active.line_errors.recv() => {
@@ -317,7 +453,126 @@ async fn drive(
     }
 }
 
-/// 把一条识别事件转成时间线事件（他人线路只上屏，没有下游，所以前缀就是全文）。
+/// 翻译模式：把一条 ASR 事件并入句子状态、送翻译，并把源文交给界面。
+fn on_asr_translated(
+    event: AsrEvent,
+    emit: &Emitter,
+    state: &mut TranslateState,
+    runtime: &mut TranslationRuntime,
+    cfg: &OthersTranslate,
+) {
+    state.sentence.on_event(&event.text, event.is_sentence_end);
+    if runtime.sentence_id.is_none() {
+        runtime.sentence_id = event.sentence_id;
+    }
+
+    let chunks = state
+        .chunker
+        .process_stream(&event.text, event.is_sentence_end);
+    for chunk in chunks {
+        let source_language = state.sentence.language_for_chunk();
+        if runtime.source_language.is_none() {
+            runtime.source_language = Some(source_language.clone());
+        }
+        // 源语言与目标语言相同：跳过 MT，直接原样显示。
+        let skip = canonical_language(&source_language) == runtime.target_language.as_str();
+        let job = TranslationJob {
+            generation: runtime.generation,
+            seq: runtime.next_seq,
+            text: chunk.chunk_text,
+            source_language,
+            skip_translation: skip,
+            is_sentence_end: chunk.is_sentence_end,
+        };
+        runtime.next_seq = runtime.next_seq.wrapping_add(1);
+        runtime.pending = runtime.pending.saturating_add(1);
+        if runtime.tx_job.send(job).is_err() {
+            log::warn!("他人语音：翻译 worker 已退出，本句可能缺少译文");
+        }
+        state.sentence.on_chunk(chunk.is_sentence_end);
+    }
+
+    // 源文随 Asr 事件刷新（译文由 Translation 事件累积）；句终时整句都已送翻译。
+    let source_text = state.sentence.current_text().to_string();
+    if !source_text.is_empty() {
+        let sent = if event.is_sentence_end {
+            source_text.len()
+        } else {
+            state.chunker.emitted_byte_len(&source_text)
+        };
+        emit.send(PipelineEvent::Asr {
+            speaker: Speaker::Others,
+            text: source_text,
+            is_sentence_end: false,
+            sent_bytes: sent,
+            language: runtime.source_language.clone(),
+            sentence_id: event.sentence_id.or(runtime.sentence_id),
+        });
+    }
+
+    if event.is_sentence_end {
+        if runtime.pending > 0 {
+            runtime.finish_pending = true;
+        } else {
+            emit_translation_end(emit, runtime);
+            runtime.reset_sentence();
+        }
+    }
+    state.sentence.on_event_end(event.is_sentence_end);
+    let _ = cfg;
+}
+
+/// 翻译模式：并入一条译文；屏障满足时把当前句定稿。
+fn on_translation_done(done: TranslationDone, emit: &Emitter, runtime: &mut TranslationRuntime) {
+    if done.generation != runtime.generation {
+        return;
+    }
+    runtime.pending = runtime.pending.saturating_sub(1);
+
+    match done.result {
+        Ok(text) if !text.is_empty() => {
+            runtime.translated.push_str(&text);
+            emit.send(PipelineEvent::Translation {
+                speaker: Speaker::Others,
+                text: runtime.translated.clone(),
+                sent_bytes: runtime.translated.len(),
+                is_sentence_end: done.is_sentence_end,
+                language: runtime.target_language.clone(),
+                sentence_id: runtime.sentence_id,
+            });
+            runtime.end_event_sent = done.is_sentence_end;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            log::error!("他人语音：翻译失败：{err}");
+            emit.send(PipelineEvent::Error {
+                context: "他人语音翻译失败".to_string(),
+                detail: err,
+            });
+        }
+    }
+
+    if runtime.pending == 0 && (runtime.finish_pending || done.is_sentence_end) {
+        if !runtime.end_event_sent {
+            emit_translation_end(emit, runtime);
+        }
+        runtime.reset_sentence();
+    }
+}
+
+/// 发出「本句译文到此为止」事件（空译文也发，避免源文行一直挂着）。
+fn emit_translation_end(emit: &Emitter, runtime: &TranslationRuntime) {
+    emit.send(PipelineEvent::Translation {
+        speaker: Speaker::Others,
+        text: runtime.translated.clone(),
+        sent_bytes: runtime.translated.len(),
+        is_sentence_end: true,
+        language: runtime.target_language.clone(),
+        sentence_id: runtime.sentence_id,
+    });
+}
+
+/// 只上屏（不翻译）：把一条识别事件直接转成时间线事件。
 fn forward_asr(
     event: AsrEvent,
     emit: &Emitter,

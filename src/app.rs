@@ -978,8 +978,8 @@ impl KaolsApp {
     fn apply_translation_modes(&mut self) {
         self.timeline
             .set_translation(Speaker::Local, self.config.local.translate);
-        // 他人线路目前只显示原文（它的翻译尚未接入），时间线按「不翻译」解释它的事件。
-        self.timeline.set_translation(Speaker::Others, false);
+        self.timeline
+            .set_translation(Speaker::Others, self.config.others.translate);
     }
 
     /// 「开始」：先建事件通道，再把会话丢到 tokio runtime 里跑。

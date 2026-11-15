@@ -221,19 +221,19 @@ main()
 3. 只清空「当前字幕句」，历史字幕保留；
 4. `runtime.spawn` 执行 `pipeline::session::run(...)`；若返回 `Err`，包装任务补发 `PipelineEvent::Error` + `StateChanged(Failed)`。
 
-`session::run` 内部顺序：
+`session::run` 内部顺序（能力开关决定建什么，D37）：
 
 1. 检查 API Key；
-2. `voice::resolve_active_voice`（自定义音色可能上传/复刻，耗时不定），发 `VoiceInfo`；
+2. `[self] tts = true` 时 `voice::resolve_active_voice`（自定义音色可能上传/复刻，耗时不定），发 `VoiceInfo`；否则完全跳过音色解析；
 3. `asr::resolve_vocabulary`（D31）：按 `[asr] hotwords` 创建/校验/更新百炼预编译热词列表，
    写回 `vocabulary_id`；失败只发 `Warning` 并降级为不带热词；
-4. 按完整设备名打开输入/输出设备（失败直接结束会话），发 `Devices`；
-5. 创建播放引擎（TTS 输出 22050Hz）、启动采集（16kHz）；
-6. 用 `pipeline::asr_line::spawn` 启动 VAD 线程与 ASR 任务（带 `vocabulary_id`），并启动 TTS 任务；
-7. 需要翻译时建 `QwenMtClient` + 翻译 worker，得到 `TranslationRuntime`；
+4. 按完整设备名打开**需要的**设备（失败直接结束会话），发 `Devices`（未启用的设备留空）：`[self] mic` 决定输入设备，`[self] tts` 决定输出设备；
+5. `[self] tts = true` 时创建播放引擎（TTS 输出 22050Hz）；`[self] mic = true` 时启动采集（16kHz）；
+6. `[self] mic = true` 时用 `pipeline::asr_line::spawn` 启动 VAD 线程与 ASR 任务（带 `vocabulary_id`）；`[self] tts = true` 时启动 TTS 任务；
+7. 需要翻译时建 `QwenMtClient` + 翻译 worker，得到 `TranslationRuntime`（与是否有 TTS 无关）；
 8. `[others] enabled = true` 时 spawn `pipeline::others_line::run`（独立任务，不阻塞启动）；
 9. 状态置 `Running`；
-10. 把上述对象交给 `pipeline::self_line::run`（我方调度循环），直到停止或出错；
+10. 把上述对象交给 `pipeline::self_line::run`（我方调度循环；`voice` / `asr_events` / `tx_tts` 都是 `Option`，缺失时对应环节变成空操作），直到停止或出错；
 11. 收尾（见 3.5）。
 
 ### 3.5 停止、失败与关闭
@@ -728,13 +728,20 @@ Connecting ──成功──▶ Capturing
 - `Waiting` 时该线路的 ASR 任务被停止（run-task `finish-task`），重连后重建，避免空转计费。
 - 该线路的 ASR 致命错误走私有错误通道，只触发重连，不升级为会话级 `Error`。
 
-### 18.2 界面
+### 18.2 翻译（`[others] translate`）
+
+- 复用 `self_line` 的句子状态、分块器与 `TranslationRuntime`（`pub(crate)`），不另写一套：`SentenceLanguageState` 负责每句语言冻结，`TextChunker` 按 `[translate] granularity` 切块，`TranslationRuntime` 累积译文并按 generation 丢弃过期结果。
+- 与自己的区别：**没有 TTS**，译文只发 `PipelineEvent::Translation{speaker: Others}` 进时间线；句终没有「收口 TTS task」这一步，屏障只用于保证下一句源文不与上一句译文配对。
+- 翻译 worker 在整个他人线路运行期只建一次，重连不重建；`QwenMtClient` 初始化失败时降级为只显示原文并发一条 `Warning`。
+- 源语言与目标语言相同（`[others] target` 与判定语言一致）时跳过 MT，直接把原文作为译文显示。
+
+### 18.3 界面
 
 - 顶部黄色**实时状态**横幅：`Waiting` 显示「原因；N 秒后重试」（每 500ms 重绘刷新倒计时），`Connecting` 显示「正在连接…」，`Capturing` 自动消失；不可手动关闭，会话结束时清空。
 - 顶栏 `他人 ● 状态` 指示器：只在 `[others] enabled = true` 时显示。
-- 文本只上屏：`Speaker::Others` 事件进 GUI 时间线；OSC 与 TTS 都只消费 `Speaker::Local`，他人翻译尚未接入（先显示原文）。
+- 文本只上屏：`Speaker::Others` 事件进 GUI 时间线；OSC 与 TTS 都只消费 `Speaker::Local`。开启 `[others] translate` 后，时间线上一条他人消息是「原文小字行 + 译文大字行」，与自己的双语消息一致。
 
-### 18.3 验证
+### 18.4 验证
 
 - 单测：倒计时换算（`retry_seconds`）、时间线的双来源交错与去重。
 - 真机（2026-11-15）：`[vrchat] process` 设为不存在的进程 → 会话照常运行、横幅显示倒计时、日志只记一条 warn；改成 `explorer.exe` 并「应用」→ 触发 D20 重启后他人线路进入 `Capturing`、横幅消失、顶栏出现两个 ASR 就绪日志；停止会话后横幅与指示器清空。

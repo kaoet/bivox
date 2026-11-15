@@ -155,10 +155,17 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("未配置 API Key，请在「设置」页填写"))?;
 
     // 解析生效音色：系统音色原样返回；`custom:<名字>` 会把所有语言样本并行注册好（可能上传，耗时不定）。
-    let voice = crate::voice::resolve_active_voice(&config).await?;
-    emit(PipelineEvent::VoiceInfo {
-        display: describe_voice(&voice),
-    });
+    // `[self] tts = false` 时完全不解析音色（也不上传复刻），只上屏。
+    let voice = if config.local.tts {
+        let voice = crate::voice::resolve_active_voice(&config).await?;
+        emit(PipelineEvent::VoiceInfo {
+            display: describe_voice(&voice),
+        });
+        Some(voice)
+    } else {
+        log::info!("未启用语音合成：跳过音色解析与 TTS");
+        None
+    };
     if handle.is_cancelled() {
         emit(PipelineEvent::StateChanged(SessionState::Idle));
         return Ok(());
@@ -181,84 +188,114 @@ pub async fn run(
         return Ok(());
     }
 
-    // 设备：按完整名精确匹配（D12），失败直接终止会话。
+    // 设备：按完整名精确匹配（D12），失败直接终止会话；未启用的输入/输出设备不打开。
     let device_mgr = AudioDeviceManager::new();
-    let in_dev = device_mgr.get_input_device(config.audio.input_device.as_deref())?;
-    let out_dev = device_mgr.get_output_device(config.audio.output_device.as_deref())?;
-    let in_name = crate::audio::device::device_name(&in_dev);
-    let out_name = crate::audio::device::device_name(&out_dev);
+    let in_dev = if config.local.mic {
+        Some(device_mgr.get_input_device(config.audio.input_device.as_deref())?)
+    } else {
+        None
+    };
+    let out_dev = if config.local.tts {
+        Some(device_mgr.get_output_device(config.audio.output_device.as_deref())?)
+    } else {
+        None
+    };
+    let in_name = in_dev.as_ref().map(crate::audio::device::device_name);
+    let out_name = out_dev.as_ref().map(crate::audio::device::device_name);
     emit(PipelineEvent::Devices {
-        input: in_name.clone(),
-        output: out_name.clone(),
+        input: in_name.clone().unwrap_or_default(),
+        output: out_name.clone().unwrap_or_default(),
     });
-    log::info!("输入设备：{in_name}；输出设备：{out_name}");
+    log::info!(
+        "输入设备：{}；输出设备：{}",
+        in_name.as_deref().unwrap_or("（未启用麦克风）"),
+        out_name.as_deref().unwrap_or("（未启用语音合成）")
+    );
     if handle.is_cancelled() {
         emit(PipelineEvent::StateChanged(SessionState::Idle));
         return Ok(());
     }
 
-    // 扬声器输出引擎（TTS 默认 22050Hz）
-    let playback_engine = AudioPlaybackEngine::new(&out_dev, 22050)?;
-    let playback = playback_engine.handle();
+    // 扬声器输出引擎（TTS 默认 22050Hz）：只在启用语音合成时创建。
+    let playback_engine = match &out_dev {
+        Some(dev) => Some(AudioPlaybackEngine::new(dev, 22050)?),
+        None => None,
+    };
+    let playback = playback_engine.as_ref().map(|engine| engine.handle());
 
     // 麦克风采集：`capture` 必须活到会话结束，drop 即停止采集。
-    let (tx_mic, rx_mic) = mpsc::channel::<Vec<u8>>(100);
-    let capture = AudioCapture::start(&in_dev, tx_mic)?;
+    let (capture, mic_rx) = match &in_dev {
+        Some(dev) => {
+            let (tx_mic, rx_mic) = mpsc::channel::<Vec<u8>>(100);
+            (Some(AudioCapture::start(dev, tx_mic)?), Some(rx_mic))
+        }
+        None => (None, None),
+    };
 
     let inference_ws_url = config.inference_ws_url();
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     // 识别线路：VAD 线程 + ASR 任务（与他人线路共用同一套接线，D34/D39）。
-    let asr_line = crate::pipeline::asr_line::spawn(crate::pipeline::asr_line::AsrLineParams {
-        api_key: api_key.clone(),
-        model: &config.asr.model,
-        ws_url: &inference_ws_url,
-        language_hints: config.local.languages.clone(),
-        vocabulary_id: hotwords.vocabulary_id.clone(),
-        vad: &config.vad,
-        audio_rx: rx_mic,
-        vad_active: handle.vad_active.clone(),
-        vad_reset: handle.vad_reset_flag(),
-        vad_degraded: handle.vad_degraded_flag(),
-        running: handle.running.clone(),
-        user_stopped: handle.stop_requested.clone(),
-        events: events.clone(),
-        repaint: repaint.clone(),
-    })?;
-    let asr_events = asr_line.events;
-    let mut vad_worker_thread = asr_line.vad_thread;
-    tasks.push(asr_line.task);
+    // `[self] mic = false` 时不采集、不识别，只用打字输入。
+    let (asr_events, mut vad_worker_thread) = match mic_rx {
+        Some(mic_rx) => {
+            let asr_line =
+                crate::pipeline::asr_line::spawn(crate::pipeline::asr_line::AsrLineParams {
+                    api_key: api_key.clone(),
+                    model: &config.asr.model,
+                    ws_url: &inference_ws_url,
+                    language_hints: config.local.languages.clone(),
+                    vocabulary_id: hotwords.vocabulary_id.clone(),
+                    vad: &config.vad,
+                    audio_rx: mic_rx,
+                    vad_active: handle.vad_active.clone(),
+                    vad_reset: handle.vad_reset_flag(),
+                    vad_degraded: handle.vad_degraded_flag(),
+                    running: handle.running.clone(),
+                    user_stopped: handle.stop_requested.clone(),
+                    events: events.clone(),
+                    repaint: repaint.clone(),
+                })?;
+            tasks.push(asr_line.task);
+            (Some(asr_line.events), asr_line.vad_thread)
+        }
+        None => (None, None),
+    };
 
-    // TTS 任务
-    let (tx_tts, rx_tts) = mpsc::channel::<TtsChunkRequest>(100);
-    {
-        let events = events.clone();
-        let repaint = repaint.clone();
-        let running = handle.running.clone();
-        let user_stopped = handle.stop_requested.clone();
-        let tts_config = QwenTtsConfig {
-            api_key: api_key.clone(),
-            tts_model: config.tts.model.clone(),
-            ws_url: inference_ws_url.clone(),
-            dialect: config.tts.dialect.clone(),
-        };
-        let tts_playback = playback.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Err(err) =
-                QwenTtsClient::run_duplex(tts_config, rx_tts, tts_playback, running).await
-            {
-                // 用户主动停止时的连接错误属于预期收尾，不弹错误条
-                if !user_stopped.load(Ordering::SeqCst) {
-                    // best-effort: 界面可能已退出，失败只上报不阻塞
-                    let _ = events.send(PipelineEvent::Error {
-                        context: "语音合成服务异常".to_string(),
-                        detail: format!("{err:#}"),
-                    });
-                    repaint.request_repaint();
+    // TTS 任务：只在启用语音合成时创建（没有 TTS 时渠道为空，所有发送变成空操作）。
+    let tx_tts = match &playback {
+        Some(tts_playback) => {
+            let (tx, rx) = mpsc::channel::<TtsChunkRequest>(100);
+            let tts_config = QwenTtsConfig {
+                api_key: api_key.clone(),
+                tts_model: config.tts.model.clone(),
+                ws_url: inference_ws_url.clone(),
+                dialect: config.tts.dialect.clone(),
+            };
+            let tts_playback = tts_playback.clone();
+            let events = events.clone();
+            let repaint = repaint.clone();
+            let running = handle.running.clone();
+            let user_stopped = handle.stop_requested.clone();
+            tasks.push(tokio::spawn(async move {
+                if let Err(err) =
+                    QwenTtsClient::run_duplex(tts_config, rx, tts_playback, running).await
+                {
+                    // 用户主动停止时的连接错误属于预期收尾，不弹错误条
+                    if !user_stopped.load(Ordering::SeqCst) {
+                        // best-effort: 界面可能已退出，失败只上报不阻塞
+                        let _ = events.send(PipelineEvent::Error {
+                            context: "语音合成服务异常".to_string(),
+                            detail: format!("{err:#}"),
+                        });
+                        repaint.request_repaint();
+                    }
                 }
-            }
-        }));
-    }
+            }));
+            Some(tx)
+        }
+        None => None,
+    };
 
     // 翻译 worker：开启后 ASR/打字文本先经 MT 再送 TTS。目标语言与音色在会话内固定，
     // 运行中改配置由 D20 热重启处理；主循环只通过通道收发，不 await HTTP。
@@ -275,22 +312,23 @@ pub async fn run(
         let (tx_job, done_rx, worker) =
             translator::spawn(client, target.clone(), handle.running.clone());
         tasks.push(worker);
-        let (voice_id, rate) = voice.selection_for(&target);
-        (
-            Some(TranslationRuntime::new(
-                target,
-                voice_id.to_string(),
-                rate,
-                tx_job,
-            )),
-            Some(done_rx),
-        )
+        (Some(TranslationRuntime::new(target, tx_job)), Some(done_rx))
     } else {
         (None, None)
     };
 
     // 他人线路（D36/D40）：独立任务，进程不可达时自己退避重连，不影响本会话。
     if config.others.enabled {
+        let translate =
+            config
+                .others
+                .translate
+                .then(|| crate::pipeline::others_line::OthersTranslate {
+                    model: config.translate.model.clone(),
+                    chat_url: config.translate_chat_url(),
+                    target: canonical_language(&config.others.target).to_string(),
+                    granularity: config.translate.granularity,
+                });
         tasks.push(tokio::spawn(crate::pipeline::others_line::run(
             crate::pipeline::others_line::Params {
                 api_key: api_key.clone(),
@@ -298,8 +336,10 @@ pub async fn run(
                 ws_url: inference_ws_url,
                 vocabulary_id: hotwords.vocabulary_id.clone(),
                 vad: config.vad.clone(),
+                chunk_words: config.chunking.words,
                 process: config.vrchat.process.clone(),
                 languages: config.others.languages.clone(),
+                translate,
                 running: handle.running.clone(),
                 events: events.clone(),
                 repaint: repaint.clone(),
@@ -313,7 +353,7 @@ pub async fn run(
     crate::pipeline::self_line::run(
         crate::pipeline::self_line::Params {
             handle: &handle,
-            voice: &voice,
+            voice: voice.as_ref(),
             chunk_words: config.chunking.words,
             languages: config.local.languages.clone(),
             translate_enabled,
@@ -322,7 +362,7 @@ pub async fn run(
             asr_events,
             rx_mt,
             translation,
-            tx_tts: tx_tts.clone(),
+            tx_tts,
         },
         &mut emit,
     )
@@ -331,6 +371,7 @@ pub async fn run(
     // 翻译 worker 的发送端随 `self_line::run` 返回一起释放（它持在 `TranslationRuntime` 里）。
     handle.abort_background();
     handle.reset_vad();
+    // 先停采集（释放麦克风），再等 VAD 线程与后台任务退出。
     drop(capture);
     if let Some(worker) = vad_worker_thread.take() {
         if !join_thread_with_timeout(worker, SHUTDOWN_TIMEOUT) {
@@ -340,7 +381,6 @@ pub async fn run(
             );
         }
     }
-    drop(tx_tts);
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
         for task in tasks {
             let _ = task.await;

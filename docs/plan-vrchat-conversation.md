@@ -5,7 +5,7 @@
 > 用户可见行为进 [`README.md`](../README.md)；本文件随后删除（git 历史保留）。
 > 配置字段的最终事实源仍然是 [`src/config.rs`](../src/config.rs)，本文件中的 TOML 只是方案快照。
 
-**状态**：需求已冻结；P0–P5 已完成，P6（对方翻译 + 打字输入）待开工。
+**状态**：需求已冻结；P0–P6 已完成，P7（气泡时间线）待开工。
 
 ---
 
@@ -309,7 +309,11 @@ pub struct Timeline {
 - [x] **P5 对方线路**：采集 + 重连状态机 + `OthersStatus` + 倒计时横幅 + 双 VAD 指示器（不含翻译）。D40 已落地。
   落地内容：`pipeline/others_line.rs`（独立 tokio 任务：找 PID → 进程环回 → 复用 `asr_line` → 只上屏；`Connecting/Capturing/Waiting` 状态机、1→2→4→8→10s 退避、按跳变发状态与日志、等待时拆掉 ASR 连接）；`events::OthersStatus`；顶部带倒计时的实时状态横幅（不可手动关闭、恢复自动消失）；顶栏 `他人 ●` 指示器；他人 ASR 错误走私有通道只触发重连。
   验证（2026-11-15）：门禁全绿（lib 245，新增倒计时换算测试）；GUI：`[others] enabled` 后顶栏出现 `他人 ●`；进程设为不存在的名字 → 会话正常运行、横幅「未找到进程 NoSuchApp.exe；1 秒后重试」且日志只记一条 warn；改为 `explorer.exe` 并应用 → D20 重启后 `已连接进程 explorer.exe（PID …）`、横幅消失、两条 ASR 就绪日志；停止后横幅与指示器清空。
-- [ ] **P6 对方翻译 + 打字输入**：对方 MT worker；`tts=false` 时的打字输入输出路径；双向联调。
+- [x] **P6 对方翻译 + 打字输入**：
+  - [x] 自己线路支持关语音合成 / 关麦克风：`[self] tts = false` 时跳过音色解析、播放引擎与 TTS 连接（`self_line` 的 `voice` / `tx_tts` 变 `Option`，发送变空操作），打字输入与 ASR 文本照常上屏；`[self] mic = false` 时不采集、不识别，只用打字输入。
+    验证（2026-11-15）：`tts=false + translate=true` 打字输入 → 时间线显示 `zh` 原文 + `ja` 译文、日志「未启用语音合成：跳过音色解析与 TTS」、无 TTS WebSocket；`mic=false + tts=false` → 日志「输入设备：（未启用麦克风）；输出设备：（未启用语音合成）」、无 ASR 连接、打字输入仍上屏。
+  - [x] 他人线路翻译：第二个 MT worker（目标 `[others] target`）+ 复用 `self_line` 的句子状态/分块器/`TranslationRuntime` + 句终屏障，译文以 `Speaker::Others` 进时间线。
+    验证（2026-11-15 真机 VRChat）：`[others] languages = ["ja"]`、`translate = true`、`target = "zh"`，开始会话后 `他人语音：已连接进程 VRChat.exe（PID 25940）`，VRChat 内真实日语语音连续产出四条「`ja` 原文 + `zh` 译文」的消息，`他人 ●` 指示器随语音亮起，停止后干净退出。
 - [ ] **P7 界面**：气泡时间线重写（最新在上、左右对齐、角标、分色、复制）。
 - [ ] **P8 收尾**：文档四件套、门禁、真机冒烟。
 
