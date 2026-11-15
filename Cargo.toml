@@ -1,6 +1,6 @@
 [package]
 name = "bivox"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 default-run = "bivox"
 description = "超低延迟VRChat语音识别、翻译与语音合成"
