@@ -1,4 +1,4 @@
-//! VRChat OSC 聊天框后台服务（D33/D39）。
+//! VRChat OSC 聊天框后台服务（D33/D39/D42）。
 //!
 //! 独立于 GUI 重绘：会话把 `PipelineEvent` 克隆一份发到这里，本任务维护自己的
 //! [`Timeline`]（只取我方投影）、1 秒文本节流、typing 跳变和显式清空。
@@ -6,7 +6,8 @@
 //! 关键约束（2026-11-08 实测）：
 //! - `/chatbox/input` 文本最多 1 条/秒；900ms 长跑会跳字；
 //! - `/chatbox/typing` 不占文本限流；
-//! - 聊天框在最后一个文本包后约 30 秒自然过期；正常句终不清空，停止/关闭才显式清空。
+//! - 聊天框在最后一个文本包后约 30 秒自然过期；D42 起客户端按 `retention_secs`
+//!   主动清空，历史句也只在保留时长内显示。
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -33,6 +34,10 @@ pub struct ChatboxSettings {
     pub port: u16,
     pub display: VrchatDisplay,
     pub translate_enabled: bool,
+    /// 是否在聊天框里同时显示历史句（D42）。
+    pub show_history: bool,
+    /// 句终后的保留时长：历史句年龄上限，也是最后一句的存活时长（D42）。
+    pub retention: Duration,
 }
 
 impl ChatboxSettings {
@@ -42,6 +47,8 @@ impl ChatboxSettings {
             port: config.vrchat.osc.port,
             display: config.vrchat.osc.display,
             translate_enabled: config.local.translate,
+            show_history: config.vrchat.osc.show_history,
+            retention: Duration::from_secs(u64::from(config.vrchat.osc.retention_secs)),
         }
     }
 }
@@ -53,6 +60,8 @@ impl Default for ChatboxSettings {
             port: crate::config::DEFAULT_VRCHAT_OSC_PORT,
             display: VrchatDisplay::default(),
             translate_enabled: false,
+            show_history: false,
+            retention: Duration::from_secs(u64::from(crate::config::DEFAULT_VRCHAT_RETENTION_SECS)),
         }
     }
 }
@@ -249,6 +258,7 @@ impl Runtime {
                     sent_bytes,
                     language,
                     sentence_id,
+                    now,
                 );
                 if !had_current && self.has_current() {
                     // 新的一段显示：允许同样的文本再次显示（上一段可能已自然过期）。
@@ -275,6 +285,7 @@ impl Runtime {
                     is_sentence_end,
                     language,
                     sentence_id,
+                    now,
                 );
                 if !had_current && self.has_current() {
                     self.last_sent_text.clear();
@@ -282,7 +293,7 @@ impl Runtime {
                 self.tick(now);
             }
             PipelineEvent::TypedSentence { text, language } => {
-                self.timeline.push_typed(text, language);
+                self.timeline.push_typed(text, language, now);
                 self.last_sent_text.clear();
                 self.tick(now);
             }
@@ -309,17 +320,27 @@ impl Runtime {
         }
 
         // typing 只跟“当前句是否存在”有关，与 display 模式无关。
-        let current_exists = self.has_current();
+        let options = chatbox::ChatboxOptions {
+            display: self.settings.display,
+            show_history: self.settings.show_history,
+            retention: self.settings.retention,
+        };
+        let (current_exists, composed) = {
+            let view = self.timeline.speaker_view(Speaker::Local);
+            let current_exists = view
+                .current
+                .is_some_and(|message| !message.text.is_empty() || !message.source.is_empty());
+            (current_exists, chatbox::compose(&view, options, now))
+        };
         if current_exists != self.typing_sent {
             self.sender.send_typing(current_exists);
             self.typing_sent = current_exists;
         }
 
-        let ChatboxText::Text(desired) = chatbox::compose(
-            &self.timeline.speaker_view(Speaker::Local),
-            self.settings.display,
-        ) else {
-            return;
+        // `Clear` = 没有可显示内容（D42）；空串同样是清空命令，靠下面的去重避免重复发送。
+        let desired = match composed {
+            ChatboxText::Text(text) => text,
+            ChatboxText::Clear => String::new(),
         };
 
         if desired == self.last_sent_text {
@@ -483,12 +504,16 @@ mod tests {
         config.vrchat.osc.enabled = true;
         config.vrchat.osc.port = 9100;
         config.vrchat.osc.display = VrchatDisplay::Translation;
+        config.vrchat.osc.show_history = true;
+        config.vrchat.osc.retention_secs = 12;
         config.local.translate = true;
         let settings = ChatboxSettings::from_config(&config);
         assert!(settings.enabled);
         assert_eq!(settings.port, 9100);
         assert_eq!(settings.display, VrchatDisplay::Translation);
         assert!(settings.translate_enabled);
+        assert!(settings.show_history);
+        assert_eq!(settings.retention, Duration::from_secs(12));
     }
 
     #[test]
@@ -504,6 +529,8 @@ mod tests {
             port,
             display: VrchatDisplay::Source,
             translate_enabled: false,
+            show_history: false,
+            retention: Duration::from_secs(30),
         });
         let start = Instant::now();
         runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
@@ -577,5 +604,124 @@ mod tests {
             return false;
         };
         message.addr == "/chatbox/typing" && message.args == vec![OscType::Bool(expected)]
+    }
+
+    fn asr_end_event(text: &str) -> PipelineEvent {
+        PipelineEvent::Asr {
+            speaker: Speaker::Local,
+            text: text.to_string(),
+            is_sentence_end: true,
+            sent_bytes: 0,
+            language: Some("en".to_string()),
+            sentence_id: None,
+        }
+    }
+
+    #[test]
+    fn runtime_shows_history_and_clears_after_retention() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: true,
+            port,
+            display: VrchatDisplay::Source,
+            translate_enabled: false,
+            show_history: true,
+            retention: Duration::from_secs(5),
+        });
+        let start = Instant::now();
+        runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        // 第一句在 +2s 定稿。
+        runtime.on_event(asr_end_event("一"), start + Duration::from_secs(2));
+        assert!(is_text(&recv_packet(&listener), "一"));
+
+        // 第二句在 +3.5s 定稿：没有当前句，历史按新→旧。
+        runtime.on_event(asr_end_event("二"), start + Duration::from_millis(3500));
+        assert!(is_text(&recv_packet(&listener), "二\n一"));
+
+        // +7.01s：第一句超过 5 秒，只剩第二句。
+        runtime.tick(start + Duration::from_millis(7010));
+        assert!(is_text(&recv_packet(&listener), "二"));
+
+        // +8.51s：第二句也过期，主动清空。
+        runtime.tick(start + Duration::from_millis(8510));
+        assert!(is_text(&recv_packet(&listener), ""));
+    }
+
+    #[test]
+    fn runtime_clears_last_sentence_after_retention_when_history_off() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: true,
+            port,
+            display: VrchatDisplay::Source,
+            translate_enabled: false,
+            show_history: false,
+            retention: Duration::from_secs(5),
+        });
+        let start = Instant::now();
+        runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        runtime.on_event(asr_end_event("一"), start + Duration::from_secs(2));
+        assert!(is_text(&recv_packet(&listener), "一"));
+
+        // 关闭历史句：第二句定稿后只显示它，不再附带第一句。
+        runtime.on_event(asr_end_event("二"), start + Duration::from_millis(3500));
+        assert!(is_text(&recv_packet(&listener), "二"));
+
+        // 定稿 5 秒后主动清空（不依赖 VRChat 自然过期）。
+        runtime.tick(start + Duration::from_millis(8600));
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(recv_packet_opt(&listener).is_none(), "清空只发一次");
+    }
+
+    #[test]
+    fn runtime_keeps_current_sentence_regardless_of_retention() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: true,
+            port,
+            display: VrchatDisplay::Source,
+            translate_enabled: false,
+            show_history: false,
+            retention: Duration::from_secs(5),
+        });
+        let start = Instant::now();
+        runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        runtime.on_event(asr_event("正在说"), start + Duration::from_secs(2));
+        assert!(is_typing(&recv_packet(&listener), true));
+        assert!(is_text(&recv_packet(&listener), "正在说"));
+
+        // 当前句长时间未定稿也不受保留时长清空。
+        runtime.tick(start + Duration::from_secs(100));
+        assert!(recv_packet_opt(&listener).is_none());
+
+        // 定稿后 typing 关闭；文本没变，不重复发。
+        runtime.on_event(asr_end_event("正在说"), start + Duration::from_secs(101));
+        assert!(is_typing(&recv_packet(&listener), false));
+        assert!(recv_packet_opt(&listener).is_none());
+
+        // 定稿 5 秒后清空。
+        runtime.tick(start + Duration::from_secs(107));
+        assert!(is_text(&recv_packet(&listener), ""));
     }
 }

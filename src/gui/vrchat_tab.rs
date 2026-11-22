@@ -7,7 +7,10 @@
 use eframe::egui;
 
 use crate::app::{BivoxApp, Tab};
-use crate::config::{DEFAULT_VRCHAT_PROCESS, VrchatDisplay, VrchatOscConfig};
+use crate::config::{
+    DEFAULT_VRCHAT_PROCESS, MAX_VRCHAT_RETENTION_SECS, MIN_VRCHAT_RETENTION_SECS, VrchatDisplay,
+    VrchatOscConfig,
+};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
@@ -72,40 +75,41 @@ fn show_process(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
 }
 
-/// OSC 聊天框设置：改值即保存、不重启实时管线。
+/// OSC 聊天框设置：改值即保存、不重启实时管线（D33/D42）。
 fn show_osc(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("OSC 聊天框").strong());
     ui.label(egui::RichText::new("把实时字幕发送到 VRChat 的 OSC 聊天框。").weak());
 
     let configured = current(app);
-    let mut enabled = configured.enabled;
-    let mut port = configured.port;
-    let mut display = configured.display;
+    let mut osc = configured.clone();
+    let mut save = false;
 
-    let enabled_changed = ui.checkbox(&mut enabled, "启用 OSC 聊天框").changed();
+    if ui.checkbox(&mut osc.enabled, "启用 OSC 聊天框").changed() {
+        save = true;
+    }
     ui.add_space(6.0);
 
     ui.horizontal(|ui| {
         ui.label("发送端口");
         let response = ui.add(
-            egui::DragValue::new(&mut port)
+            egui::DragValue::new(&mut osc.port)
                 .range(1..=65535)
                 .speed(1.0)
-                .max_decimals(0),
+                .max_decimals(0)
+                // 编辑中的文本由 egui 暂存；这里的值每帧从配置重建，
+                // 若边输入边写回会导致 EditState 失效、输入被重置。
+                .update_while_editing(false),
         );
         let enter = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let port_committed =
-            port != configured.port && (response.lost_focus() || response.drag_stopped() || enter);
-        ui.label(egui::RichText::new("VRChat 默认 9000").weak());
-
-        if enabled_changed || port_committed || display != configured.display {
-            if enabled != configured.enabled
-                || port != configured.port
-                || display != configured.display
-            {
-                app.update_vrchat_settings(enabled, port, display);
-            }
+        // 拖动中的每帧变化不写盘；失焦/回车提交时 DragValue 才改值（changed）。
+        let committed = response.drag_stopped()
+            || response.lost_focus()
+            || enter
+            || (response.changed() && !response.dragged());
+        if osc.port != configured.port && committed {
+            save = true;
         }
+        ui.label(egui::RichText::new("VRChat 默认 9000").weak());
     });
 
     ui.add_space(8.0);
@@ -116,11 +120,48 @@ fn show_osc(app: &mut BivoxApp, ui: &mut egui::Ui) {
         VrchatDisplay::Translation,
     ] {
         if ui
-            .radio_value(&mut display, mode, display_label(mode))
+            .radio_value(&mut osc.display, mode, display_label(mode))
             .changed()
         {
-            app.update_vrchat_settings(enabled, port, display);
+            save = true;
         }
+    }
+
+    ui.add_space(8.0);
+    if ui.checkbox(&mut osc.show_history, "显示历史句").changed() {
+        save = true;
+    }
+    ui.horizontal(|ui| {
+        ui.label("保留时长");
+        let response = ui.add(
+            egui::DragValue::new(&mut osc.retention_secs)
+                .range(MIN_VRCHAT_RETENTION_SECS..=MAX_VRCHAT_RETENTION_SECS)
+                .speed(1.0)
+                .max_decimals(0)
+                .suffix(" 秒")
+                // 同上：失焦/回车时才把文本写回，避免每帧重建的值让输入框回到旧值。
+                .update_while_editing(false),
+        );
+        let enter = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        // 失焦后的提交发生在下一帧（此时 response 已是按钮而不是 TextEdit），
+        // 所以必须用 changed() 捕获这一帧的值变化。
+        let committed = response.drag_stopped()
+            || response.lost_focus()
+            || enter
+            || (response.changed() && !response.dragged());
+        if osc.retention_secs != configured.retention_secs && committed {
+            save = true;
+        }
+    });
+
+    if save && osc != configured {
+        app.update_vrchat_settings(
+            osc.enabled,
+            osc.port,
+            osc.display,
+            osc.show_history,
+            osc.retention_secs,
+        );
     }
 
     ui.add_space(10.0);

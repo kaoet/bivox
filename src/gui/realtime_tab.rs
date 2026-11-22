@@ -288,6 +288,7 @@ mod tests {
             source_language: source_language.to_string(),
             source_sent_bytes: 15,
             sentence_id: Some(1),
+            finished_at: None,
         }
     }
 

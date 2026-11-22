@@ -871,14 +871,23 @@ impl BivoxApp {
         self.finish_config_write(result, "已保存翻译设置");
     }
 
-    /// 更新 VRChat 页负责的 `[vrchat.osc]` 字段（D3/D33）。
+    /// 更新 VRChat 页负责的 `[vrchat.osc]` 字段（D3/D33/D42）。
     ///
     /// `[vrchat.osc]` 不进配置指纹，改设置立即生效、不重启实时管线。
-    pub fn update_vrchat_settings(&mut self, enabled: bool, port: u16, display: VrchatDisplay) {
+    pub fn update_vrchat_settings(
+        &mut self,
+        enabled: bool,
+        port: u16,
+        display: VrchatDisplay,
+        show_history: bool,
+        retention_secs: u32,
+    ) {
         let result = self.write_config(|config| {
             config.vrchat.osc.enabled = enabled;
             config.vrchat.osc.port = port;
             config.vrchat.osc.display = display;
+            config.vrchat.osc.show_history = show_history;
+            config.vrchat.osc.retention_secs = retention_secs;
             Ok(())
         });
         self.finish_config_write(result, "已保存 VRChat 设置");
@@ -1174,10 +1183,11 @@ impl BivoxApp {
                     sent_bytes,
                     language,
                     sentence_id,
+                    Instant::now(),
                 );
             }
             PipelineEvent::TypedSentence { text, language } => {
-                self.timeline.push_typed(text, language);
+                self.timeline.push_typed(text, language, Instant::now());
             }
             PipelineEvent::Translation {
                 speaker,
@@ -1195,6 +1205,7 @@ impl BivoxApp {
                     is_sentence_end,
                     language,
                     sentence_id,
+                    Instant::now(),
                 );
             }
             PipelineEvent::VadActive { speaker, active } => match speaker {

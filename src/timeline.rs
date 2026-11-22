@@ -1,13 +1,16 @@
 //! 对话时间线状态机：把两条线路的 ASR / 翻译 / 打字输入事件归约成「消息列表」。
 //!
-//! GUI 实时页与 VRChat OSC 聊天框共用这份逻辑（D16/D26/D33/D39）：
+//! GUI 实时页与 VRChat OSC 聊天框共用这份逻辑（D16/D26/D33/D39/D42）：
 //! - 每条消息带来源 [`Speaker`]；同一时刻每条线路最多一条「未完成」消息（`open = true`）；
 //! - `messages[0]` 是最新一条；新消息插到最前面，未完成消息**原地更新**（不改变位置）；
 //! - 普通模式：`text` 就是 ASR 文本；翻译模式：`text` 是累计译文、`source` 是原文；
 //! - `sent_bytes` / `source_sent_bytes` 分别是主行/副行已送入下游的字节前缀（界面分色）；
+//! - 定稿时记录 `finished_at`，供 OSC 聊天框按保留时长裁剪历史句（D42）；
 //! - 历史上限 [`MAX_MESSAGES`]，按 `(来源, sentence_id)` 去重同一句的重复最终结果。
 //!
-//! 本模块是纯逻辑：不依赖 egui、网络或时间，便于单测。
+//! 本模块是纯逻辑：不依赖 egui、网络，也不读取系统时钟；`now` 由调用方传入，便于单测。
+
+use std::time::Instant;
 
 use crate::events::Speaker;
 
@@ -35,17 +38,21 @@ pub struct Message {
     pub source_sent_bytes: usize,
     /// 服务端句子 id（用于丢弃同一句的重复最终结果）。
     pub sentence_id: Option<u64>,
+    /// 句终（定稿）时刻；未完成消息为 `None`（D42）。
+    ///
+    /// OSC 聊天框用它判断历史句是否超出保留时长。
+    pub finished_at: Option<Instant>,
 }
 
-/// 某一条线路的视图：聊天框只镜像我方，用它取出「当前句 + 最后一条历史」。
-#[derive(Debug, Clone, Copy)]
+/// 某一条线路的视图：聊天框只镜像我方，用它取出「当前句 + 历史句」。
+#[derive(Debug, Clone)]
 pub struct SpeakerView<'a> {
     /// 该线路是否开启翻译（决定 `text` 是译文还是原文）。
     pub translation: bool,
     /// 当前未完成的消息。
     pub current: Option<&'a Message>,
-    /// 该线路最新一条已完成的消息（没有当前句时回退显示）。
-    pub last: Option<&'a Message>,
+    /// 该线路所有已完成的消息，新 → 旧；`history[0]` 就是最近一条历史句。
+    pub history: Vec<&'a Message>,
 }
 
 /// 两条线路共用的对话时间线。
@@ -82,7 +89,7 @@ impl Timeline {
     }
 
     /// 打字输入句：提交即进历史（不经过 ASR 的 `sentence_id` 去重）。
-    pub fn push_typed(&mut self, text: String, language: String) {
+    pub fn push_typed(&mut self, text: String, language: String, now: Instant) {
         if text.is_empty() {
             return;
         }
@@ -96,6 +103,7 @@ impl Timeline {
             source_language: String::new(),
             source_sent_bytes: 0,
             sentence_id: None,
+            finished_at: Some(now),
         });
     }
 
@@ -116,6 +124,7 @@ impl Timeline {
         sent: usize,
         language: Option<String>,
         sentence_id: Option<u64>,
+        now: Instant,
     ) {
         if self.translation(speaker) {
             self.apply_source(speaker, text, sent, language);
@@ -139,7 +148,7 @@ impl Timeline {
         }
 
         if is_sentence_end {
-            self.finalize_open(speaker, sentence_id);
+            self.finalize_open(speaker, sentence_id, now);
         }
     }
 
@@ -174,6 +183,7 @@ impl Timeline {
         is_sentence_end: bool,
         language: String,
         sentence_id: Option<u64>,
+        now: Instant,
     ) {
         if !text.is_empty() {
             let message = self.open_message(speaker);
@@ -184,22 +194,25 @@ impl Timeline {
         }
 
         if is_sentence_end {
-            self.finalize_open(speaker, sentence_id);
+            self.finalize_open(speaker, sentence_id, now);
         }
     }
 
-    /// 某条线路的「当前消息 + 最后一条历史」（聊天框投影）。
+    /// 某条线路的「当前消息 + 所有历史消息」（聊天框投影）。
     pub fn speaker_view(&self, speaker: Speaker) -> SpeakerView<'_> {
+        let current = self
+            .messages
+            .iter()
+            .find(|message| message.open && message.speaker == speaker);
+        let history = self
+            .messages
+            .iter()
+            .filter(|message| !message.open && message.speaker == speaker)
+            .collect();
         SpeakerView {
             translation: self.translation(speaker),
-            current: self
-                .messages
-                .iter()
-                .find(|message| message.open && message.speaker == speaker),
-            last: self
-                .messages
-                .iter()
-                .find(|message| !message.open && message.speaker == speaker),
+            current,
+            history,
         }
     }
 
@@ -218,6 +231,7 @@ impl Timeline {
             source_language: String::new(),
             source_sent_bytes: 0,
             sentence_id: None,
+            finished_at: None,
         });
         &mut self.messages[0]
     }
@@ -239,7 +253,7 @@ impl Timeline {
     ///
     /// 定稿后消息要沉到所有未完成消息之后——未完成消息永远占据列表最前面，
     /// 这样「当前句」不会被别的新消息顶下去，只有它自己定稿时才让位（D39）。
-    fn finalize_open(&mut self, speaker: Speaker, sentence_id: Option<u64>) {
+    fn finalize_open(&mut self, speaker: Speaker, sentence_id: Option<u64>, now: Instant) {
         let Some(index) = self.open_index(speaker) else {
             return;
         };
@@ -258,6 +272,7 @@ impl Timeline {
         message.sent_bytes = 0;
         message.source_sent_bytes = 0;
         message.sentence_id = sentence_id;
+        message.finished_at = Some(now);
 
         // 剩下的未完成消息仍排在最前，把这条挪到它们后面。
         let remaining_open = self.messages.iter().filter(|message| message.open).count();
@@ -301,9 +316,10 @@ fn clamp_prefix_len(text: &str, sent: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn asr(timeline: &mut Timeline, speaker: Speaker, text: &str, sent: usize, end: bool) {
-        timeline.apply_asr(speaker, text, end, sent, None, None);
+        timeline.apply_asr(speaker, text, end, sent, None, None, Instant::now());
     }
 
     fn asr_with_id(
@@ -313,7 +329,7 @@ mod tests {
         end: bool,
         id: Option<u64>,
     ) {
-        timeline.apply_asr(speaker, text, end, 0, None, id);
+        timeline.apply_asr(speaker, text, end, 0, None, id, Instant::now());
     }
 
     fn translation(
@@ -324,7 +340,15 @@ mod tests {
         end: bool,
         id: Option<u64>,
     ) {
-        timeline.apply_translation(speaker, text, sent, end, "en".to_string(), id);
+        timeline.apply_translation(
+            speaker,
+            text,
+            sent,
+            end,
+            "en".to_string(),
+            id,
+            Instant::now(),
+        );
     }
 
     #[test]
@@ -381,9 +405,9 @@ mod tests {
     #[test]
     fn sent_prefix_is_clamped_to_char_boundary() {
         let mut timeline = Timeline::default();
-        timeline.apply_asr(Speaker::Local, "你好", false, 3, None, None);
+        timeline.apply_asr(Speaker::Local, "你好", false, 3, None, None, Instant::now());
         assert_eq!(timeline.messages()[0].sent_bytes, 3);
-        timeline.apply_asr(Speaker::Local, "你好", false, 4, None, None);
+        timeline.apply_asr(Speaker::Local, "你好", false, 4, None, None, Instant::now());
         assert_eq!(
             timeline.messages()[0].sent_bytes,
             3,
@@ -402,6 +426,7 @@ mod tests {
             6,
             Some("zh".to_string()),
             None,
+            Instant::now(),
         );
         assert_eq!(timeline.messages()[0].source, "你好");
         assert_eq!(timeline.messages()[0].source_language, "zh");
@@ -416,6 +441,7 @@ mod tests {
             "你好。".len(),
             Some("zh".to_string()),
             Some(9),
+            Instant::now(),
         );
         assert!(timeline.messages()[0].open, "ASR 句终不应定稿");
 
@@ -434,7 +460,7 @@ mod tests {
     fn translation_mode_empty_translation_is_dropped() {
         let mut timeline = Timeline::default();
         timeline.set_translation(Speaker::Local, true);
-        timeline.apply_asr(Speaker::Local, "你好", false, 6, None, None);
+        timeline.apply_asr(Speaker::Local, "你好", false, 6, None, None, Instant::now());
         translation(&mut timeline, Speaker::Local, "", 0, true, Some(1));
         assert!(timeline.messages().is_empty(), "空译文句终不落历史");
     }
@@ -443,7 +469,7 @@ mod tests {
     fn typed_sentence_goes_to_history_below_open_message() {
         let mut timeline = Timeline::default();
         asr(&mut timeline, Speaker::Local, "正在识别", 0, false);
-        timeline.push_typed("打字输入。".to_string(), "ja".to_string());
+        timeline.push_typed("打字输入。".to_string(), "ja".to_string(), Instant::now());
         assert_eq!(timeline.messages().len(), 2);
         assert!(timeline.messages()[0].open, "当前句仍钉在最上面");
         assert_eq!(timeline.messages()[1].text, "打字输入。");
@@ -453,9 +479,25 @@ mod tests {
     #[test]
     fn open_sentence_stays_on_top_while_other_side_finishes() {
         let mut timeline = Timeline::default();
-        timeline.apply_asr(Speaker::Local, "我在说话", false, 0, None, None);
+        timeline.apply_asr(
+            Speaker::Local,
+            "我在说话",
+            false,
+            0,
+            None,
+            None,
+            Instant::now(),
+        );
         // 对方开始并立刻完成一句：不能把我方当前句顶下去
-        timeline.apply_asr(Speaker::Others, "对方说话。", true, 0, None, None);
+        timeline.apply_asr(
+            Speaker::Others,
+            "对方说话。",
+            true,
+            0,
+            None,
+            None,
+            Instant::now(),
+        );
         assert_eq!(timeline.messages().len(), 2);
         assert!(timeline.messages()[0].open, "我方当前句仍在最上面");
         assert_eq!(timeline.messages()[0].text, "我在说话");
@@ -463,7 +505,15 @@ mod tests {
         assert!(!timeline.messages()[1].open, "定稿的消息在未完成消息之后");
 
         // 我方定稿后才让位到历史区（仍是历史里最新的一条）
-        timeline.apply_asr(Speaker::Local, "我在说话。", true, 0, None, None);
+        timeline.apply_asr(
+            Speaker::Local,
+            "我在说话。",
+            true,
+            0,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(!timeline.messages()[0].open);
         assert_eq!(timeline.messages()[0].text, "我在说话。");
         assert_eq!(timeline.messages()[1].text, "对方说话。");
@@ -472,8 +522,16 @@ mod tests {
     #[test]
     fn both_open_sentences_stay_below_each_other() {
         let mut timeline = Timeline::default();
-        timeline.apply_asr(Speaker::Local, "我方", false, 0, None, None);
-        timeline.apply_asr(Speaker::Others, "对方", false, 0, None, None);
+        timeline.apply_asr(Speaker::Local, "我方", false, 0, None, None, Instant::now());
+        timeline.apply_asr(
+            Speaker::Others,
+            "对方",
+            false,
+            0,
+            None,
+            None,
+            Instant::now(),
+        );
         // 两条未完成消息都在开头，后开始的一条在上面
         assert_eq!(timeline.messages().len(), 2);
         assert!(timeline.messages()[0].open);
@@ -514,20 +572,22 @@ mod tests {
     }
 
     #[test]
-    fn speaker_view_returns_newest_completed_message() {
+    fn speaker_view_returns_history_newest_first() {
         let mut timeline = Timeline::default();
-        assert!(timeline.speaker_view(Speaker::Local).last.is_none());
+        assert!(timeline.speaker_view(Speaker::Local).history.is_empty());
 
         asr_with_id(&mut timeline, Speaker::Local, "第一句。", true, Some(1));
-        timeline.push_typed("第二句。".to_string(), "zh".to_string());
+        timeline.push_typed("第二句。".to_string(), "zh".to_string(), Instant::now());
         asr_with_id(&mut timeline, Speaker::Others, "别人的。", true, Some(1));
 
         let view = timeline.speaker_view(Speaker::Local);
         assert!(view.current.is_none());
-        assert_eq!(
-            view.last.map(|message| message.text.as_str()),
-            Some("第二句。")
-        );
+        let texts: Vec<_> = view
+            .history
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["第二句。", "第一句。"]);
         assert!(!view.translation);
 
         timeline.set_translation(Speaker::Local, true);
@@ -536,10 +596,51 @@ mod tests {
     }
 
     #[test]
+    fn finalize_records_finished_at() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        timeline.apply_asr(Speaker::Local, "半句", false, 0, None, None, t0);
+        assert!(
+            timeline.messages()[0].finished_at.is_none(),
+            "未完成消息没有句终时间"
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        timeline.apply_asr(Speaker::Local, "半句。", true, 0, None, None, t1);
+        assert_eq!(timeline.messages()[0].finished_at, Some(t1));
+
+        let t2 = t1 + Duration::from_secs(2);
+        timeline.push_typed("打字。".to_string(), "zh".to_string(), t2);
+        assert_eq!(timeline.messages()[0].finished_at, Some(t2));
+    }
+
+    #[test]
+    fn translation_finalize_records_finished_at() {
+        let mut timeline = Timeline::default();
+        timeline.set_translation(Speaker::Local, true);
+        let t0 = Instant::now();
+        timeline.apply_asr(Speaker::Local, "源文", false, 0, None, None, t0);
+
+        let t1 = t0 + Duration::from_millis(500);
+        timeline.apply_translation(
+            Speaker::Local,
+            "译文",
+            0,
+            true,
+            "en".to_string(),
+            Some(1),
+            t1,
+        );
+        let message = &timeline.messages()[0];
+        assert!(!message.open);
+        assert_eq!(message.finished_at, Some(t1));
+    }
+
+    #[test]
     fn history_is_capped() {
         let mut timeline = Timeline::default();
         for index in 0..=MAX_MESSAGES {
-            timeline.push_typed(format!("第 {index} 句。"), "zh".to_string());
+            timeline.push_typed(format!("第 {index} 句。"), "zh".to_string(), Instant::now());
         }
         assert_eq!(timeline.messages().len(), MAX_MESSAGES);
         assert_eq!(

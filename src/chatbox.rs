@@ -1,7 +1,15 @@
-//! VRChat 聊天框文本合成与截断（纯逻辑，D33/D39）。
+//! VRChat 聊天框文本合成与截断（纯逻辑，D33/D39/D42）。
 //!
-//! 输入是某一条线路的 [`SpeakerView`]（与 GUI 同一份时间线状态里的我方投影）与
-//! `[vrchat.osc] display`，输出要发给 `/chatbox/input` 的文本。这里不碰网络、不依赖时间，便于单测。
+//! 输入是某条线路的 [`SpeakerView`]（与 GUI 同一份时间线状态里的我方投影）与
+//! [`ChatboxOptions`]，输出要发给 `/chatbox/input` 的文本。这里不碰网络；当前时间由
+//! `now` 传入，便于单测。
+//!
+//! 组合规则（D42）：
+//! - 优先级：当前句 → 最近历史句 → 第二近 → …；历史句只在 `age ≤ retention` 时参与；
+//! - 从 144 UTF-16 码元 / 9 个显示行出发逐句装填；整句放不下就按剩余配额截断
+//!   （保尾 + 前导 `…`）后停止，因此至多一条句子被截断；
+//! - 显示顺序为「当前句在上，历史向下越来越旧」；关闭历史句时最多装 1 块；
+//! - 双语每句是一个块（译文\n原文），剩余行数为奇数时译文多一行；保留软借用。
 //!
 //! 截断规则（2026-11-09 实测后）：
 //! - VRChat 最多 144 个 UTF-16 码元 / 9 个**显示行**（包含自动换行）；
@@ -11,8 +19,10 @@
 //! - 双语按软 5:4 配额：字符约 79/64（正文 143 个码元），显示行默认 5/4；
 //!   任一侧用不完时把额度借给另一侧，只有两侧都超过配额时才严格 5/4；
 
+use std::time::{Duration, Instant};
+
 use crate::config::VrchatDisplay;
-use crate::timeline::SpeakerView;
+use crate::timeline::{Message, SpeakerView};
 
 /// VRChat ChatBox 的字符预算（按 UTF-16 码元计，最保守）。
 pub const CHATBOX_MAX_UTF16_UNITS: usize = 144;
@@ -33,82 +43,182 @@ const EMOJI_UNITS: u32 = 6;
 pub enum ChatboxText {
     /// 要发送的文本（已截断）。
     Text(String),
-    /// 没有可更新的内容；保持聊天框现状（不要发空串）。
-    Keep,
+    /// 没有可显示内容；发空串清空聊天框。
+    Clear,
 }
 
-/// 根据某条线路的时间线视图与显示模式合成聊天框文本。
+/// 一次合成使用的显示设置（D42）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatboxOptions {
+    /// 翻译模式下的显示内容；非翻译模式固定显示 ASR 原文。
+    pub display: VrchatDisplay,
+    /// 是否在聊天框里同时保留历史句。
+    pub show_history: bool,
+    /// 句终后的保留时长：历史句年龄上限，也是最后一句的存活时长。
+    pub retention: Duration,
+}
+
+/// 根据某条线路的时间线视图与显示设置合成聊天框文本。
 ///
 /// 调用方传入 `timeline.speaker_view(Speaker::Local)`：聊天框只镜像我方。
-pub fn compose(view: &SpeakerView<'_>, display: VrchatDisplay) -> ChatboxText {
-    if !view.translation {
-        let text = view
-            .current
-            .map(|message| message.text.as_str())
-            .filter(|text| !text.is_empty())
-            .or_else(|| view.last.map(|message| message.text.as_str()))
-            .unwrap_or_default();
-        if text.is_empty() {
-            return ChatboxText::Keep;
+pub fn compose(view: &SpeakerView<'_>, options: ChatboxOptions, now: Instant) -> ChatboxText {
+    let mut blocks = Vec::new();
+    let mut units_left = CHATBOX_MAX_UTF16_UNITS;
+    let mut lines_left = CHATBOX_MAX_LINES;
+    // 关闭历史句时最多装一块（当前句，或当前句不可渲染时的最后一条历史句）。
+    let max_blocks = if options.show_history { usize::MAX } else { 1 };
+
+    if let Some(current) = view.current {
+        if let Some(truncated) = add_block(
+            current,
+            view.translation,
+            options.display,
+            &mut units_left,
+            &mut lines_left,
+            &mut blocks,
+        ) {
+            if truncated || blocks.len() >= max_blocks {
+                return finish(blocks);
+            }
         }
-        return text_or_keep(fit_single(text));
     }
 
-    let (source, translation) = match view.current {
-        Some(current) if !current.text.is_empty() || !current.source.is_empty() => {
-            (current.source.as_str(), current.text.as_str())
+    for message in &view.history {
+        if blocks.len() >= max_blocks {
+            break;
         }
-        _ => match view.last {
-            Some(last) => (last.source.as_str(), last.text.as_str()),
-            None => return ChatboxText::Keep,
-        },
-    };
+        let Some(finished_at) = message.finished_at else {
+            continue;
+        };
+        if now.saturating_duration_since(finished_at) > options.retention {
+            // 历史按新→旧排列，后面的只会更旧。
+            break;
+        }
+        if let Some(truncated) = add_block(
+            message,
+            view.translation,
+            options.display,
+            &mut units_left,
+            &mut lines_left,
+            &mut blocks,
+        ) {
+            if truncated || blocks.len() >= max_blocks {
+                break;
+            }
+        }
+    }
 
-    let text = match display {
-        VrchatDisplay::Source => fit_single(source),
-        VrchatDisplay::Translation => fit_single(translation),
-        VrchatDisplay::Bilingual => fit_bilingual(translation, source),
-    };
-    text_or_keep(text)
+    finish(blocks)
 }
 
-fn text_or_keep(text: String) -> ChatboxText {
-    if text.is_empty() {
-        ChatboxText::Keep
+fn finish(blocks: Vec<String>) -> ChatboxText {
+    if blocks.is_empty() {
+        ChatboxText::Clear
     } else {
-        ChatboxText::Text(text)
+        ChatboxText::Text(blocks.join("\n"))
     }
 }
 
-/// 把任意文本截成 VRChat 可接受的形式（保尾、9 行、144 UTF-16 码元）。
+/// 把一个消息块装入剩余预算；放不下时按剩余配额截断。
 ///
-/// 对外主要给测试与调试用；正常路径由 [`compose`] 调用。
-pub fn truncate_chatbox(text: &str) -> String {
-    fit_single(text)
+/// 返回 `None` 表示这条消息在当前显示模式下不可渲染（例如只显示译文但译文未到），
+/// 调用方应继续尝试下一条；返回 `Some(truncated)` 表示已追加一块。
+fn add_block(
+    message: &Message,
+    translation_mode: bool,
+    display: VrchatDisplay,
+    units_left: &mut usize,
+    lines_left: &mut usize,
+    blocks: &mut Vec<String>,
+) -> Option<bool> {
+    let separator = usize::from(!blocks.is_empty());
+    if *lines_left == 0 || *units_left <= separator {
+        return None;
+    }
+    let (block, truncated) = fit_message(
+        message,
+        translation_mode,
+        display,
+        *units_left - separator,
+        *lines_left,
+    )?;
+    if !has_visible_text(&block) {
+        return None;
+    }
+    *units_left -= separator + utf16_len(&block);
+    *lines_left = lines_left.saturating_sub(visual_line_count(&block));
+    blocks.push(block);
+    Some(truncated)
 }
 
-fn fit_single(text: &str) -> String {
-    fit_tail(text, CHATBOX_MAX_UTF16_UNITS, CHATBOX_MAX_LINES)
+fn fit_message(
+    message: &Message,
+    translation_mode: bool,
+    display: VrchatDisplay,
+    units: usize,
+    lines: usize,
+) -> Option<(String, bool)> {
+    if !translation_mode {
+        return fit_single_side(&message.text, units, lines);
+    }
+    match display {
+        VrchatDisplay::Source => fit_single_side(&message.source, units, lines),
+        VrchatDisplay::Translation => fit_single_side(&message.text, units, lines),
+        VrchatDisplay::Bilingual => fit_bilingual(&message.text, &message.source, units, lines),
+    }
 }
 
-fn fit_bilingual(translation: &str, source: &str) -> String {
-    let translation = translation.trim();
-    let source = source.trim();
-
-    if translation.is_empty() {
-        return fit_single(source);
+fn fit_single_side(text: &str, units: usize, lines: usize) -> Option<(String, bool)> {
+    let natural = normalize_block(text);
+    if natural.is_empty() {
+        return None;
     }
-    if source.is_empty() {
-        return fit_single(translation);
+    if utf16_len(&natural) <= units && visual_line_count(&natural) <= lines {
+        return Some((natural, false));
+    }
+    let fitted = fit_tail(text, units, lines);
+    if fitted.is_empty() {
+        return None;
+    }
+    Some((fitted, true))
+}
+
+/// 合成一个双语块；`(block, truncated)`。
+///
+/// 内部换行占 1 个码元；剩余行数按 `ceil/floor` 分给译文/原文（奇数时译文多一行），
+/// 字符按同一比例给基础配额。保留软借用：一侧自然用量低于自己的份额时，把剩余额度
+/// 借给另一侧（D33/D42）。
+fn fit_bilingual(
+    translation: &str,
+    source: &str,
+    max_units: usize,
+    max_lines: usize,
+) -> Option<(String, bool)> {
+    let translation_text = normalize_block(translation);
+    let source_text = normalize_block(source);
+
+    match (translation_text.is_empty(), source_text.is_empty()) {
+        (true, true) => return None,
+        (true, false) => return fit_single_side(&source_text, max_units, max_lines),
+        (false, true) => return fit_single_side(&translation_text, max_units, max_lines),
+        (false, false) => {}
     }
 
-    // 两段之间的换行占 1 个码元；剩余 143 个按 5:4 分给译文/原文。
-    // 先按软配额分字符：哪一边用不完就把余额借给另一边。
-    let content_budget = CHATBOX_MAX_UTF16_UNITS - 1;
-    let base_translation = content_budget * 5 / 9;
+    let natural = format!("{translation_text}\n{source_text}");
+    if utf16_len(&natural) <= max_units && visual_line_count(&natural) <= max_lines {
+        return Some((natural, false));
+    }
+    if max_lines == 0 || max_units < 2 {
+        return None;
+    }
+
+    let content_budget = max_units - 1;
+    let translation_share = max_lines.div_ceil(2);
+    let source_share = max_lines / 2;
+    let base_translation = content_budget * translation_share / max_lines;
     let base_source = content_budget - base_translation;
-    let natural_translation = utf16_len(&normalize_lines(translation).join("\n"));
-    let natural_source = utf16_len(&normalize_lines(source).join("\n"));
+    let natural_translation = utf16_len(&translation_text);
+    let natural_source = utf16_len(&source_text);
 
     let translation_units = if natural_translation <= base_translation {
         natural_translation
@@ -119,40 +229,70 @@ fn fit_bilingual(translation: &str, source: &str) -> String {
     };
     let source_units = content_budget.saturating_sub(translation_units);
 
-    // 先按字符配额裁一次，再用实际视觉行数分配 5/4 行配额。
-    let translation = fit_tail(translation, translation_units, CHATBOX_MAX_LINES);
-    let source = fit_tail(source, source_units, CHATBOX_MAX_LINES);
-    if translation.is_empty() {
-        return source;
+    // 先按字符配额裁一次，再用实际视觉行数分配行配额。
+    let translation_fit = fit_tail(&translation_text, translation_units, max_lines);
+    let source_fit = fit_tail(&source_text, source_units, max_lines);
+    let translation_visible = has_visible_text(&translation_fit);
+    let source_visible = has_visible_text(&source_fit);
+    if !translation_visible && !source_visible {
+        return None;
     }
-    if source.is_empty() {
-        return translation;
+    // 有一侧被挤没时，这句话已经算被截断（只是保留了另一侧的完整内容），
+    // 不应再在这句之后继续装更旧的历史句。
+    if !translation_visible {
+        return fit_single_side(&source_text, max_units, max_lines).map(|(block, _)| (block, true));
+    }
+    if !source_visible {
+        return fit_single_side(&translation_text, max_units, max_lines)
+            .map(|(block, _)| (block, true));
     }
 
-    let translation_lines = visual_line_count(&translation);
-    let source_lines = visual_line_count(&source);
-    if translation_lines + source_lines <= CHATBOX_MAX_LINES {
-        return format!("{translation}\n{source}");
+    let translation_lines = visual_line_count(&translation_fit);
+    let source_lines = visual_line_count(&source_fit);
+    if translation_lines + source_lines <= max_lines {
+        return Some((format!("{translation_fit}\n{source_fit}"), true));
     }
 
-    // 软 5/4：默认译文 5 行、原文 4 行；哪边用不到 5/4 行就把行数借给另一边。
-    let (translation_cap, source_cap) = if translation_lines < 5 {
-        (translation_lines, CHATBOX_MAX_LINES - translation_lines)
-    } else if source_lines < 4 {
-        (CHATBOX_MAX_LINES - source_lines, source_lines)
+    // 奇数行时译文多一行；哪边用不到自己的份额就把行数借给另一边。
+    let (translation_cap, source_cap) = if translation_lines < translation_share {
+        (translation_lines, max_lines - translation_lines)
+    } else if source_lines < source_share {
+        (max_lines - source_lines, source_lines)
     } else {
-        (5, 4)
+        (translation_share, source_share)
     };
 
-    let translation = fit_tail(&translation, translation_units, translation_cap);
-    let source = fit_tail(&source, source_units, source_cap);
-    if translation.is_empty() {
-        source
-    } else if source.is_empty() {
-        translation
-    } else {
-        format!("{translation}\n{source}")
+    let translation_fit = fit_tail(&translation_text, translation_units, translation_cap);
+    let source_fit = fit_tail(&source_text, source_units, source_cap);
+    match (
+        has_visible_text(&translation_fit),
+        has_visible_text(&source_fit),
+    ) {
+        (true, true) => Some((format!("{translation_fit}\n{source_fit}"), true)),
+        (true, false) => {
+            fit_single_side(&translation_text, max_units, max_lines).map(|(block, _)| (block, true))
+        }
+        (false, true) => {
+            fit_single_side(&source_text, max_units, max_lines).map(|(block, _)| (block, true))
+        }
+        (false, false) => None,
     }
+}
+
+/// 把任意文本截成 VRChat 可接受的形式（保尾、9 行、144 UTF-16 码元）。
+///
+/// 对外主要给测试与调试用；正常路径由 [`compose`] 调用。
+pub fn truncate_chatbox(text: &str) -> String {
+    fit_tail(text, CHATBOX_MAX_UTF16_UNITS, CHATBOX_MAX_LINES)
+}
+
+/// 文本是否含有 `…` 和空白之外的可见内容。
+fn has_visible_text(text: &str) -> bool {
+    text.chars().any(|ch| ch != '…' && !ch.is_whitespace())
+}
+
+fn normalize_block(text: &str) -> String {
+    normalize_lines(text).join("\n")
 }
 
 /// 保留文本尾部，最多 `max_units` 个 UTF-16 码元、`max_lines` 个**实际显示行**。
@@ -352,6 +492,54 @@ mod tests {
     use super::*;
     use crate::events::Speaker;
     use crate::timeline::Timeline;
+    use std::time::{Duration, Instant};
+
+    /// 旧签名包装：关闭历史句、30 秒保留，便于复用原有单句用例。
+    fn compose(view: &SpeakerView<'_>, display: VrchatDisplay) -> ChatboxText {
+        super::compose(
+            view,
+            ChatboxOptions {
+                display,
+                show_history: false,
+                retention: Duration::from_secs(30),
+            },
+            Instant::now(),
+        )
+    }
+
+    /// 旧签名包装：完整预算下的双语块。
+    fn fit_bilingual(translation: &str, source: &str) -> String {
+        super::fit_bilingual(
+            translation,
+            source,
+            CHATBOX_MAX_UTF16_UNITS,
+            CHATBOX_MAX_LINES,
+        )
+        .expect("expected bilingual block")
+        .0
+    }
+
+    fn compose_with(
+        timeline: &Timeline,
+        display: VrchatDisplay,
+        show_history: bool,
+        retention_secs: u64,
+        now: Instant,
+    ) -> ChatboxText {
+        super::compose(
+            &timeline.speaker_view(Speaker::Local),
+            ChatboxOptions {
+                display,
+                show_history,
+                retention: Duration::from_secs(retention_secs),
+            },
+            now,
+        )
+    }
+
+    fn finalize(timeline: &mut Timeline, text: &str, at: Instant) {
+        timeline.apply_asr(Speaker::Local, text, true, 0, None, None, at);
+    }
 
     #[test]
     fn truncate_keeps_tail_and_prefixes_ellipsis() {
@@ -536,10 +724,10 @@ mod tests {
                 &timeline.speaker_view(Speaker::Local),
                 VrchatDisplay::Source
             ),
-            ChatboxText::Keep
+            ChatboxText::Clear
         );
 
-        timeline.push_typed("旧句。".to_string(), "zh".to_string());
+        timeline.push_typed("旧句。".to_string(), "zh".to_string(), Instant::now());
         assert_eq!(
             compose(
                 &timeline.speaker_view(Speaker::Local),
@@ -548,7 +736,15 @@ mod tests {
             ChatboxText::Text("旧句。".to_string())
         );
 
-        timeline.apply_asr(Speaker::Local, "当前句。", false, 0, None, None);
+        timeline.apply_asr(
+            Speaker::Local,
+            "当前句。",
+            false,
+            0,
+            None,
+            None,
+            Instant::now(),
+        );
         assert_eq!(
             compose(
                 &timeline.speaker_view(Speaker::Local),
@@ -562,15 +758,15 @@ mod tests {
     fn compose_translation_modes() {
         let mut timeline = Timeline::default();
         timeline.set_translation(Speaker::Local, true);
-        timeline.apply_asr(Speaker::Local, "源文", false, 0, None, None);
+        timeline.apply_asr(Speaker::Local, "源文", false, 0, None, None, Instant::now());
 
-        // 译文还没到：只显示译文时保持现状，双语录只有原文。
+        // 译文还没到：只显示译文时没有可显示内容；双语只有原文。
         assert_eq!(
             compose(
                 &timeline.speaker_view(Speaker::Local),
                 VrchatDisplay::Translation
             ),
-            ChatboxText::Keep
+            ChatboxText::Clear
         );
         assert_eq!(
             compose(
@@ -587,6 +783,7 @@ mod tests {
             false,
             "en".to_string(),
             None,
+            Instant::now(),
         );
         assert_eq!(
             compose(
@@ -619,5 +816,307 @@ mod tests {
         assert!(utf16_len(&fitted) <= CHATBOX_MAX_UTF16_UNITS);
         // 结果必须是合法 UTF-8（能构造出 String 就已经满足），再确认没有半个 emoji。
         assert!(fitted.chars().all(|ch| ch == '…' || ch == '😀'));
+    }
+
+    #[test]
+    fn history_renders_current_then_newest_history() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        finalize(&mut timeline, "一号", t0);
+        finalize(&mut timeline, "二号", t0 + Duration::from_secs(1));
+        timeline.apply_asr(
+            Speaker::Local,
+            "当前",
+            false,
+            0,
+            None,
+            None,
+            t0 + Duration::from_secs(2),
+        );
+
+        let now = t0 + Duration::from_secs(2);
+        assert_eq!(
+            compose_with(&timeline, VrchatDisplay::Source, true, 30, now),
+            ChatboxText::Text("当前\n二号\n一号".to_string()),
+            "当前句在上，历史向下越来越旧"
+        );
+        assert_eq!(
+            compose_with(&timeline, VrchatDisplay::Source, false, 30, now),
+            ChatboxText::Text("当前".to_string()),
+            "关闭历史句时只显示当前句"
+        );
+    }
+
+    #[test]
+    fn history_drops_expired_sentences() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        finalize(&mut timeline, "旧句", t0);
+        finalize(&mut timeline, "新句", t0 + Duration::from_secs(10));
+
+        assert_eq!(
+            compose_with(
+                &timeline,
+                VrchatDisplay::Source,
+                true,
+                30,
+                t0 + Duration::from_secs(35)
+            ),
+            ChatboxText::Text("新句".to_string()),
+            "超过保留时长的历史句不显示"
+        );
+        assert_eq!(
+            compose_with(
+                &timeline,
+                VrchatDisplay::Source,
+                true,
+                30,
+                t0 + Duration::from_secs(41)
+            ),
+            ChatboxText::Clear,
+            "全部过期后清空"
+        );
+    }
+
+    #[test]
+    fn history_off_clears_last_sentence_after_retention() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        finalize(&mut timeline, "最后一句", t0);
+
+        assert_eq!(
+            compose_with(
+                &timeline,
+                VrchatDisplay::Source,
+                false,
+                15,
+                t0 + Duration::from_secs(15)
+            ),
+            ChatboxText::Text("最后一句".to_string()),
+            "正好到保留时长时仍显示"
+        );
+        assert_eq!(
+            compose_with(
+                &timeline,
+                VrchatDisplay::Source,
+                false,
+                15,
+                t0 + Duration::from_secs(16)
+            ),
+            ChatboxText::Clear,
+            "关闭历史句时保留时长同样生效"
+        );
+    }
+
+    #[test]
+    fn history_truncates_overflowing_sentence_then_stops() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        timeline.push_typed("一号".to_string(), "zh".to_string(), t0);
+        timeline.push_typed(
+            "A".repeat(200),
+            "en".to_string(),
+            t0 + Duration::from_secs(1),
+        );
+        timeline.apply_asr(
+            Speaker::Local,
+            "当前",
+            false,
+            0,
+            None,
+            None,
+            t0 + Duration::from_secs(2),
+        );
+
+        let now = t0 + Duration::from_secs(2);
+        let ChatboxText::Text(text) = compose_with(&timeline, VrchatDisplay::Source, true, 30, now)
+        else {
+            panic!("expected text");
+        };
+        assert!(text.starts_with("当前\n…"), "{text}");
+        assert!(text.contains('A'));
+        assert!(!text.contains("一号"), "截断后不再装更旧的历史句: {text}");
+        assert!(utf16_len(&text) <= CHATBOX_MAX_UTF16_UNITS, "{text}");
+        assert!(visual_line_count(&text) <= CHATBOX_MAX_LINES, "{text}");
+    }
+
+    #[test]
+    fn history_does_not_emit_ellipsis_only_block() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        finalize(&mut timeline, "历史", t0);
+        let full = "A".repeat(CHATBOX_MAX_UTF16_UNITS);
+        timeline.apply_asr(
+            Speaker::Local,
+            &full,
+            false,
+            0,
+            None,
+            None,
+            t0 + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            compose_with(
+                &timeline,
+                VrchatDisplay::Source,
+                true,
+                30,
+                t0 + Duration::from_secs(1)
+            ),
+            ChatboxText::Text(full),
+            "预算用尽时不发只有 … 的块"
+        );
+    }
+
+    #[test]
+    fn bilingual_history_uses_remaining_odd_lines_for_translation() {
+        let mut timeline = Timeline::default();
+        timeline.set_translation(Speaker::Local, true);
+        let t0 = Instant::now();
+        // 历史句：译文 4 行、原文 4 行。
+        timeline.apply_asr(Speaker::Local, "S1\nS2\nS3\nS4", false, 0, None, None, t0);
+        timeline.apply_translation(
+            Speaker::Local,
+            "T1\nT2\nT3\nT4",
+            0,
+            true,
+            "en".to_string(),
+            None,
+            t0 + Duration::from_secs(1),
+        );
+        // 当前句 4 行（译文未到，bilingual 下只显示原文）。
+        timeline.apply_asr(
+            Speaker::Local,
+            "C1\nC2\nC3\nC4",
+            false,
+            0,
+            None,
+            None,
+            t0 + Duration::from_secs(2),
+        );
+
+        let now = t0 + Duration::from_secs(2);
+        let ChatboxText::Text(text) =
+            compose_with(&timeline, VrchatDisplay::Bilingual, true, 30, now)
+        else {
+            panic!("expected text");
+        };
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), CHATBOX_MAX_LINES, "{text}");
+        assert_eq!(&lines[..4], &["C1", "C2", "C3", "C4"], "{text}");
+        // 剩余 5 行：译文 3 行、原文 2 行（奇数给译文多一行）。
+        assert_eq!(lines[6], "T4", "{text}");
+        assert_eq!(lines[8], "S4", "{text}");
+        assert!(lines[4].starts_with('…'), "{text}");
+        assert!(lines[7].starts_with('…'), "{text}");
+    }
+
+    #[test]
+    fn bilingual_history_borrows_unused_lines_in_small_budget() {
+        let mut timeline = Timeline::default();
+        timeline.set_translation(Speaker::Local, true);
+        let t0 = Instant::now();
+        let source = (1..=10)
+            .map(|index| format!("S{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        timeline.apply_asr(Speaker::Local, &source, false, 0, None, None, t0);
+        timeline.apply_translation(
+            Speaker::Local,
+            "T1\nT2",
+            0,
+            true,
+            "en".to_string(),
+            None,
+            t0 + Duration::from_secs(1),
+        );
+        timeline.apply_asr(
+            Speaker::Local,
+            "C1\nC2\nC3\nC4",
+            false,
+            0,
+            None,
+            None,
+            t0 + Duration::from_secs(2),
+        );
+
+        let now = t0 + Duration::from_secs(2);
+        let ChatboxText::Text(text) =
+            compose_with(&timeline, VrchatDisplay::Bilingual, true, 30, now)
+        else {
+            panic!("expected text");
+        };
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), CHATBOX_MAX_LINES, "{text}");
+        // 译文只有 2 行，不截断；原文借用剩下的 3 行。
+        assert_eq!(&lines[4..6], &["T1", "T2"], "{text}");
+        assert!(lines[6].starts_with('…'), "{text}");
+        assert_eq!(lines[8], "S10", "{text}");
+    }
+
+    #[test]
+    fn translation_pending_current_skips_to_history() {
+        let mut timeline = Timeline::default();
+        timeline.set_translation(Speaker::Local, true);
+        let t0 = Instant::now();
+        timeline.apply_asr(Speaker::Local, "源1", false, 0, None, None, t0);
+        timeline.apply_translation(
+            Speaker::Local,
+            "译1",
+            0,
+            true,
+            "en".to_string(),
+            Some(1),
+            t0 + Duration::from_secs(1),
+        );
+        // 第二句已成为当前句，但译文还没到；第一句的译文已经定稿进入历史。
+        timeline.apply_asr(
+            Speaker::Local,
+            "源2",
+            false,
+            0,
+            None,
+            None,
+            t0 + Duration::from_secs(2),
+        );
+
+        let now = t0 + Duration::from_secs(2);
+        assert_eq!(
+            compose_with(&timeline, VrchatDisplay::Bilingual, true, 30, now),
+            ChatboxText::Text("源2\n译1\n源1".to_string()),
+            "当前句只有原文时，历史句仍带着译文显示"
+        );
+        assert_eq!(
+            compose_with(&timeline, VrchatDisplay::Translation, true, 30, now),
+            ChatboxText::Text("译1".to_string()),
+            "只显示译文时跳过不可渲染的当前句，回退到历史句"
+        );
+        assert_eq!(
+            compose_with(&timeline, VrchatDisplay::Translation, false, 30, now),
+            ChatboxText::Text("译1".to_string()),
+            "关闭历史句时回退到最后一条历史句"
+        );
+
+        timeline.apply_translation(
+            Speaker::Local,
+            "译2",
+            0,
+            true,
+            "en".to_string(),
+            Some(2),
+            t0 + Duration::from_secs(3),
+        );
+        assert_eq!(
+            compose_with(
+                &timeline,
+                VrchatDisplay::Bilingual,
+                true,
+                30,
+                t0 + Duration::from_secs(3)
+            ),
+            ChatboxText::Text("译2\n源2\n译1\n源1".to_string()),
+            "迟到的译文定稿后自动反映到当前块"
+        );
     }
 }

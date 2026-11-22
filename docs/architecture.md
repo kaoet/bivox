@@ -17,7 +17,7 @@ Bivox 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 - 两个二进制：`bivox.exe`（GUI 主程序）与 `admin.exe`（百炼音色/热词调试 CLI，不随发布包分发，D19）；
 - 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口、声音复刻 HTTP 接口，以及 ASR 预编译热词管理 HTTP 接口（D31）；
 - 翻译模式（`[self] translate`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成，字幕以「译文 + 原文」双语呈现（M2，D26；独立 GUI 翻译页是 M3）；
-- VRChat OSC 聊天框（`[vrchat.osc]`，D33）：会话事件额外喂给独立后台任务，按固定 1 秒文本间隔、typing 跳变和约 30 秒自然过期更新本机 `127.0.0.1:9000` 的 ChatBox；
+- VRChat OSC 聊天框（`[vrchat.osc]`，D33/D42）：会话事件额外喂给独立后台任务，按固定 1 秒文本间隔、typing 跳变、可配置的历史句窗口（默认保留最近 30 秒）更新本机 `127.0.0.1:9000` 的 ChatBox；
 - 他人线路（`[others]`，D36/D40）：独立 tokio 任务用进程环回采集 VRChat 的音频 → 本地 VAD → 第二条 ASR，文本只进时间线上屏（不发 OSC、不做 TTS）；进程不可达时按退避自动重连，不影响会话；
 - 没有本地语音模型，运行必须联网并配置 API Key。
 
@@ -79,9 +79,9 @@ src/
 ├── config.rs            config.toml 解析、默认值、归一化、校验、URL/路径派生
 ├── config_edit.rs       配置读写：读取、最小化序列化、校验、`.bak` 备份
 ├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
-├── chatbox.rs           VRChat 聊天框文本合成/typing 判断/144 UTF-16、9 显示行截断（D33）
-├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、清空、测试消息（D33）
-├── timeline.rs         Timeline：ASR/翻译/打字事件的纯归约（GUI 与 OSC 共用）
+├── chatbox.rs           VRChat 聊天框文本合成：当前句+历史句、逐句截断、双语软借用（D33/D42）
+├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、保留时长清空、测试消息（D33/D42）
+├── timeline.rs         Timeline：ASR/翻译/打字事件的纯归约（GUI 与 OSC 共用；含句终时间戳）
 ├── http.rs              百炼 HTTP JSON 接口的公共错误类型与响应解析
 ├── language.rs          语言代码集合、脚本统计、LanguageTracker、instruction 映射
 ├── asr/
@@ -129,7 +129,7 @@ src/
 │   ├── tts_current_voice.rs 语音合成页：顶部「当前音色」选择
 │   ├── tts_voice_editor.rs  语音合成页：自定义音色样本编辑/排序/语速
 │   ├── translate_tab.rs 翻译页：共用的粒度、显示原文与翻译模型
-│   ├── vrchat_tab.rs    VRChat 页：采集进程、OSC 开关/端口/显示模式、发送测试消息（D33/D38）
+│   ├── vrchat_tab.rs    VRChat 页：采集进程、OSC 开关/端口/显示模式/历史句/保留时长、发送测试消息（D33/D38/D42）
 │   ├── settings_tab.rs  设置页：API Key、高级设置、整页保存
 │   ├── log_panel.rs     底部日志面板
 │   ├── widgets.rs       通用小部件（错误横幅、键值行、设备下拉）
@@ -615,7 +615,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 翻译是逐块 HTTP 请求：clause 模式的实际延迟、端到端 1s 目标、16 语种 TTS 自然度与碎句译文质量尚未做真实语料评估。
 - 已送 TTS 的译文不可撤回；翻译失败的片段不发声，只按 D8 显示错误条。
 - VRChat 聊天框文本**固定最多 1 条/秒**（本机实测 900ms 长跑跳字），因此聊天框字幕是低频镜像，不是逐事件刷新；GUI 字幕不受影响（D33）。
-- VRChat 约 30 秒无新文本会自然过期；正常句终不主动清空，停止/失败/关闭 OSC/关窗才显式清空。当前句若超过约 30 秒没有任何文本变化（极罕见）也可能自然消失。
+- 聊天框内容在定稿超过 `retention_secs`（默认 30 秒，1–30）后由客户端主动发空串清空；停止/失败/关闭 OSC/关窗立即清空（D42）。VRChat 自身约 30 秒自然过期仍存在，但客户端不再依赖它；当前句（未定稿）不受保留时长限制。
 - `/chatbox/typing` 实测不占文本 1 条/秒预算；若未来 VRChat 版本变化，需要重新评估。
 - 144 按 UTF-16 码元预算、9 个显示行（含自动换行）；默认 UI 行宽已实测（ASCII 24 / 中文 15 / emoji 12），但 UI 缩放、字体和复杂 ZWJ emoji 仍可能影响换行，截断模型保留保守余量。
 - 只支持与本机 VRChat 通信（loopback），不支持远程主机或 OSCQuery 自动发现。
@@ -663,48 +663,51 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ### 17.1 配置与界面
 
-- `[vrchat.osc]` 字段见 `src/config.rs`；`display` 的三种取值为 `source` / `bilingual` / `translation`。
+- `[vrchat.osc]` 字段见 `src/config.rs`；`display` 的三种取值为 `source` / `bilingual` / `translation`；`show_history` 与 `retention_secs` 见 D42。
 - `[vrchat.osc]` 不进配置指纹：GUI 写回后 `ChatboxService` 通过 watch 立即读取，不重启实时管线（D20 例外）；`[vrchat] process` 是对方线路的运行配置，进指纹（D37）。
-- 「VRChat」页在「语音合成」和「翻译」之间：启用开关、发送端口、三种显示模式、发送测试消息。
+- 「VRChat」页在「语音合成」和「翻译」之间：启用开关、发送端口、三种显示模式、显示历史句、保留时长（1–30 秒，默认 30）、发送测试消息。
   - 翻译模式未开启时三种模式仍可编辑，页面不写额外提示；
   - 无状态行、typing 说明、隐私提示；
   - 测试消息立即发送，不受 1 秒文本节流约束；不改变 typing。
 
 ### 17.2 文本合成与截断
 
-入口：`chatbox::compose(&SpeakerView, display) -> Text/Keep`（`SpeakerView` 来自 `timeline.speaker_view(Speaker::Local)`）。
+入口：`chatbox::compose(&SpeakerView, ChatboxOptions, now) -> Text/Clear`（`SpeakerView` 来自 `timeline.speaker_view(Speaker::Local)`）。
 
-- 普通模式：显示 ASR 当前句；没有当前句时显示最后一条历史。
-- 翻译模式：`source` 显示源文，`translation` 显示译文（译文未到时 Keep、保留上一帧，不回退原文），`bilingual` 为「译文\n原文」。
-- 当前句是否存在决定 typing，与 display 无关。
-- 截断：`chatbox::truncate_chatbox` / 内部 `fit_*`：
+- 候选顺序（D42）：当前句 → 历史句（新→旧，`finished_at` 距今 ≤ `retention_secs`）。关闭历史句时最多装 1 块：有当前句只显示当前句；当前句在所选显示模式下不可渲染时才回退到最后一条历史句。
+- 普通模式显示 ASR 文本；翻译模式按 `display` 取源文 / 译文 / 双语。只显示译文且当前句译文未到时，跳过当前句、用保留时长内的历史句填充；仍没有可显示内容则发空串清空（不再保留可能超龄的上一帧）。
+- 逐句装填：从 144 码元 / 9 显示行出发；整块放得下就原样放入，放不下就按剩余配额截断该句（保尾 + 前导 `…`）后停止，因此至多一条句子被截断；块间分隔换行各占 1 个码元。
+- 当前句不预留历史空间：当前句自己用满预算时历史句不显示。
+- 双语：剩余行数为奇数时译文多一行（`ceil(L/2)`），字符按同一比例给基础配额；保留软借用（一侧用不完时借给另一侧）。同一句的「译文\n原文」始终相邻，块间不会交叉。
+- 截断细节 `chatbox::truncate_chatbox` / 内部 `fit_*`：
   - 144 UTF-16 码元、最多 9 个**显示行**（包含自动换行；VRChat 超行时保留前 9 行、裁尾）；
   - 实测默认 UI 行宽：约 24 ASCII / 15 中文 / 12 emoji；`chatbox` 用保守单位模型
     （ASCII 3 / CJK 5 / emoji 6，行宽 72）估算自动换行；
   - 超长时从头部删行/删字符，保留句尾；被截掉的句头用前导 `…` 代替（替换首字符，不额外占预算）；
-  - 双语按**软 5:4 配额**分配字符与显示行（正文 143 码元中译文 79 / 原文 64，行默认 5/4）；只有两侧都超过配额时才严格 5/4，任一侧用不完就把额度借给另一侧，总计不超过 144 码元 / 9 个显示行，两边都保尾。
+  - 双语的行份额为 `ceil/floor`（剩余 9 行时译文 5 / 原文 4），字符按同一比例分；只有两侧都超过份额时才严格按份额，任一侧用不完就把额度借给另一侧，总计不超过 144 码元 / 9 个显示行，两边都保尾。
 
 ### 17.3 发送与限流
 
 - `ChatboxService` 是 `BivoxApp` 持有的常驻 tokio 任务；会话 `emit` 把 `PipelineEvent` 克隆一份发到其无界通道。
 - 文本：距上次成功文本发送 ≥ `CHATBOX_TEXT_INTERVAL`（1000ms）才发；1 秒内多次变化只发最新内容；相同文本只在同一段显示内去重，新当前句/打字输入会重置去重。
 - typing：`/chatbox/typing` 只在当前句开始/结束时发送；实测不占文本预算。
-- 正常句终不清空；VRChat 约 30 秒自然过期。停止/失败/关闭 OSC/关窗发空字符串显式清空。
+- 清空（D42）：没有可显示内容时发空串；已定稿内容超过 `retention_secs` 后由客户端主动发空串清空（默认 30 秒，与 VRChat 自然过期对齐，不需要心跳重发）。停止/失败/关闭 OSC/关窗仍立即清空。
 - 发送：`rosc` 编码 `/chatbox/input` `(text, true, false)` 或 `/chatbox/typing`，`std::net::UdpSocket` 发到 `127.0.0.1:port`；不 bind 9000、不用 bundle。
 - 失败只写 debug 日志；VRChat 未运行是正常状态，不弹错误。
 
 ### 17.4 与 GUI 的边界
 
-- `Timeline` 由 `timeline.rs` 提供，GUI 与 OSC 任务共用，避免 D16/D26 语义漂移。
+- `Timeline` 由 `timeline.rs` 提供，GUI 与 OSC 任务共用，避免 D16/D26 语义漂移；`Message.finished_at` 记录句终时刻，供 OSC 按保留时长裁剪（D42）。
 - 会话启动失败时，包装任务额外向 OSC 通道发 `StateChanged(Failed)`，让聊天框清空。
 - 关窗流程调用 `ChatboxService::shutdown()` 尽力清空并退出任务。
 
 ### 17.5 验证
 
 - 单测：配置解析/校验、VRChat 配置写回、文本合成/保尾截断/9 行、typing 跳变、OSC 编码（`/chatbox/input` 的 `sTF`、`/chatbox/typing` 的 bool）、1 秒节流与清空（注入时钟）。
+- 历史句（D42）：当前句+历史顺序、保留时长边界、关闭历史句时的最后一句清空、逐句截断与仅截断一条、双语奇数行 3/2 与软借用、译文未到的当前句回退历史、预算用尽不发只有 `…` 的块。
 - 2026-11-09 真机复核：144 ASCII 显示 6 行；160 ASCII 在 144 字符处裁尾；12 个显式行只显示 L01–L09；默认 UI 每行约 24 ASCII / 15 中文 / 12 emoji；144 纯中文约 10 行，双语 144 字符会因自动换行超过 9 行而裁掉源文尾。修复后 `chatbox` 按显示宽度估算换行，客户端发的 144 中文/双语样例均为 9 行且保留尾部标记。
-- GUI：egui_mcp 验证页签、开关/模式/端口写回、测试消息发包。
-- 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、30 秒自然过期与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。
+- GUI：egui_mcp 验证页签、开关/模式/端口/历史句/保留时长写回、测试消息发包。
+- 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、保留时长清空与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。
 
 ---
 

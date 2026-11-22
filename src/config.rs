@@ -89,6 +89,17 @@ pub const DEFAULT_TRANSLATE_GRANULARITY: TranslateGranularity = TranslateGranula
 /// 默认 VRChat OSC 接收端口（VRChat 的默认 inPort）。
 pub const DEFAULT_VRCHAT_OSC_PORT: u16 = 9000;
 
+/// 默认聊天框文本保留时长（秒）：定稿后多久主动清空（D42）。
+pub const DEFAULT_VRCHAT_RETENTION_SECS: u32 = 30;
+
+/// 聊天框文本保留时长的最小值（秒）。
+pub const MIN_VRCHAT_RETENTION_SECS: u32 = 1;
+
+/// 聊天框文本保留时长的最大值（秒）。
+///
+/// 取 30 秒与 VRChat 聊天框的自然过期时长对齐，避免额外的心跳重发（D42）。
+pub const MAX_VRCHAT_RETENTION_SECS: u32 = 30;
+
 /// 对方线路默认监听的目标进程（VRChat 的 exe 文件名）。
 pub const DEFAULT_VRCHAT_PROCESS: &str = "VRChat.exe";
 
@@ -375,7 +386,7 @@ impl Default for VrchatConfig {
 }
 
 /// `[vrchat.osc]`：OSC 聊天框输出。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VrchatOscConfig {
     /// 是否把实时字幕发送到 VRChat 的 OSC 聊天框。
@@ -388,6 +399,17 @@ pub struct VrchatOscConfig {
 
     /// 翻译模式下的聊天框显示内容；非翻译模式固定显示 ASR 原文。
     pub display: VrchatDisplay,
+
+    /// 是否在聊天框里同时保留当前句之后的历史句（D42）。
+    ///
+    /// 关闭时只显示当前句；没有当前句时显示最后一条定稿消息。
+    pub show_history: bool,
+
+    /// 聊天框文本保留时长（秒），范围 [`MIN_VRCHAT_RETENTION_SECS`]–[`MAX_VRCHAT_RETENTION_SECS`]（D42）。
+    ///
+    /// 两种模式都生效：历史句的年龄上限；关闭历史句时是最后一条消息定稿后的存活时间。
+    /// 当前句（未定稿）不受此限制。
+    pub retention_secs: u32,
 }
 
 impl Default for VrchatOscConfig {
@@ -396,6 +418,8 @@ impl Default for VrchatOscConfig {
             enabled: false,
             port: DEFAULT_VRCHAT_OSC_PORT,
             display: VrchatDisplay::default(),
+            show_history: false,
+            retention_secs: DEFAULT_VRCHAT_RETENTION_SECS,
         }
     }
 }
@@ -814,6 +838,18 @@ impl AppConfig {
                 Value::String(self.vrchat.osc.display.label().to_string()),
             );
         }
+        if self.vrchat.osc.show_history != default.vrchat.osc.show_history {
+            osc.insert(
+                "show_history".to_string(),
+                Value::Boolean(self.vrchat.osc.show_history),
+            );
+        }
+        if self.vrchat.osc.retention_secs != default.vrchat.osc.retention_secs {
+            osc.insert(
+                "retention_secs".to_string(),
+                Value::Integer(i64::from(self.vrchat.osc.retention_secs)),
+            );
+        }
         if !osc.is_empty() {
             vrchat.insert("osc".to_string(), Value::Table(osc));
         }
@@ -995,6 +1031,13 @@ impl AppConfig {
         }
         if self.vrchat.osc.port == 0 {
             bail!("配置项 [vrchat.osc] port 必须在 1–65535 之间");
+        }
+        if !(MIN_VRCHAT_RETENTION_SECS..=MAX_VRCHAT_RETENTION_SECS)
+            .contains(&self.vrchat.osc.retention_secs)
+        {
+            bail!(
+                "配置项 [vrchat.osc] retention_secs 必须在 {MIN_VRCHAT_RETENTION_SECS}–{MAX_VRCHAT_RETENTION_SECS} 秒之间"
+            );
         }
         Ok(())
     }
@@ -1328,6 +1371,11 @@ mod tests {
         assert!(!config.vrchat.osc.enabled);
         assert_eq!(config.vrchat.osc.port, DEFAULT_VRCHAT_OSC_PORT);
         assert_eq!(config.vrchat.osc.display, VrchatDisplay::Bilingual);
+        assert!(!config.vrchat.osc.show_history, "默认不显示历史句");
+        assert_eq!(
+            config.vrchat.osc.retention_secs, DEFAULT_VRCHAT_RETENTION_SECS,
+            "默认保留 30 秒"
+        );
         assert_eq!(
             config.cache_path(),
             PathBuf::from("cache.json"),
@@ -1575,6 +1623,8 @@ show_source = false
 enabled = true
 port = 9001
 display = "translation"
+show_history = true
+retention_secs = 12
 "#;
         let config = AppConfig::from_toml_str(text).unwrap();
         let out = config.to_toml_string().unwrap();
@@ -1625,6 +1675,8 @@ display = "translation"
         assert!(round.vrchat.osc.enabled);
         assert_eq!(round.vrchat.osc.port, 9001);
         assert_eq!(round.vrchat.osc.display, VrchatDisplay::Translation);
+        assert!(round.vrchat.osc.show_history);
+        assert_eq!(round.vrchat.osc.retention_secs, 12);
 
         assert_eq!(round.to_toml_string().unwrap(), out, "序列化应稳定");
         assert_eq!(out.matches("rate = ").count(), 1, "默认语速不应写回: {out}");
@@ -2013,12 +2065,14 @@ rate = 1.25
     #[test]
     fn vrchat_osc_config_is_parsed_and_validated() {
         let config = AppConfig::from_toml_str(
-            "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nenabled = true\nport = 9001\ndisplay = \"translation\"\n",
+            "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nenabled = true\nport = 9001\ndisplay = \"translation\"\nshow_history = true\nretention_secs = 20\n",
         )
         .unwrap();
         assert!(config.vrchat.osc.enabled);
         assert_eq!(config.vrchat.osc.port, 9001);
         assert_eq!(config.vrchat.osc.display, VrchatDisplay::Translation);
+        assert!(config.vrchat.osc.show_history);
+        assert_eq!(config.vrchat.osc.retention_secs, 20);
 
         let err = AppConfig::from_toml_str("[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nport = 0\n")
             .unwrap_err();
@@ -2026,6 +2080,17 @@ rate = 1.25
             format!("{err:#}").contains("[vrchat.osc] port"),
             "port=0 应被拒绝: {err:#}"
         );
+
+        for retention in ["0", "31"] {
+            let err = AppConfig::from_toml_str(&format!(
+                "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nretention_secs = {retention}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[vrchat.osc] retention_secs"),
+                "retention_secs={retention} 应被拒绝: {err:#}"
+            );
+        }
 
         let err = AppConfig::from_toml_str(
             "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\ndisplay = \"both\"\n",
