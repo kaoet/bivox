@@ -7,6 +7,7 @@ pub mod asr_tab;
 pub mod audio_tab;
 pub mod language_list;
 pub mod log_panel;
+pub mod meter;
 pub mod others_tab;
 pub mod realtime_tab;
 pub mod self_tab;

@@ -301,6 +301,7 @@ impl Runtime {
             | PipelineEvent::VoiceInfo { .. }
             | PipelineEvent::VadActive { .. }
             | PipelineEvent::OthersStatus(_)
+            | PipelineEvent::LineError { .. }
             | PipelineEvent::Warning { .. }
             | PipelineEvent::Error { .. } => {}
         }

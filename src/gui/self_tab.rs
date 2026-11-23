@@ -64,8 +64,16 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     );
 
     ui.add_space(8.0);
-    ui.checkbox(&mut app.self_mic, "采集麦克风");
-    ui.label(egui::RichText::new("关闭后不录音、不上传，只能用实时页底部的打字输入。").weak());
+    let mut mic_enabled = app.config.local.mic;
+    if ui.checkbox(&mut mic_enabled, "采集麦克风").changed() {
+        app.set_local_mic(mic_enabled);
+    }
+    ui.label(
+        egui::RichText::new(
+            "关闭后不录音、不上传，只能用实时页底部的打字输入；切换立即生效，无需保存。",
+        )
+        .weak(),
+    );
 
     ui.add_space(10.0);
     language_list::show(ui, "self_languages", &mut app.self_languages);

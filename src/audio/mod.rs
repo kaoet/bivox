@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod device;
+pub mod meter;
 pub mod playback;
 #[cfg(windows)]
 pub mod process_capture;

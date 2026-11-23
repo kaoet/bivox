@@ -10,6 +10,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::audio::device::AudioDeviceManager;
+use crate::audio::meter::MeterSmoother;
 use crate::config::{
     AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VAD_MIN_SILENCE_MS, DEFAULT_VAD_TAIL_MS,
     DEFAULT_VAD_THRESHOLD, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
@@ -170,16 +171,18 @@ pub struct BivoxApp {
     pub asr_hotwords: String,
     /// 语音识别页保存/校验错误（红色显示）。
     pub asr_edit_error: Option<String>,
-    /// 「自己」页草稿：麦克风 / 语言列表 / 翻译 / 译文语言 / 合成开关。
-    pub self_mic: bool,
+    /// 「自己」页草稿：语言列表 / 翻译 / 译文语言 / 合成开关。
+    ///
+    /// 麦克风开关不在这里：它切换即写回配置（D43），不参与本页的脏状态。
     pub self_languages: Vec<String>,
     pub self_translate: bool,
     pub self_target: String,
     pub self_tts: bool,
     /// 「自己」页保存/校验错误（红色显示）。
     pub self_edit_error: Option<String>,
-    /// 「他人」页草稿：开关 / 语言列表 / 翻译 / 译文语言。
-    pub others_enabled: bool,
+    /// 「他人」页草稿：语言列表 / 翻译 / 译文语言。
+    ///
+    /// 侦听开关不在这里：它切换即写回配置（D43），不参与本页的脏状态。
     pub others_languages: Vec<String>,
     pub others_translate: bool,
     pub others_target: String,
@@ -191,10 +194,17 @@ pub struct BivoxApp {
     pub pipeline_warning: Option<String>,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
     pub pipeline_error: Option<String>,
-    /// 本地 VAD 当前是否处于语音段（顶栏指示器用）。
+    /// 本地 VAD 当前是否处于语音段（顶栏电平条配色用）。
     pub vad_active: bool,
     /// 他人线路的 VAD 指示（由对方线路上报；对方线路未启用时保持 false）。
     pub vad_active_others: bool,
+    /// 顶栏麦克风电平（平滑后，0..1）。
+    pub mic_level: f32,
+    /// 顶栏他人线路电平（平滑后，0..1）。
+    pub others_level: f32,
+    /// 两条电平条的平滑器。
+    pub mic_meter: MeterSmoother,
+    pub others_meter: MeterSmoother,
     /// 他人线路的最近状态（`None` = 未启用或会话未运行）。
     pub others_status: Option<OthersStatus>,
     /// 他人线路下一次重试的相对时刻（由 `retry_in` 换算，界面倒计时用）。
@@ -265,13 +275,11 @@ impl BivoxApp {
             asr_model: String::new(),
             asr_hotwords: String::new(),
             asr_edit_error: None,
-            self_mic: true,
             self_languages: Vec::new(),
             self_translate: false,
             self_target: String::new(),
             self_tts: true,
             self_edit_error: None,
-            others_enabled: false,
             others_languages: Vec::new(),
             others_translate: false,
             others_target: String::new(),
@@ -281,6 +289,10 @@ impl BivoxApp {
             pipeline_error: None,
             vad_active: false,
             vad_active_others: false,
+            mic_level: 0.0,
+            others_level: 0.0,
+            mic_meter: MeterSmoother::default(),
+            others_meter: MeterSmoother::default(),
             others_status: None,
             others_retry_deadline: None,
             startup_error,
@@ -406,9 +418,8 @@ impl BivoxApp {
         self.asr_edit_error = None;
     }
 
-    /// 从配置同步「自己」页的草稿值。
+    /// 从配置同步「自己」页的草稿值（麦克风不在草稿里，直接读配置）。
     pub fn sync_self_inputs(&mut self) {
-        self.self_mic = self.config.local.mic;
         self.self_languages = self.config.local.languages.clone();
         self.self_translate = self.config.local.translate;
         self.self_target = self.config.local.target.clone();
@@ -416,9 +427,8 @@ impl BivoxApp {
         self.self_edit_error = None;
     }
 
-    /// 从配置同步「他人」页的草稿值。
+    /// 从配置同步「他人」页的草稿值（侦听开关不在草稿里，直接读配置）。
     pub fn sync_others_inputs(&mut self) {
-        self.others_enabled = self.config.others.enabled;
         self.others_languages = self.config.others.languages.clone();
         self.others_translate = self.config.others.translate;
         self.others_target = self.config.others.target.clone();
@@ -639,18 +649,18 @@ impl BivoxApp {
 
     // ---- 自己页 ----
 
-    /// 「自己」页是否有未保存改动。
+    /// 「自己」页是否有未保存改动（麦克风切换即写回，不算脏）。
     pub fn self_tab_dirty(&self) -> bool {
-        self.self_mic != self.config.local.mic
-            || self.self_languages != self.config.local.languages
+        self.self_languages != self.config.local.languages
             || self.self_translate != self.config.local.translate
             || self.self_target != self.config.local.target
             || self.self_tts != self.config.local.tts
     }
 
-    /// 保存「自己」页的全部改动（`[self]` 一次原子写回）。
+    /// 保存「自己」页的其余改动（语言 / 翻译 / 合成，`[self]` 一次原子写回）。
     ///
-    /// 成功后重载配置；运行中会按 D20 自动重启实时管线。
+    /// 麦克风已在切换时单独写回（D43），这里不改它。成功后重载配置；
+    /// 运行中会按 D20 自动重启实时管线。
     pub fn save_self_tab(&mut self) {
         if !self.self_tab_dirty() {
             return;
@@ -676,7 +686,6 @@ impl BivoxApp {
         let original = config_edit::read(&self.paths.config_file)?;
         let mut config = AppConfig::load(&self.paths.config_file)
             .context("磁盘上的配置已无效，无法保存「自己」设置")?;
-        config.local.mic = self.self_mic;
         config.local.languages = self.self_languages.clone();
         config.local.translate = self.self_translate;
         config.local.target = self.self_target.clone();
@@ -691,17 +700,17 @@ impl BivoxApp {
 
     // ---- 他人页 ----
 
-    /// 「他人」页是否有未保存改动。
+    /// 「他人」页是否有未保存改动（侦听开关切换即写回，不算脏）。
     pub fn others_tab_dirty(&self) -> bool {
-        self.others_enabled != self.config.others.enabled
-            || self.others_languages != self.config.others.languages
+        self.others_languages != self.config.others.languages
             || self.others_translate != self.config.others.translate
             || self.others_target != self.config.others.target
     }
 
-    /// 保存「他人」页的全部改动（`[others]` 一次原子写回）。
+    /// 保存「他人」页的其余改动（语言 / 翻译，`[others]` 一次原子写回）。
     ///
-    /// 成功后重载配置；运行中会按 D20 自动重启实时管线。
+    /// 侦听开关已在切换时单独写回（D43），这里不改它。成功后重载配置；
+    /// 运行中会按 D20 自动重启实时管线。
     pub fn save_others_tab(&mut self) {
         if !self.others_tab_dirty() {
             return;
@@ -727,7 +736,6 @@ impl BivoxApp {
         let original = config_edit::read(&self.paths.config_file)?;
         let mut config = AppConfig::load(&self.paths.config_file)
             .context("磁盘上的配置已无效，无法保存「他人」设置")?;
-        config.others.enabled = self.others_enabled;
         config.others.languages = self.others_languages.clone();
         config.others.translate = self.others_translate;
         config.others.target = self.others_target.clone();
@@ -921,6 +929,115 @@ impl BivoxApp {
         }
     }
 
+    // ---- 快捷开关（D43）----
+    //
+    // 顶栏图标与「自己 / 他人」页的 checkbox 共用这一条路径：切换即写回配置，
+    // 同时通过 `PipelineSessionHandle` 通知会话按线路立即启停；成功后同步运行
+    // 配置指纹，避免误触发 D20 全量热重启。
+
+    /// 麦克风开关（顶栏图标 / 「自己」页 checkbox）：写回 `[self] mic` 并立即启停麦克风线路。
+    pub fn set_local_mic(&mut self, enabled: bool) {
+        if self.config.local.mic == enabled {
+            return;
+        }
+        match self.write_config(|config| {
+            config.local.mic = enabled;
+            Ok(())
+        }) {
+            Ok(()) => {
+                self.config.local.mic = enabled;
+                if let Some(session) = &self.session {
+                    session.set_mic_enabled(enabled);
+                }
+                self.refresh_running_signature();
+                if !enabled {
+                    self.vad_active = false;
+                    self.timeline.drop_open(Speaker::Local);
+                }
+                self.config_write_error = None;
+                self.config_write_error_tab = None;
+                info!(
+                    "麦克风已{}（{}）",
+                    if enabled { "开启" } else { "关闭" },
+                    self.paths.config_file.display()
+                );
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.config_write_error = Some(message.clone());
+                self.config_write_error_tab = None;
+                warn!("切换麦克风失败：{message}");
+            }
+        }
+    }
+
+    /// 他人侦听开关（顶栏图标 / 「他人」页 checkbox）：写回 `[others] enabled` 并立即启停他人线路。
+    pub fn set_others_enabled(&mut self, enabled: bool) {
+        if self.config.others.enabled == enabled {
+            return;
+        }
+        match self.write_config(|config| {
+            config.others.enabled = enabled;
+            Ok(())
+        }) {
+            Ok(()) => {
+                self.config.others.enabled = enabled;
+                if let Some(session) = &self.session {
+                    session.set_others_enabled(enabled);
+                }
+                self.refresh_running_signature();
+                if !enabled {
+                    self.vad_active_others = false;
+                    self.others_status = None;
+                    self.others_retry_deadline = None;
+                    self.timeline.drop_open(Speaker::Others);
+                }
+                self.config_write_error = None;
+                self.config_write_error_tab = None;
+                info!(
+                    "他人侦听已{}（{}）",
+                    if enabled { "开启" } else { "关闭" },
+                    self.paths.config_file.display()
+                );
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.config_write_error = Some(message.clone());
+                self.config_write_error_tab = None;
+                warn!("切换他人侦听失败：{message}");
+            }
+        }
+    }
+
+    /// 快捷开关已由监督者接管，更新运行指纹避免 D20 误重启。
+    fn refresh_running_signature(&mut self) {
+        if self.session.is_some() {
+            self.running_config_signature = Some(config_signature(&self.config));
+        }
+    }
+
+    /// 麦克风线路启动失败：监督者已把运行时开关置关，这里把配置与页签一起回退。
+    fn revert_local_mic_after_error(&mut self, detail: &str) {
+        self.config.local.mic = false;
+        if let Some(session) = &self.session {
+            session.set_mic_enabled(false);
+        }
+        self.vad_active = false;
+        self.timeline.drop_open(Speaker::Local);
+        self.refresh_running_signature();
+        if let Err(err) = self.write_config(|config| {
+            config.local.mic = false;
+            Ok(())
+        }) {
+            let message = format!("{err:#}");
+            self.config_write_error = Some(message.clone());
+            self.config_write_error_tab = None;
+            warn!("麦克风启动失败后写回关闭状态失败：{message}");
+        }
+        self.pipeline_warning = Some(format!("麦克风线路启动失败，已自动关闭：{detail}"));
+        warn!("麦克风线路启动失败，已自动关闭：{detail}");
+    }
+
     /// 读原文 → 解析为类型化配置 → 修改 → 最小化序列化并写回。
     fn write_config(
         &mut self,
@@ -1009,7 +1126,7 @@ impl BivoxApp {
         let (tx, rx) = mpsc::unbounded_channel();
         // 打字输入命令通道：GUI 提交、会话调度循环消费（无界，界面不会阻塞）。
         let (typed_tx, typed_rx) = mpsc::unbounded_channel::<TypedInput>();
-        let handle = PipelineSessionHandle::new(typed_tx);
+        let handle = PipelineSessionHandle::new(typed_tx, config.local.mic, config.others.enabled);
         self.restart_pending = false;
         self.running_config_signature = Some(config_signature(&config));
         self.session = Some(handle.clone());
@@ -1115,6 +1232,20 @@ impl BivoxApp {
         self.stop_session();
     }
 
+    /// 更新顶栏两条电平条的平滑值，并在运行期间维持约 30fps 重绘。
+    fn pump_meters(&mut self, ctx: &egui::Context) {
+        let (mic_target, others_target) = match &self.session {
+            Some(session) => (session.mic_level(), session.others_level()),
+            None => (0.0, 0.0),
+        };
+        let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.1);
+        self.mic_level = self.mic_meter.update(mic_target, dt);
+        self.others_level = self.others_meter.update(others_target, dt);
+        if self.session.is_some() && (self.config.local.mic || self.config.others.enabled) {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
     /// 排空后台事件（每帧一次）。
     fn pump_events(&mut self) {
         let mut events = Vec::new();
@@ -1148,6 +1279,10 @@ impl BivoxApp {
                     self.running_config_signature = None;
                     self.vad_active = false;
                     self.vad_active_others = false;
+                    self.mic_level = 0.0;
+                    self.others_level = 0.0;
+                    self.mic_meter.reset();
+                    self.others_meter.reset();
                     self.others_status = None;
                     self.others_retry_deadline = None;
                     self.typed_input_error = None;
@@ -1226,6 +1361,20 @@ impl BivoxApp {
                     self.others_status = None;
                 }
             }
+            PipelineEvent::LineError { speaker, detail } => match speaker {
+                Speaker::Local => {
+                    warn!("麦克风线路启动失败：{detail}");
+                    if self.config.local.mic {
+                        self.revert_local_mic_after_error(&detail);
+                    } else {
+                        self.pipeline_warning = Some(format!("麦克风线路启动失败：{detail}"));
+                    }
+                }
+                Speaker::Others => {
+                    self.pipeline_warning = Some(format!("他人线路启动失败：{detail}"));
+                    warn!("他人线路启动失败：{detail}");
+                }
+            },
             PipelineEvent::Warning { context, detail } => {
                 // 不影响会话继续的告警（如预编译热词降级，D31）：黄色横幅，可手动清除。
                 self.pipeline_warning = Some(format!("{context}：{detail}"));
@@ -1338,6 +1487,19 @@ impl BivoxApp {
                 egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
             );
         }
+        if let Some(detail) = self.config_write_error.clone()
+            && self.config_write_error_tab.is_none()
+        {
+            gui::widgets::banner(
+                ui,
+                "配置写回失败",
+                &detail,
+                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+            );
+            if ui.button("清除错误").clicked() {
+                self.config_write_error = None;
+            }
+        }
         self.others_status_banner(ui);
         if let Some(detail) = self.pipeline_warning.clone() {
             gui::widgets::banner(
@@ -1389,6 +1551,7 @@ impl eframe::App for BivoxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_logs();
         self.pump_events();
+        self.pump_meters(ui.ctx());
         // 自动重启需要 Context 来 request_repaint（点击「开始」时也会传一份）
         self.egui_ctx = Some(ui.ctx().clone());
 

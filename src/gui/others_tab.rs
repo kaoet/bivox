@@ -63,10 +63,15 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     );
 
     ui.add_space(8.0);
-    ui.checkbox(&mut app.others_enabled, "侦听他人语音");
+    let mut others_enabled = app.config.others.enabled;
+    if ui.checkbox(&mut others_enabled, "侦听他人语音").changed() {
+        app.set_others_enabled(others_enabled);
+    }
     ui.label(
-        egui::RichText::new("要采集的进程在「VRChat」页设置；关闭时不采集、不建第二条识别连接。")
-            .weak(),
+        egui::RichText::new(
+            "要采集的进程在「VRChat」页设置；关闭时不采集、不建第二条识别连接。切换立即生效，无需保存。",
+        )
+        .weak(),
     );
 
     ui.add_space(10.0);

@@ -149,6 +149,13 @@ pub enum PipelineEvent {
     ///
     /// 只在跳变时发：`Waiting` 带 `retry_in`，界面据此显示倒计时；`Capturing` 表示恢复。
     OthersStatus(OthersStatus),
+    /// 某条线路无法启动（目前用于麦克风设备打开失败，D43）。
+    ///
+    /// 只影响该线路：界面把顶栏开关回退并显示告警，不结束会话。
+    LineError {
+        speaker: Speaker,
+        detail: String,
+    },
     /// 用户可感知、但不影响会话继续运行的告警（黄色横幅）。
     ///
     /// 典型场景：配置了预编译热词但注册/更新失败，本次识别降级为不带热词继续跑（D31）。

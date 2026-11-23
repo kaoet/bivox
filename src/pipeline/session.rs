@@ -4,36 +4,43 @@
 //! [`crate::pipeline::self_line`]；本模块只负责把线路、音色、翻译 worker 与设备接起来，
 //! 并在停止时按顺序收尾。
 //!
-//! 与 GUI 的边界（决策 D6/D13，见 docs/decisions.md）：
+//! 与 GUI 的边界（决策 D6/D13/D43，见 docs/decisions.md）：
 //! - 只通过 [`PipelineEvent`] 向上汇报；
 //! - GUI 持有 [`PipelineSessionHandle`]（`Send + Clone`），不持有 cpal 的 `Stream`；
-//! - 停止时 GUI 调 `handle.stop()`，本任务退出前会 drop `AudioCapture` 并等后台任务结束，
+//! - 顶栏的两个快捷开关通过 handle 里的 `watch` 通知本模块，由线路监督者按需
+//!   **只启停该线路**，不触发 D20 全量热重启；
+//! - 停止时 GUI 调 `handle.stop()`，本任务退出前会等监督者 drop `AudioCapture` 并收尾，
 //!   确保麦克风/扬声器被释放。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::audio::capture::AudioCapture;
 use crate::audio::device::AudioDeviceManager;
 use crate::audio::playback::AudioPlaybackEngine;
+use crate::client::AsrEvent;
 use crate::client::qwen_mt::QwenMtClient;
 use crate::client::qwen_tts::{QwenTtsClient, QwenTtsConfig, TtsChunkRequest};
-use crate::config::AppConfig;
-use crate::events::{PipelineEvent, SessionState};
+use crate::config::{AppConfig, VadConfig};
+use crate::events::{PipelineEvent, SessionState, Speaker};
 use crate::language::canonical_language;
+use crate::pipeline::asr_line::{self, AsrLine, AsrLineParams};
 use crate::pipeline::self_line::TranslationRuntime;
 use crate::pipeline::translator;
 use crate::voice::ActiveVoice;
 
 /// 取消检查间隔：ASR 事件本身是事件驱动的，短轮询兼顾停止响应速度与开销。
 pub(crate) const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// 停止时等待后台任务收尾的上限。
+/// 单条线路（ASR/VAD）停止时等待后台任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// 会话停止时等待两个线路监督者退出的上限（其中可能包含两次 3s 级别收尾）。
+const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 /// 一句「打字输入」的最大字符数（界面校验用；官方单次 continue-task 上限远大于此）。
 pub const MAX_TYPED_INPUT_CHARS: usize = 500;
 
@@ -56,21 +63,48 @@ pub struct PipelineSessionHandle {
     vad_active: Arc<AtomicBool>,
     /// 本地 VAD 是否已因推理失败降级为全量上传（GUI 告警用）。
     vad_degraded: Arc<AtomicBool>,
+    /// 他人线路的 VAD 是否已降级（只用于顶栏电平条配色）。
+    vad_degraded_others: Arc<AtomicBool>,
     /// 请求 VAD 线程在下一块音频前重置瞬态（断线重连时由 ASR 置位）。
     vad_reset: Arc<AtomicBool>,
     /// 打字输入命令通道（GUI 提交，会话调度循环消费）。
     typed_tx: UnboundedSender<TypedInput>,
+    /// 顶栏麦克风开关的期望状态（监督者 watch）。
+    mic_enabled_tx: watch::Sender<bool>,
+    /// 顶栏他人侦听开关的期望状态（监督者 watch）。
+    others_enabled_tx: watch::Sender<bool>,
+    /// 保留一个接收端：会话尚未订阅时，watch 通道也不能因为无接收者而关闭，
+    /// 否则 Starting 期间的顶栏切换会丢失（D43）。
+    mic_enabled_keep: watch::Receiver<bool>,
+    others_enabled_keep: watch::Receiver<bool>,
+    /// 麦克风实时电平（f32 bits）。
+    mic_level: Arc<AtomicU32>,
+    /// 他人线路实时电平（f32 bits）。
+    others_level: Arc<AtomicU32>,
 }
 
 impl PipelineSessionHandle {
-    pub fn new(typed_tx: UnboundedSender<TypedInput>) -> Self {
+    pub fn new(
+        typed_tx: UnboundedSender<TypedInput>,
+        mic_enabled: bool,
+        others_enabled: bool,
+    ) -> Self {
+        let (mic_enabled_tx, mic_enabled_keep) = watch::channel(mic_enabled);
+        let (others_enabled_tx, others_enabled_keep) = watch::channel(others_enabled);
         Self {
             running: Arc::new(AtomicBool::new(true)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             vad_active: Arc::new(AtomicBool::new(false)),
             vad_degraded: Arc::new(AtomicBool::new(false)),
+            vad_degraded_others: Arc::new(AtomicBool::new(false)),
             vad_reset: Arc::new(AtomicBool::new(false)),
             typed_tx,
+            mic_enabled_tx,
+            others_enabled_tx,
+            mic_enabled_keep,
+            others_enabled_keep,
+            mic_level: Arc::new(AtomicU32::new(0)),
+            others_level: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -89,21 +123,80 @@ impl PipelineSessionHandle {
         self.vad_degraded.load(Ordering::Relaxed)
     }
 
-    /// 传给 VAD 线程的重置标志。
-    fn vad_reset_flag(&self) -> Arc<AtomicBool> {
-        self.vad_reset.clone()
+    /// 他人线路的 VAD 是否已降级为全量上传。
+    pub fn vad_degraded_others(&self) -> bool {
+        self.vad_degraded_others.load(Ordering::Relaxed)
     }
 
-    /// 传给 VAD 线程的降级标志。
-    fn vad_degraded_flag(&self) -> Arc<AtomicBool> {
+    /// 麦克风实时电平（0..1）。
+    pub fn mic_level(&self) -> f32 {
+        f32::from_bits(self.mic_level.load(Ordering::Relaxed))
+    }
+
+    /// 他人线路实时电平（0..1）。
+    pub fn others_level(&self) -> f32 {
+        f32::from_bits(self.others_level.load(Ordering::Relaxed))
+    }
+
+    /// 顶栏麦克风开关：更新期望状态，监督者会立即启停该线路。
+    pub fn set_mic_enabled(&self, enabled: bool) {
+        let _ = self.mic_enabled_tx.send(enabled);
+    }
+
+    /// 顶栏他人侦听开关：更新期望状态，监督者会立即启停该线路。
+    pub fn set_others_enabled(&self, enabled: bool) {
+        let _ = self.others_enabled_tx.send(enabled);
+    }
+
+    pub fn mic_enabled(&self) -> bool {
+        *self.mic_enabled_keep.borrow()
+    }
+
+    pub fn others_enabled(&self) -> bool {
+        *self.others_enabled_keep.borrow()
+    }
+
+    fn mic_enabled_rx(&self) -> watch::Receiver<bool> {
+        self.mic_enabled_tx.subscribe()
+    }
+
+    fn others_enabled_rx(&self) -> watch::Receiver<bool> {
+        self.others_enabled_tx.subscribe()
+    }
+
+    fn vad_active_handle(&self) -> Arc<AtomicBool> {
+        self.vad_active.clone()
+    }
+
+    fn vad_degraded_handle(&self) -> Arc<AtomicBool> {
         self.vad_degraded.clone()
     }
 
-    /// 会话停止/失败后把指示器与降级状态复位。
+    fn vad_degraded_others_handle(&self) -> Arc<AtomicBool> {
+        self.vad_degraded_others.clone()
+    }
+
+    fn vad_reset_handle(&self) -> Arc<AtomicBool> {
+        self.vad_reset.clone()
+    }
+
+    fn mic_level_handle(&self) -> Arc<AtomicU32> {
+        self.mic_level.clone()
+    }
+
+    fn others_level_handle(&self) -> Arc<AtomicU32> {
+        self.others_level.clone()
+    }
+
+    /// 会话停止/失败后把 VAD 指示、降级标志与电平复位。
     pub fn reset_vad(&self) {
         self.vad_active.store(false, Ordering::Relaxed);
         self.vad_degraded.store(false, Ordering::Relaxed);
+        self.vad_degraded_others.store(false, Ordering::Relaxed);
         self.vad_reset.store(false, Ordering::Relaxed);
+        self.mic_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.others_level
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
     }
 
     /// 请求停止（用户点「停止」或关窗时调用；后台任务会在一个轮询周期内退出）。
@@ -124,6 +217,288 @@ impl PipelineSessionHandle {
     /// 内部收尾用：让后台任务退出，但不算"用户停止"。
     fn abort_background(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 麦克风线路重建所需的固定参数。
+struct MicParams {
+    api_key: String,
+    model: String,
+    ws_url: String,
+    languages: Vec<String>,
+    vocabulary_id: Option<String>,
+    vad: VadConfig,
+    input_device: Option<String>,
+    events: UnboundedSender<PipelineEvent>,
+    repaint: eframe::egui::Context,
+    /// 本地线路事件复用的稳定通道；线路重建时把新 ASR 事件转发进来。
+    local_tx: mpsc::Sender<AsrEvent>,
+}
+
+/// 一条正在运行的麦克风线路。
+struct MicLine {
+    input_name: String,
+    capture: AudioCapture,
+    asr: AsrLine,
+    forward_task: JoinHandle<()>,
+    line_running: Arc<AtomicBool>,
+    line_stopped: Arc<AtomicBool>,
+}
+
+impl MicLine {
+    /// 停止这条线路：先释放采集，再收尾 VAD/ASR 与事件转发。
+    async fn stop(self) {
+        self.line_running.store(false, Ordering::SeqCst);
+        self.line_stopped.store(true, Ordering::SeqCst);
+        // 先 drop 采集：释放麦克风，并关闭音频通道。
+        drop(self.capture);
+        // 事件转发只服务于本线路，先停掉；ASR 的发送失败属于预期收尾。
+        self.forward_task.abort();
+        let _ = self.forward_task.await;
+        self.asr.shutdown(SHUTDOWN_TIMEOUT).await;
+    }
+}
+
+/// 打开麦克风并启动「采集 → 电平 tap → VAD → ASR」整条线路。
+fn start_mic_line(params: &MicParams, handle: &PipelineSessionHandle) -> Result<MicLine> {
+    let device = AudioDeviceManager::new().get_input_device(params.input_device.as_deref())?;
+    let input_name = crate::audio::device::device_name(&device);
+
+    let (tx_mic, rx_mic) = mpsc::channel::<Vec<u8>>(100);
+    let capture = AudioCapture::start(&device, tx_mic)?;
+
+    let line_running = Arc::new(AtomicBool::new(true));
+    let line_stopped = Arc::new(AtomicBool::new(false));
+    handle.vad_active.store(false, Ordering::Relaxed);
+    handle.vad_degraded.store(false, Ordering::Relaxed);
+    handle.vad_reset.store(false, Ordering::Relaxed);
+    handle.mic_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
+
+    let mut asr = asr_line::spawn(AsrLineParams {
+        api_key: params.api_key.clone(),
+        model: &params.model,
+        ws_url: &params.ws_url,
+        language_hints: params.languages.clone(),
+        vocabulary_id: params.vocabulary_id.clone(),
+        vad: &params.vad,
+        audio_rx: rx_mic,
+        level: handle.mic_level_handle(),
+        vad_active: handle.vad_active_handle(),
+        vad_reset: handle.vad_reset_handle(),
+        vad_degraded: handle.vad_degraded_handle(),
+        running: line_running.clone(),
+        user_stopped: line_stopped.clone(),
+        events: params.events.clone(),
+        repaint: params.repaint.clone(),
+    })?;
+
+    let events = asr
+        .events
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("麦克风线路缺少识别事件通道"))?;
+    let local_tx = params.local_tx.clone();
+    let forward_task = tokio::spawn(async move {
+        let mut events = events;
+        while let Some(event) = events.recv().await {
+            if local_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(MicLine {
+        input_name,
+        capture,
+        asr,
+        forward_task,
+        line_running,
+        line_stopped,
+    })
+}
+
+/// 麦克风线路监督者：按 `mic_enabled` 的期望状态反复启停线路。
+struct MicSupervisor {
+    params: MicParams,
+    handle: PipelineSessionHandle,
+    enabled_rx: watch::Receiver<bool>,
+    line: Option<MicLine>,
+}
+
+impl MicSupervisor {
+    async fn run(mut self) {
+        loop {
+            if self.handle.is_cancelled() {
+                break;
+            }
+            // ASR 任务是致命错误才会退出的；线路还开着时不能让采集变僵尸。
+            let asr_exited = self
+                .line
+                .as_ref()
+                .is_some_and(|line| line.asr.task.is_finished());
+            if asr_exited {
+                let line = self.line.take().expect("line 已判断为 Some");
+                line.stop().await;
+                self.handle.vad_active.store(false, Ordering::Relaxed);
+                self.handle.vad_degraded.store(false, Ordering::Relaxed);
+                self.handle.vad_reset.store(false, Ordering::Relaxed);
+                self.handle
+                    .mic_level
+                    .store(0.0_f32.to_bits(), Ordering::Relaxed);
+                let _ = self.params.local_tx.try_send(AsrEvent {
+                    text: String::new(),
+                    is_sentence_end: true,
+                    sentence_id: None,
+                });
+                if *self.enabled_rx.borrow() {
+                    self.handle.set_mic_enabled(false);
+                    let _ = self.params.events.send(PipelineEvent::LineError {
+                        speaker: Speaker::Local,
+                        detail: "麦克风识别任务已退出，已自动关闭".to_string(),
+                    });
+                    self.params.repaint.request_repaint();
+                }
+            }
+            let want = *self.enabled_rx.borrow();
+            match (want, self.line.is_some()) {
+                (true, false) => match start_mic_line(&self.params, &self.handle) {
+                    Ok(line) => {
+                        self.handle
+                            .mic_level
+                            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+                        log::info!("麦克风线路已启动");
+                        self.line = Some(line);
+                    }
+                    Err(err) => {
+                        let detail = format!("{err:#}");
+                        log::error!("麦克风线路启动失败：{detail}");
+                        // 先让期望状态回到关，避免每 100ms 重试一次；GUI 会收到
+                        // LineError 后把配置与页签 checkbox 一起回退。
+                        self.handle.set_mic_enabled(false);
+                        self.handle.vad_active.store(false, Ordering::Relaxed);
+                        self.handle
+                            .mic_level
+                            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+                        let _ = self.params.events.send(PipelineEvent::LineError {
+                            speaker: Speaker::Local,
+                            detail,
+                        });
+                        self.params.repaint.request_repaint();
+                    }
+                },
+                (false, true) => {
+                    let line = self.line.take().expect("line 已判断为 Some");
+                    line.stop().await;
+                    self.handle.vad_active.store(false, Ordering::Relaxed);
+                    self.handle.vad_degraded.store(false, Ordering::Relaxed);
+                    self.handle.vad_reset.store(false, Ordering::Relaxed);
+                    self.handle
+                        .mic_level
+                        .store(0.0_f32.to_bits(), Ordering::Relaxed);
+                    // 让 self_line 丢弃当前半句并复位分块器/翻译状态。
+                    let _ = self.params.local_tx.try_send(AsrEvent {
+                        text: String::new(),
+                        is_sentence_end: true,
+                        sentence_id: None,
+                    });
+                }
+                _ => {}
+            }
+
+            tokio::select! {
+                changed = self.enabled_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {}
+            }
+        }
+
+        if let Some(line) = self.line.take() {
+            line.stop().await;
+        }
+        self.handle.vad_active.store(false, Ordering::Relaxed);
+        self.handle.vad_degraded.store(false, Ordering::Relaxed);
+        self.handle.vad_reset.store(false, Ordering::Relaxed);
+        self.handle
+            .mic_level
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// 他人线路监督者：按 `others_enabled` 的期望状态 spawn/停止独立任务。
+struct OthersSupervisor {
+    params: crate::pipeline::others_line::Params,
+    handle: PipelineSessionHandle,
+    enabled_rx: watch::Receiver<bool>,
+    task: Option<JoinHandle<()>>,
+    line_running: Option<Arc<AtomicBool>>,
+}
+
+impl OthersSupervisor {
+    async fn run(mut self) {
+        loop {
+            if self.handle.is_cancelled() {
+                break;
+            }
+            if self.task.as_ref().is_some_and(|task| task.is_finished()) {
+                if let Some(task) = self.task.take() {
+                    match task.await {
+                        Ok(()) => log::warn!("他人线路任务已退出，准备按开关状态重建"),
+                        Err(err) => log::warn!("他人线路任务异常退出：{err}"),
+                    }
+                }
+                self.line_running = None;
+                self.handle
+                    .others_level
+                    .store(0.0_f32.to_bits(), Ordering::Relaxed);
+            }
+            let want = *self.enabled_rx.borrow();
+            if want && self.task.is_none() {
+                self.handle
+                    .others_level
+                    .store(0.0_f32.to_bits(), Ordering::Relaxed);
+                self.handle
+                    .vad_degraded_others
+                    .store(false, Ordering::Relaxed);
+                let mut params = self.params.clone();
+                let line_running = Arc::new(AtomicBool::new(true));
+                params.running = line_running.clone();
+                log::info!("他人线路已启动");
+                self.line_running = Some(line_running);
+                self.task = Some(tokio::spawn(crate::pipeline::others_line::run(params)));
+            } else if !want && self.task.is_some() {
+                self.stop_task().await;
+            }
+
+            tokio::select! {
+                changed = self.enabled_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {}
+            }
+        }
+
+        self.stop_task().await;
+    }
+
+    async fn stop_task(&mut self) {
+        if let Some(running) = self.line_running.take() {
+            running.store(false, Ordering::SeqCst);
+        }
+        if let Some(task) = self.task.take() {
+            if tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await.is_err() {
+                log::warn!("等待他人线路收尾超时（{}s）", SHUTDOWN_TIMEOUT.as_secs());
+            }
+        }
+        self.handle
+            .others_level
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.handle
+            .vad_degraded_others
+            .store(false, Ordering::Relaxed);
     }
 }
 
@@ -188,29 +563,31 @@ pub async fn run(
         return Ok(());
     }
 
-    // 设备：按完整名精确匹配（D12），失败直接终止会话；未启用的输入/输出设备不打开。
+    // 设备：按完整名精确匹配（D12），失败直接终止会话；未启用的输出设备不打开。
     let device_mgr = AudioDeviceManager::new();
-    let in_dev = if config.local.mic {
-        Some(device_mgr.get_input_device(config.audio.input_device.as_deref())?)
-    } else {
-        None
-    };
     let out_dev = if config.local.tts {
         Some(device_mgr.get_output_device(config.audio.output_device.as_deref())?)
     } else {
         None
     };
-    let in_name = in_dev.as_ref().map(crate::audio::device::device_name);
     let out_name = out_dev.as_ref().map(crate::audio::device::device_name);
-    emit(PipelineEvent::Devices {
-        input: in_name.clone().unwrap_or_default(),
-        output: out_name.clone().unwrap_or_default(),
-    });
-    log::info!(
-        "输入设备：{}；输出设备：{}",
-        in_name.as_deref().unwrap_or("（未启用麦克风）"),
-        out_name.as_deref().unwrap_or("（未启用语音合成）")
-    );
+
+    // 本地线路的稳定事件通道：麦克风线路可以反复重建，self_line 只认这一条通道。
+    let (local_tx, local_rx) = mpsc::channel::<AsrEvent>(100);
+    let inference_ws_url = config.inference_ws_url();
+    let mic_params = MicParams {
+        api_key: api_key.clone(),
+        model: config.asr.model.clone(),
+        ws_url: inference_ws_url.clone(),
+        languages: config.local.languages.clone(),
+        vocabulary_id: hotwords.vocabulary_id.clone(),
+        vad: config.vad.clone(),
+        input_device: config.audio.input_device.clone(),
+        events: events.clone(),
+        repaint: repaint.clone(),
+        local_tx: local_tx.clone(),
+    };
+
     if handle.is_cancelled() {
         emit(PipelineEvent::StateChanged(SessionState::Idle));
         return Ok(());
@@ -223,44 +600,7 @@ pub async fn run(
     };
     let playback = playback_engine.as_ref().map(|engine| engine.handle());
 
-    // 麦克风采集：`capture` 必须活到会话结束，drop 即停止采集。
-    let (capture, mic_rx) = match &in_dev {
-        Some(dev) => {
-            let (tx_mic, rx_mic) = mpsc::channel::<Vec<u8>>(100);
-            (Some(AudioCapture::start(dev, tx_mic)?), Some(rx_mic))
-        }
-        None => (None, None),
-    };
-
-    let inference_ws_url = config.inference_ws_url();
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-
-    // 识别线路：VAD 线程 + ASR 任务（与他人线路共用同一套接线，D34/D39）。
-    // `[self] mic = false` 时不采集、不识别，只用打字输入。
-    let (asr_events, mut vad_worker_thread) = match mic_rx {
-        Some(mic_rx) => {
-            let asr_line =
-                crate::pipeline::asr_line::spawn(crate::pipeline::asr_line::AsrLineParams {
-                    api_key: api_key.clone(),
-                    model: &config.asr.model,
-                    ws_url: &inference_ws_url,
-                    language_hints: config.local.languages.clone(),
-                    vocabulary_id: hotwords.vocabulary_id.clone(),
-                    vad: &config.vad,
-                    audio_rx: mic_rx,
-                    vad_active: handle.vad_active.clone(),
-                    vad_reset: handle.vad_reset_flag(),
-                    vad_degraded: handle.vad_degraded_flag(),
-                    running: handle.running.clone(),
-                    user_stopped: handle.stop_requested.clone(),
-                    events: events.clone(),
-                    repaint: repaint.clone(),
-                })?;
-            tasks.push(asr_line.task);
-            (Some(asr_line.events), asr_line.vad_thread)
-        }
-        None => (None, None),
-    };
 
     // TTS 任务：只在启用语音合成时创建（没有 TTS 时渠道为空，所有发送变成空操作）。
     let tx_tts = match &playback {
@@ -317,35 +657,83 @@ pub async fn run(
         (None, None)
     };
 
-    // 他人线路（D36/D40）：独立任务，进程不可达时自己退避重连，不影响本会话。
-    if config.others.enabled {
-        let translate =
-            config
-                .others
-                .translate
-                .then(|| crate::pipeline::others_line::OthersTranslate {
-                    model: config.translate.model.clone(),
-                    chat_url: config.translate_chat_url(),
-                    target: canonical_language(&config.others.target).to_string(),
-                    granularity: config.translate.granularity,
-                });
-        tasks.push(tokio::spawn(crate::pipeline::others_line::run(
-            crate::pipeline::others_line::Params {
-                api_key: api_key.clone(),
-                model: config.asr.model.clone(),
-                ws_url: inference_ws_url,
-                vocabulary_id: hotwords.vocabulary_id.clone(),
-                vad: config.vad.clone(),
-                chunk_words: config.chunking.words,
-                process: config.vrchat.process.clone(),
-                languages: config.others.languages.clone(),
-                translate,
-                running: handle.running.clone(),
-                events: events.clone(),
-                repaint: repaint.clone(),
-            },
-        )));
-    }
+    // 两个线路监督者：顶栏开关只影响对应线路，不重启整个会话（D43）。
+    let others_params = crate::pipeline::others_line::Params {
+        api_key: api_key.clone(),
+        model: config.asr.model.clone(),
+        ws_url: inference_ws_url,
+        vocabulary_id: hotwords.vocabulary_id.clone(),
+        vad: config.vad.clone(),
+        chunk_words: config.chunking.words,
+        process: config.vrchat.process.clone(),
+        languages: config.others.languages.clone(),
+        translate: config
+            .others
+            .translate
+            .then(|| crate::pipeline::others_line::OthersTranslate {
+                model: config.translate.model.clone(),
+                chat_url: config.translate_chat_url(),
+                target: canonical_language(&config.others.target).to_string(),
+                granularity: config.translate.granularity,
+            }),
+        running: Arc::new(AtomicBool::new(false)),
+        level: handle.others_level_handle(),
+        vad_degraded: handle.vad_degraded_others_handle(),
+        events: events.clone(),
+        repaint: repaint.clone(),
+    };
+
+    // 所有可能失败的初始化都已完成，这时才真正打开麦克风；避免后面的
+    // 播放/翻译初始化失败时留下一条没人收尾的采集/ASR 任务。
+    let initial_mic = if handle.mic_enabled() {
+        match start_mic_line(&mic_params, &handle) {
+            Ok(line) => Some(line),
+            Err(err) => {
+                // TTS/翻译任务已经启动：先让它们退出，再把错误交回 app。
+                handle.stop();
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+    let in_name = initial_mic
+        .as_ref()
+        .map(|line| line.input_name.clone())
+        .unwrap_or_default();
+    emit(PipelineEvent::Devices {
+        input: in_name.clone(),
+        output: out_name.clone().unwrap_or_default(),
+    });
+    log::info!(
+        "输入设备：{}；输出设备：{}",
+        if in_name.is_empty() {
+            "（未启用麦克风）"
+        } else {
+            in_name.as_str()
+        },
+        out_name.as_deref().unwrap_or("（未启用语音合成）")
+    );
+
+    let mic_supervisor = tokio::spawn(
+        MicSupervisor {
+            params: mic_params,
+            handle: handle.clone(),
+            enabled_rx: handle.mic_enabled_rx(),
+            line: initial_mic,
+        }
+        .run(),
+    );
+    let others_supervisor = tokio::spawn(
+        OthersSupervisor {
+            params: others_params,
+            handle: handle.clone(),
+            enabled_rx: handle.others_enabled_rx(),
+            task: None,
+            line_running: None,
+        }
+        .run(),
+    );
 
     emit(PipelineEvent::StateChanged(SessionState::Running));
 
@@ -359,7 +747,7 @@ pub async fn run(
             translate_enabled,
             translate_granularity: config.translate.granularity,
             typed_rx,
-            asr_events,
+            asr_events: Some(local_rx),
             rx_mt,
             translation,
             tx_tts,
@@ -367,20 +755,33 @@ pub async fn run(
         &mut emit,
     )
     .await;
-    // 收尾（D13）：先停采集，再关 TTS 通道，最后等后台任务退出。
-    // 翻译 worker 的发送端随 `self_line::run` 返回一起释放（它持在 `TranslationRuntime` 里）。
+
+    // 收尾（D13/D43）：先取消会话，再等两个线路监督者按顺序释放设备/线程。
     handle.abort_background();
     handle.reset_vad();
-    // 先停采集（释放麦克风），再等 VAD 线程与后台任务退出。
-    drop(capture);
-    if let Some(worker) = vad_worker_thread.take() {
-        if !join_thread_with_timeout(worker, SHUTDOWN_TIMEOUT) {
-            log::warn!(
-                "等待本地 VAD 线程收尾超时（{}s）",
-                SHUTDOWN_TIMEOUT.as_secs()
-            );
-        }
+    let (mic_shutdown, others_shutdown) = tokio::join!(
+        tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, mic_supervisor),
+        tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, others_supervisor),
+    );
+    match mic_shutdown {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::warn!("麦克风线路监督者异常退出：{err}"),
+        Err(_) => log::warn!(
+            "等待麦克风线路监督者收尾超时（{}s）",
+            SUPERVISOR_SHUTDOWN_TIMEOUT.as_secs()
+        ),
     }
+    match others_shutdown {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::warn!("他人线路监督者异常退出：{err}"),
+        Err(_) => log::warn!(
+            "等待他人线路监督者收尾超时（{}s）",
+            SUPERVISOR_SHUTDOWN_TIMEOUT.as_secs()
+        ),
+    }
+    drop(local_tx);
+
+    // 最后等 TTS / 翻译 worker 收尾。
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
         for task in tasks {
             let _ = task.await;
@@ -407,19 +808,6 @@ pub async fn run(
 
     emit(PipelineEvent::StateChanged(SessionState::Idle));
     Ok(())
-}
-
-/// 等待后台线程退出，最多 `timeout`；超时返回 `false`（std 线程无法强杀，只能尽力）。
-fn join_thread_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    while !handle.is_finished() {
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let _ = handle.join();
-    true
 }
 
 fn describe_voice(voice: &ActiveVoice) -> String {

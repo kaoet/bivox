@@ -243,6 +243,16 @@ impl Timeline {
     }
 
     /// 丢弃某条线路的未完成消息（不落历史）。
+    ///
+    /// 顶栏关闭某条线路时调用：半句没有继续识别的意义，不能让「当前句」一直挂在
+    /// 界面上；同时清掉该线路的最终句 id，避免线路重建后服务端句 id 从脚开始被误判
+    /// 成重复句（D43）。
+    pub fn drop_open(&mut self, speaker: Speaker) {
+        self.remove_open(speaker);
+        self.last_finalized[speaker.index()] = None;
+    }
+
+    /// 丢弃某条线路的未完成消息（不落历史）。
     fn remove_open(&mut self, speaker: Speaker) {
         if let Some(index) = self.open_index(speaker) {
             self.messages.remove(index);
@@ -653,6 +663,19 @@ mod tests {
             "第 1 句。".to_string(),
             "最旧的一条被裁掉"
         );
+    }
+
+    #[test]
+    fn drop_open_only_affects_one_speaker() {
+        let mut timeline = Timeline::default();
+        asr(&mut timeline, Speaker::Local, "我方半句", 0, false);
+        asr(&mut timeline, Speaker::Others, "他人半句", 0, false);
+
+        timeline.drop_open(Speaker::Local);
+
+        assert_eq!(timeline.messages().len(), 1);
+        assert_eq!(timeline.messages()[0].speaker, Speaker::Others);
+        assert_eq!(timeline.messages()[0].text, "他人半句");
     }
 
     #[test]

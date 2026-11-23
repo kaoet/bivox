@@ -13,7 +13,7 @@
 //! `Waiting` 期间的每次重试不重复记。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -49,6 +49,7 @@ const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 他人线路的翻译设置（与 `[translate]` 共用模型，目标语言取 `[others] target`）。
+#[derive(Clone)]
 pub struct OthersTranslate {
     pub model: String,
     pub chat_url: String,
@@ -57,6 +58,10 @@ pub struct OthersTranslate {
 }
 
 /// 启动他人线路所需的参数（由会话准备好后传入）。
+///
+/// 监督者每次启用时 clone 一份，只替换 `running`；其余共享量（电平、降级标志）
+/// 保持在 handle 上，线路重建不会丢。
+#[derive(Clone)]
 pub struct Params {
     pub api_key: String,
     pub model: String,
@@ -73,6 +78,10 @@ pub struct Params {
     pub translate: Option<OthersTranslate>,
     /// 会话级取消标志：置 false 时本任务尽快退出。
     pub running: Arc<AtomicBool>,
+    /// 顶栏电平条共享值（f32 bits，由 asr_line 的电平 tap 写入）。
+    pub level: Arc<AtomicU32>,
+    /// 本线路 VAD 降级标志（只用于顶栏电平条配色）。
+    pub vad_degraded: Arc<AtomicBool>,
     pub events: UnboundedSender<PipelineEvent>,
     pub repaint: egui::Context,
 }
@@ -86,6 +95,8 @@ struct LineConfig {
     vad: VadConfig,
     languages: Vec<String>,
     repaint: egui::Context,
+    level: Arc<AtomicU32>,
+    vad_degraded: Arc<AtomicBool>,
 }
 
 /// 会话事件发送器：发事件并请求重绘，避免每处都重复写两行。
@@ -148,6 +159,8 @@ pub async fn run(params: Params) {
         languages,
         translate,
         running,
+        level,
+        vad_degraded,
         events,
         repaint,
     } = params;
@@ -160,6 +173,8 @@ pub async fn run(params: Params) {
         vad,
         languages: languages.clone(),
         repaint: emit.repaint.clone(),
+        level,
+        vad_degraded,
     };
 
     // 翻译 worker：整个运行期共用一份，重连不重建。
@@ -285,7 +300,8 @@ async fn start(pid: u32, config: &LineConfig) -> Result<ActiveLine> {
 
     let vad_active = Arc::new(AtomicBool::new(false));
     let vad_reset = Arc::new(AtomicBool::new(false));
-    let vad_degraded = Arc::new(AtomicBool::new(false));
+    let vad_degraded = config.vad_degraded.clone();
+    vad_degraded.store(false, Ordering::Relaxed);
     let line_running = Arc::new(AtomicBool::new(true));
     // ASR 的致命错误只触发本线路重连，不升级为会话级错误（D40）。
     let (line_tx, line_errors) = mpsc::unbounded_channel();
@@ -298,6 +314,7 @@ async fn start(pid: u32, config: &LineConfig) -> Result<ActiveLine> {
         vocabulary_id: config.vocabulary_id.clone(),
         vad: &config.vad,
         audio_rx: chunks,
+        level: config.level.clone(),
         vad_active: vad_active.clone(),
         vad_reset,
         vad_degraded: vad_degraded.clone(),
@@ -400,7 +417,12 @@ async fn drive(
                 }
                 break;
             }
-            event = active.asr.events.recv() => {
+            event = async {
+                match active.asr.events.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<AsrEvent>>().await,
+                }
+            } => {
                 match event {
                     Some(event) => {
                         if let (Some(cfg), Some(state), Some(runtime)) = (
@@ -439,18 +461,24 @@ async fn drive(
         }
     }
 
-    // 收尾：先让 ASR 停（它自己会发 finish-task），再停采集，最后等任务退出。
-    active.line_running.store(false, Ordering::SeqCst);
-    active.capture.request_stop();
-    if tokio::time::timeout(ASR_SHUTDOWN_TIMEOUT, active.asr.task)
-        .await
-        .is_err()
-    {
-        log::warn!(
-            "他人语音：等待识别任务收尾超时（{}s）",
-            ASR_SHUTDOWN_TIMEOUT.as_secs()
-        );
-    }
+    // 收尾（D13/D43）：先让 ASR 停（它自己会发 finish-task），再停采集，
+    // 最后等 VAD/ASR/电平 tap 全部退出。
+    let ActiveLine {
+        capture,
+        asr,
+        line_running,
+        line_errors: _,
+        vad_active: _,
+        vad_degraded: _,
+    } = active;
+    line_running.store(false, Ordering::SeqCst);
+    capture.request_stop();
+    drop(capture);
+    emit.send(PipelineEvent::VadActive {
+        speaker: Speaker::Others,
+        active: false,
+    });
+    asr.shutdown(ASR_SHUTDOWN_TIMEOUT).await;
 }
 
 /// 翻译模式：把一条 ASR 事件并入句子状态、送翻译，并把源文交给界面。

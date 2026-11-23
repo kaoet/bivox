@@ -65,7 +65,7 @@ pub struct GateConfig {
     pub keepalive_ms: u32,
     /// 打印每 chunk 的检测/发送决策，用于现场排障。
     pub debug: bool,
-    /// 可选：把「当前是否处于语音段」发布到共享标志（GUI 顶栏的 VAD 指示器用）。
+    /// 可选：把「当前是否处于语音段」发布到共享标志（GUI 顶栏电平条的彩色/灰阶判断用）。
     pub active_flag: Option<Arc<AtomicBool>>,
 }
 

@@ -91,6 +91,7 @@ src/
 ├── audio/
 │   ├── device.rs        设备枚举与完整名精确匹配
 │   ├── capture.rs       cpal 采集 → 单声道 16k PCM16 → 100ms chunk
+│   ├── meter.rs         PCM16 RMS → dBFS → 0..1；GUI 电平平滑（D43）
 │   ├── process_loopback.rs WASAPI 进程环回：按 PID 采某进程树的音频（D36）
 │   ├── process_capture.rs  进程环回采集线程：PID 发现、100ms 攒块、墙钟补静音（D36）
 │   ├── playback.rs      cpal 播放队列 + 重采样
@@ -117,7 +118,8 @@ src/
 │   ├── admin.rs         调试 CLI 的纯逻辑（远程音色列出/删除）
 │   └── mock_http.rs     单元测试用的手写 HTTP mock
 ├── gui/
-│   ├── toolbar.rs       顶栏：状态灯、VAD 指示器、开始/停止、版本号
+│   ├── toolbar.rs       顶栏布局：麦克风/他人开关与电平条、状态、开始/停止、版本号
+│   ├── meter.rs         顶栏图标开关 + 20 段电平条（VAD 合并配色，D43）
 │   ├── realtime_tab.rs  实时页：气泡时间线（我方靠右 / 他人靠左，底部嵌入打字输入行）
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
 │   ├── audio_tab.rs     音频页：输入/输出设备
@@ -195,7 +197,7 @@ main()
 - 打字输入：`typed_input`（输入框内容）、`typed_input_error`（行内错误）；提交通过 `PipelineSessionHandle::speak_typed` 走命令通道；
 - 音色编辑：`voice_drafts`（未保存草稿）、`selected_voice`、`voice_mode` / `voice_input` / `voice_custom_key`；
 - 语音识别编辑：`asr_model` / `asr_languages` / `asr_hotwords`（未保存草稿）、`asr_edit_error`；
-- 展示：`timeline`、`log`、`vad_active`、错误/告警横幅（`startup_error` / `config_reload_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
+- 展示：`timeline`、`log`、`vad_active` / `vad_active_others`、顶栏两条电平的平滑值 `mic_level` / `others_level`（`audio::meter::MeterSmoother`）、错误/告警横幅（`startup_error` / `config_reload_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
 - 生命周期：`closing`。
 
 `[api] key = None` 不算配置无效：GUI 正常打开；点「开始」时跳转设置页并显示 `api_key_notice`。真正非法的配置在启动阶段就弹窗退出，不会进入 `BivoxApp`。
@@ -206,9 +208,10 @@ main()
 
 1. `pump_logs()`：把 `log_sink` 累计的日志搬进界面环形缓冲（上限 5000 行）；
 2. `pump_events()`：排空 `PipelineEvent`，逐条 `apply_event`；
-3. 保存当前 `egui::Context`（热重启时用来请求重绘）；
-4. `request_close()`：处理关窗（见 3.5）；
-5. 绘制顶栏、底部日志面板（可拖拽高度）、CentralPanel 中的页签。
+3. `pump_meters()`：读取 handle 的两条电平，做快起慢落平滑；运行中按 ~30fps 请求重绘；
+4. 保存当前 `egui::Context`（热重启时用来请求重绘）；
+5. `request_close()`：处理关窗（见 3.5）；
+6. 绘制顶栏、底部日志面板（可拖拽高度）、CentralPanel 中的页签。
 
 页签顺序固定为：实时 / 音频 / 自己 / 他人 / 语音识别 / 语音合成 / VRChat / 翻译 / 设置（D38）。
 
@@ -227,23 +230,29 @@ main()
 2. `[self] tts = true` 时 `voice::resolve_active_voice`（自定义音色可能上传/复刻，耗时不定），发 `VoiceInfo`；否则完全跳过音色解析；
 3. `asr::resolve_vocabulary`（D31）：按 `[asr] hotwords` 创建/校验/更新百炼预编译热词列表，
    写回 `vocabulary_id`；失败只发 `Warning` 并降级为不带热词；
-4. 按完整设备名打开**需要的**设备（失败直接结束会话），发 `Devices`（未启用的设备留空）：`[self] mic` 决定输入设备，`[self] tts` 决定输出设备；
-5. `[self] tts = true` 时创建播放引擎（TTS 输出 22050Hz）；`[self] mic = true` 时启动采集（16kHz）；
-6. `[self] mic = true` 时用 `pipeline::asr_line::spawn` 启动 VAD 线程与 ASR 任务（带 `vocabulary_id`）；`[self] tts = true` 时启动 TTS 任务；
-7. 需要翻译时建 `QwenMtClient` + 翻译 worker，得到 `TranslationRuntime`（与是否有 TTS 无关）；
-8. `[others] enabled = true` 时 spawn `pipeline::others_line::run`（独立任务，不阻塞启动）；
-9. 状态置 `Running`；
-10. 把上述对象交给 `pipeline::self_line::run`（我方调度循环；`voice` / `asr_events` / `tx_tts` 都是 `Option`，缺失时对应环节变成空操作），直到停止或出错；
-11. 收尾（见 3.5）。
+4. `[self] tts = true` 时按完整名打开输出设备并创建播放引擎（TTS 输出 22050Hz）；
+5. `[self] tts = true` 时启动 TTS 任务；需要翻译时建 `QwenMtClient` + 翻译 worker，得到 `TranslationRuntime`；
+6. 创建本地 ASR 事件稳定通道；若 handle 的麦克风期望状态为开，打开输入设备并启动首条「采集 → 电平 tap → VAD → ASR」线路，失败仍按原行为结束会话；发 `Devices`（未启用的设备留空）；
+7. spawn 两个线路监督者：
+   - 麦克风监督者按 handle 的 `watch` 期望状态反复重建/停止上述线路；
+   - 他人监督者按 `watch` 期望状态 spawn/停止 `pipeline::others_line::run`；进程不可达由该线路自己退避重连；
+   然后置 `Running`；
+8. 把 `local_rx` 交给 `pipeline::self_line::run`（我方调度循环；`voice` / `tx_tts` 缺失时对应环节变成空操作），直到停止或出错；
+9. 收尾（见 3.5）。
+
+> 麦克风/他人开关的即时切换走监督者的 `watch`，不触发 D20 全量热重启（D43）；只有顶栏开关之外的配置变更才走 D20。
 
 ### 3.5 停止、失败与关闭
 
-- `PipelineSessionHandle` 持有两个 `Arc<AtomicBool>`，以及一个 GUI → 会话的打字输入无界 `Sender`（D24）：
+- `PipelineSessionHandle` 持有两条线路的期望状态 `watch`、实时电平 `AtomicU32`、VAD/降级标志，以及一个 GUI → 会话的打字输入无界 `Sender`（D24/D43）：
   - `running`：后台任务的“继续运行”标志，初值 `true`；
-  - `stop_requested`：区分“用户主动停止”与“服务异常自行退出”。
+  - `stop_requested`：区分“用户主动停止”与“服务异常自行退出”；
+  - `mic_enabled` / `others_enabled`：顶栏开关的期望状态，监督者按它启停对应线路；
+  - `mic_level` / `others_level`：顶栏电平条读取的共享值。
 - 「停止」：GUI 置 `Stopping`，请求 handle 停止，并立即清空当前字幕句；后台调度循环最多 100ms 内退出。已在命令通道里、尚未开始朗读的打字输入句随会话丢弃（字幕历史保留）。
-- 会话收尾顺序：复位 VAD 状态 → drop 采集（释放麦克风）→ 等 VAD 线程退出（≤3s）→ 关闭 TTS 输入通道 → 最多等待 ASR/TTS 任务 3s → 若非用户主动停止，补发 `Error` → 发 `StateChanged(Idle)`。
-- 收到 `Idle`/`Failed` 后 GUI 清空 `session`、配置指纹与 VAD 指示，并清当前字幕句；若 `restart_pending` 且未在关窗，则用新配置自动重启（D20）。
+- 会话收尾顺序：复位 VAD/电平 → 取消两个监督者 → 麦克风监督者 drop 采集（释放麦克风）→ 等 VAD 线程/ASR 任务退出（每条线路 ≤3s）→ 他人监督者等 `others_line` 退出 → 关闭 TTS 输入通道 → 最多等待 TTS/翻译任务 3s → 若非用户主动停止，补发 `Error` → 发 `StateChanged(Idle)`。
+- 收到 `Idle`/`Failed` 后 GUI 清空 `session`、配置指纹、VAD/电平并清当前字幕句；若 `restart_pending` 且未在关窗，则用新配置自动重启（D20）。
+- 运行中切换顶栏开关：写回配置 → 更新 `running_config_signature`（避免误触发 D20）→ 通知 handle 的 `watch`；监督者只启停该线路并释放对应资源。
 - 关窗：首次收到 close request 时 `CancelClose`、置 `closing`、请求停止会话；下一帧刷新日志并真正 `Close`。这样保证后台任务与音频设备先释放（D13）。
 
 ---
@@ -305,10 +314,11 @@ main()
 
 | 执行体 | 职责 |
 |---|---|
-| 主线程（eframe） | 绘制、处理输入、配置写回、启动/停止会话、排空事件 |
-| tokio 多线程 Runtime | 会话编排任务、ASR 任务、TTS 任务、声音复刻网络请求 |
+| 主线程（eframe） | 绘制、处理输入、配置写回、启动/停止会话、排空事件、平滑电平 |
+| tokio 多线程 Runtime | 会话编排任务、麦克风/他人线路监督者、ASR 任务、TTS 任务、声音复刻网络请求 |
 | cpal 采集回调线程 | 混音、重采样、按块 `try_send` 到采集通道 |
 | cpal 播放回调线程 | 从播放队列取样本填缓冲区，不足补静音 |
+| 线路监督者任务 | 按 `watch` 期望状态启停麦克风线路或 `others_line`；释放设备/线程 |
 
 事件流：
 
@@ -320,17 +330,23 @@ pipeline::self_line ──(经 session::emit 克隆, unbounded)──▶ Chatbox
       └── 独立任务：我方投影（`speaker_view(Speaker::Local)`）→ 1 秒文本节流 / typing / 清空
 
 实时页输入框 ──(TypedInput, unbounded)──▶ session 调度循环（biased 优先）
+
+顶栏开关 ──(watch<bool>)──▶ 线路监督者 ──▶ start/stop 麦克风线路 / others_line
+顶栏电平 ◀──(AtomicU32)── asr_line 电平 tap（VAD 之前）
 ```
 
 - `PipelineEvent` 字段以 `src/events.rs` 为唯一事实源；事件不携带 egui 类型。
 - `Asr` / `Translation` / `VadActive` 带 `speaker`（`Local` 我方 / `Others` 他人，D39）：两条线路共用同一套事件与时间线，靠来源区分；OSC 与 TTS 只消费 `Local`。
-- `OthersStatus`：他人线路的状态跳变（`Connecting` / `Capturing` / `Waiting` + `retry_in`，D40），界面据此显示带倒计时的状态横幅与顶栏指示器。
+- `OthersStatus`：他人线路的状态跳变（`Connecting` / `Capturing` / `Waiting` + `retry_in`，D40），界面据此显示带倒计时的状态横幅。
+- `LineError`：某条线路无法启动（目前是麦克风设备打开失败，D43）；界面回退顶栏开关并显示黄色告警，不结束会话。
+- 顶栏两条电平不走事件通道：`asr_line` 的电平 tap 写 handle 上的 `AtomicU32`，GUI 每帧读取并平滑；只在运行中请求 ~30fps 重绘。
+- 顶栏两个开关走 `watch<bool>`，监督者按最新期望值启停对应线路；这不算 D20 配置热更新。
 - 会话的 `emit` 同时向 GUI 与 OSC 两个无界通道发送事件克隆；OSC 任务不依赖 GUI 重绘（D33）。
 - `Warning`：用户可感知但不影响会话继续的降级（例如预编译热词注册失败，D31），界面显示黄色「运行告警」条，可手动清除。
 - `TypedSentence`：会话接受一句打字输入、已交给 TTS 排队后发给界面（进字幕历史）。
 - `Translation`：翻译模式下的译文（可能随 ASR 修订多次到达），`language` 固定为目标语言；界面用它累积译文行，句终时与原文行一起进历史（M2，D26）。
 - 翻译模式下 `Asr` 事件语义：`sent_bytes` = 已送翻译的源文长度、`is_sentence_end` 恒为 `false`、`language` = 源语言；句终与当前行收口一律由 `Translation` 负责（D26）。
-- GUI → 后台唯一命令通道是打字输入通道；会话调度循环用 `biased` select 优先处理它，避免按下回车后又把当前 ASR 句的 chunk 送进 TTS（D24）。
+- GUI → 后台：打字输入走无界命令通道，会话调度循环用 `biased` select 优先处理它，避免按下回车后又把当前 ASR 句的 chunk 送进 TTS（D24）；顶栏两个开关走 `watch<bool>`，由线路监督者按最新期望值启停（D43）。
 - ASR→会话、会话→TTS、采集→ASR 使用有界 channel（容量 100）；采集端用 `try_send`，满则丢弃，避免阻塞实时回调。
 - 会话状态机：`Idle → Starting → Running → Stopping → Idle`；失败路径为 `Starting/Running → Failed`。GUI 以 `Idle`/`Failed` 作为“会话已结束”的信号。
 - 后台服务非用户主动退出时，会补发 `Error` 再发 `Idle`：错误条保留，状态回到可再次启动的空闲态。
@@ -462,7 +478,8 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 语音中：发送当前 chunk；起音瞬间补发 `pre_roll_ms`（内部固定 300ms）历史音频，避免切掉首字（采集块不一定整除毫秒，按**整块向上取整**保留，实际补发可能略多于配置值）；
 - 语音刚结束：继续补 `tail_ms`（默认值见 `VadConfig::default`）静音，帮助服务端 VAD 吐出 `sentence_end`（服务端约需 800ms 静音）；
 - 完全空闲：每 `keepalive_ms`（默认 10s）补一小段静音，避免 run-task 任务约 23s 无音频被服务端失败；
-- 每个 chunk 更新共享 `active_flag`（顶栏 VAD 指示器）。
+- 每个 chunk 更新共享 `active_flag`（顶栏电平条的彩色/灰阶判断）。
+- `asr_line` 在 VAD 之前对每个 chunk 做电平 tap（RMS → dBFS → 0..1），写入顶栏共享 `AtomicU32`（D43）；电平 tap 在 tokio 任务里，不阻塞 cpal 回调。
 - `[vad] enabled = false` 时跳过门控，全量上传（字段语义见 `src/config.rs`）。
 
 **独立 VAD 线程**
@@ -560,7 +577,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 12. GUI 结构
 
-- 顶栏：应用名、会话状态灯、我方 VAD 指示器（`[others] enabled` 时还有 `他人 ●` 指示器）、开始/停止、版本号。
+- 顶栏：麦克风/他人侦听图标开关 + 20 段电平条（VAD 合并配色，D43）、会话状态灯、开始/停止、版本号；不再显示应用名与副标题。线路关闭时电平条整体隐藏但保留 100×14 位置，避免布局跳动。
 - 底部日志面板：可拖拽高度（默认 180，最小 60），等宽字体、按级别着色，只渲染最近 500 行。
 - 中央页签：
 
@@ -568,8 +585,8 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 |---|---|---|
 | 实时 | 气泡时间线 + 打字输入 | **两条未完成消息永远钉在最上面**，定稿后才沉到历史区；历史区新→旧；**我方气泡靠右、他人气泡靠左**，宽度贴合内容（上限约 72%）；翻译模式下气泡内是「原文小字弱色行 + 主行大字（20pt）」，**原文语言**代码画在气泡外侧（他人气泡右侧 / 我方气泡左侧，翻译模式也标原文语种），`show_source=false` 只渲染主行（D26/D39）；当前句按「已送入 / 尚未送入」分色；所有文本（原文与译文）都可拖动选中并用 Ctrl+C 复制，界面不提供复制按钮（D16）；底部多行输入框（默认 1 行、约 4 行封顶后内部滚动）Shift+Enter 换行、Enter/「朗读」排队朗读打字输入（D24），仅运行中可提交，上限 500 字符 |
 | 音频 | 输入/输出设备 + VAD | 设备下拉保存完整设备名，改动后立即写回并重载（可能触发 D20 热重启）；「刷新设备」「恢复系统默认」；配置值不在设备列表时橙色警告。VAD 参数（启用/阈值/静音/tail/debug）用「保存 VAD 设置」写回，运行中触发 D20 热重启 |
-| 自己 | 我方线路 | `[self]` 的麦克风开关、语言列表、翻译开关与目标语言、合成开关；Tab 级保存/放弃更改（D38）；运行中保存触发 D20 热重启 |
-| 他人 | 他人线路 | `[others]` 的开关、语言列表、翻译开关与目标语言；Tab 级保存/放弃更改（D38）；音源在「VRChat」页设置 |
+| 自己 | 我方线路 | `[self]` 的麦克风开关、语言列表、翻译开关与目标语言、合成开关；麦克风开关切换即写回并启停线路（D43），其余字段 Tab 级保存/放弃更改（D38）；运行中保存其余字段触发 D20 热重启 |
+| 他人 | 他人线路 | `[others]` 的侦听开关、语言列表、翻译开关与目标语言；侦听开关切换即写回并启停线路（D43），其余字段 Tab 级保存/放弃更改（D38）；音源在「VRChat」页设置 |
 | 语音识别 | 共用的识别模型 + 预编译热词 | 模型输入框（可恢复默认）；热词多行文本框（一行一个，权重固定 50 超级热词、最多 50 条）；Tab 级保存/放弃更改（一次保存模型/热词，D32/D38）；运行中保存触发 D20 热重启；热词在下一次会话启动时自动同步到百炼（D31） |
 | 语音合成 | 合成模型 + 当前音色 + 中文方言 + 自定义音色编辑器 | 顶部合成模型输入框（可恢复默认），Radio 现有/自定义音色 + 中文方言下拉（选项来自 `CHINESE_DIALECTS`）；Tab 级保存/放弃更改；左侧列表、右侧详情（显示名、键名、样本增删/拖拽排序、语言下拉、`rfd` 选音频、每个样本的语速滑条与「重置」）。页面拆为 `tts_tab.rs`（外壳/模型/方言/列表编排）+ `tts_current_voice.rs` + `tts_voice_editor.rs` |
 | 翻译 | 共用的翻译设置 | 粒度二选一 + 显示原文开关 + 翻译模型输入/应用（D25/D26/D38）；`show_source` 只影响渲染、不重启，粒度变化触发 D20 热重启 |
@@ -587,10 +604,10 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`；lib 目标当前共 **249** 个（以 `cargo test` 输出为准；`bin` 下的调试工具另有少量单测）。
-- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、进程环回配速与进程发现、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`；lib 目标当前共 **270** 个（以 `cargo test` 输出为准；`bin` 下的调试工具另有少量单测）。
+- 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、PCM 电平映射与平滑、`Timeline::drop_open`、进程环回配速与进程发现、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
-- UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；没有 UI 自动化测试（不使用 egui_kittest，D14）。
+- UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；顶栏开关需要额外验证「运行中只启停该线路、不重启会话」「页签 checkbox 同步」「900px 最小宽度」；没有 UI 自动化测试（不使用 egui_kittest，D14）。
 - 静态截图：glow 变体 + `EFRAME_SCREENSHOT_TO`（wgpu 不支持该调试特性）。
 - 发布前人工冒烟：开始/停止、配置保存、双开单实例、release 启动、便携目录行为。
 - CI（`.github/workflows/ci.yml`）在 windows-latest 上跑 `cargo fmt --check` / `cargo build --bins` / `cargo test`；提交前仍须在本机执行同一组门禁（具体命令与提交规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)）。
@@ -741,12 +758,13 @@ Connecting ──成功──▶ Capturing
 ### 18.3 界面
 
 - 顶部黄色**实时状态**横幅：`Waiting` 显示「原因；N 秒后重试」（每 500ms 重绘刷新倒计时），`Connecting` 显示「正在连接…」，`Capturing` 自动消失；不可手动关闭，会话结束时清空。
-- 顶栏 `他人 ● 状态` 指示器：只在 `[others] enabled = true` 时显示。
+- 顶栏他人电平条：`[others] enabled = true` 时占位并按 VAD 状态显示彩色/灰阶；关闭时隐藏但保留空间（D43）。
 - 文本只上屏：`Speaker::Others` 事件进 GUI 时间线；OSC 与 TTS 都只消费 `Speaker::Local`。开启 `[others] translate` 后，时间线上一条他人消息是「原文小字行 + 译文大字行」，与自己的双语消息一致。
 
 ### 18.4 验证
 
 - 单测：倒计时换算（`retry_seconds`）、时间线的双来源交错、去重与「当前句钉顶」排序。
+- 顶栏快捷开关（2026-11-22 真机）：会话运行中切麦克风 → 麦克风线路停止/重建、ASR 重新就绪、会话状态保持 `Running`；切他人 → 黄色状态横幅出现/消失、会话不重启；`config.toml` 与「自己 / 他人」页 checkbox 同步；900×600 下布局不重叠。
 - 真机（2026-11-15）：`[vrchat] process` 设为不存在的进程 → 会话照常运行、横幅显示倒计时、日志只记一条 warn；改成 `explorer.exe` 并「应用」→ 触发 D20 重启后他人线路进入 `Capturing`、横幅消失、顶栏出现两个 ASR 就绪日志；停止会话后横幅与指示器清空。
 - 双向对话验收（2026-11-15 真机，VRChat 内有真人语音）：
   1. 只麦克风：VAD 指示随说话变化、我方字幕与 TTS/聊天框路径与改造前一致；
