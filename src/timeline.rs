@@ -6,7 +6,9 @@
 //! - 普通模式：`text` 就是 ASR 文本；翻译模式：`text` 是累计译文、`source` 是原文；
 //! - `sent_bytes` / `source_sent_bytes` 分别是主行/副行已送入下游的字节前缀（界面分色）；
 //! - 定稿时记录 `finished_at`，供 OSC 聊天框按保留时长裁剪历史句（D42）；
-//! - 历史上限 [`MAX_MESSAGES`]，按 `(来源, sentence_id)` 去重同一句的重复最终结果。
+//! - 历史上限 [`MAX_MESSAGES`]，按 `(来源, sentence_id)` 去重同一句的重复最终结果；
+//! - 手动「清除 VRChat 聊天框」用 [`Timeline::clear_messages`] 丢弃全部消息，但保留
+//!   翻译模式与去重记忆（D44）。
 //!
 //! 本模块是纯逻辑：不依赖 egui、网络，也不读取系统时钟；`now` 由调用方传入，便于单测。
 
@@ -86,6 +88,16 @@ impl Timeline {
     pub fn reset_open(&mut self) {
         self.messages.retain(|message| !message.open);
         self.last_finalized = [None; 2];
+    }
+
+    /// 清空所有消息（当前句与历史），保留翻译模式与最终句去重记忆（D44）。
+    ///
+    /// 供手动「清除 VRChat 聊天框」使用：OSC 任务每 tick 都从这份时间线重新合成，
+    /// 只发空串的话旧历史会再次出现。保留 `last_finalized` 是为了让服务端重复下发的
+    /// 同一句最终结果仍被丢弃，不会把刚清掉的句子写回；翻译模式是会话级设置，清空
+    /// 消息不应重置它。
+    pub fn clear_messages(&mut self) {
+        self.messages.clear();
     }
 
     /// 打字输入句：提交即进历史（不经过 ASR 的 `sentence_id` 去重）。
@@ -688,5 +700,32 @@ mod tests {
         timeline.reset_open();
         assert_eq!(timeline.messages().len(), 1, "未完成消息清理掉，历史保留");
         assert_eq!(timeline.messages()[0].text, "第一句。");
+    }
+
+    #[test]
+    fn clear_messages_drops_all_but_keeps_dedupe_and_translation() {
+        let mut timeline = Timeline::default();
+        asr_with_id(&mut timeline, Speaker::Local, "已定稿。", true, Some(7));
+        asr(&mut timeline, Speaker::Local, "半句", 0, false);
+        assert_eq!(timeline.messages().len(), 2);
+
+        timeline.clear_messages();
+        assert!(timeline.messages().is_empty(), "当前句与历史都清掉");
+
+        // 同一 sentence_id 的重复最终结果仍被去重，不会把刚清掉的句子写回。
+        asr_with_id(&mut timeline, Speaker::Local, "已定稿。", true, Some(7));
+        assert!(timeline.messages().is_empty());
+
+        // 新句不受清空影响。
+        asr_with_id(&mut timeline, Speaker::Local, "新句。", true, Some(8));
+        assert_eq!(timeline.messages().len(), 1);
+        assert_eq!(timeline.messages()[0].text, "新句。");
+
+        // 翻译模式是会话级设置，清空消息不应重置它。
+        timeline.set_translation(Speaker::Local, true);
+        timeline.set_translation(Speaker::Others, true);
+        timeline.clear_messages();
+        assert!(timeline.translation(Speaker::Local));
+        assert!(timeline.translation(Speaker::Others));
     }
 }

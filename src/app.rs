@@ -929,6 +929,13 @@ impl BivoxApp {
         }
     }
 
+    /// 手动清空 VRChat 聊天框（含历史句，D44）；OSC 关闭时无操作。
+    pub fn clear_chatbox(&self) {
+        if self.config.vrchat.osc.enabled {
+            self.chatbox.force_clear();
+        }
+    }
+
     // ---- 快捷开关（D43）----
     //
     // 顶栏图标与「自己 / 他人」页的 checkbox 共用这一条路径：切换即写回配置，

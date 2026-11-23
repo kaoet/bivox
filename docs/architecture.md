@@ -56,6 +56,7 @@ VRChat OSC 聊天框（D33）：
   pipeline::session::emit（事件克隆一份）→ ChatboxService 后台任务
     └─ 自己的 Timeline + 1 秒文本节流 + typing 跳变 + 约 30 秒自然过期
          └─ rosc 编码 → UDP 127.0.0.1:{vrchat.osc.port}（/chatbox/input、/chatbox/typing）
+  顶栏「清除 VRChat 聊天框」──(Command::ForceClear)──▶ 同一任务：清镜像 Timeline + 立即空串（D44）
 
 关键取舍：
 
@@ -80,7 +81,7 @@ src/
 ├── config_edit.rs       配置读写：读取、最小化序列化、校验、`.bak` 备份
 ├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
 ├── chatbox.rs           VRChat 聊天框文本合成：当前句+历史句、逐句截断、双语软借用（D33/D42）
-├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、保留时长清空、测试消息（D33/D42）
+├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、保留时长清空、测试消息、手动清除（D33/D42/D44）
 ├── timeline.rs         Timeline：ASR/翻译/打字事件的纯归约（GUI 与 OSC 共用；含句终时间戳）
 ├── http.rs              百炼 HTTP JSON 接口的公共错误类型与响应解析
 ├── language.rs          语言代码集合、脚本统计、LanguageTracker、instruction 映射
@@ -118,7 +119,7 @@ src/
 │   ├── admin.rs         调试 CLI 的纯逻辑（远程音色列出/删除）
 │   └── mock_http.rs     单元测试用的手写 HTTP mock
 ├── gui/
-│   ├── toolbar.rs       顶栏布局：麦克风/他人开关与电平条、状态、开始/停止、版本号
+│   ├── toolbar.rs       顶栏布局：麦克风/他人开关与电平条、状态、开始/停止、清除聊天框、版本号（D43/D44）
 │   ├── meter.rs         顶栏图标开关 + 20 段电平条（VAD 合并配色，D43）
 │   ├── realtime_tab.rs  实时页：气泡时间线（我方靠右 / 他人靠左，底部嵌入打字输入行）
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
@@ -577,7 +578,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 12. GUI 结构
 
-- 顶栏：麦克风/他人侦听图标开关 + 20 段电平条（VAD 合并配色，D43）、会话状态灯、开始/停止、版本号；不再显示应用名与副标题。线路关闭时电平条整体隐藏但保留 100×14 位置，避免布局跳动。
+- 顶栏：麦克风/他人侦听图标开关 + 20 段电平条（VAD 合并配色，D43）、会话状态灯、开始/停止、清除 VRChat 聊天框（需启用 OSC，D44）、版本号；不再显示应用名与副标题。线路关闭时电平条整体隐藏但保留 100×14 位置，避免布局跳动。
 - 底部日志面板：可拖拽高度（默认 180，最小 60），等宽字体、按级别着色，只渲染最近 500 行。
 - 中央页签：
 
@@ -686,6 +687,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
   - 翻译模式未开启时三种模式仍可编辑，页面不写额外提示；
   - 无状态行、typing 说明、隐私提示；
   - 测试消息立即发送，不受 1 秒文本节流约束；不改变 typing。
+- 顶栏「清除 VRChat 聊天框」只看 `[vrchat.osc] enabled`：启用时可点（与会话是否运行无关），禁用时置灰并在 tooltip 指向启用开关（D44）。
 
 ### 17.2 文本合成与截断
 
@@ -709,12 +711,14 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 文本：距上次成功文本发送 ≥ `CHATBOX_TEXT_INTERVAL`（1000ms）才发；1 秒内多次变化只发最新内容；相同文本只在同一段显示内去重，新当前句/打字输入会重置去重。
 - typing：`/chatbox/typing` 只在当前句开始/结束时发送；实测不占文本预算。
 - 清空（D42）：没有可显示内容时发空串；已定稿内容超过 `retention_secs` 后由客户端主动发空串清空（默认 30 秒，与 VRChat 自然过期对齐，不需要心跳重发）。停止/失败/关闭 OSC/关窗仍立即清空。
+- 手动清除（D44）：`ChatboxService::force_clear()` 发 `Command::ForceClear`，`Runtime::force_clear()` 先按上面的 `clear()` 立即发空串并关闭 typing（不等 1 秒窗口、不重试），再 `Timeline::clear_messages()` 丢弃镜像里的当前句与历史句；只清消息，保留翻译模式与最终句去重记忆，避免服务端重复最终结果把句子写回。OSC 关闭时按钮禁用，任务也不发包。
 - 发送：`rosc` 编码 `/chatbox/input` `(text, true, false)` 或 `/chatbox/typing`，`std::net::UdpSocket` 发到 `127.0.0.1:port`；不 bind 9000、不用 bundle。
 - 失败只写 debug 日志；VRChat 未运行是正常状态，不弹错误。
 
 ### 17.4 与 GUI 的边界
 
 - `Timeline` 由 `timeline.rs` 提供，GUI 与 OSC 任务共用，避免 D16/D26 语义漂移；`Message.finished_at` 记录句终时刻，供 OSC 按保留时长裁剪（D42）。
+- 手动清除只作用于 OSC 任务自己那份 `Timeline`（`clear_messages`），GUI 字幕历史不受影响（D44）。
 - 会话启动失败时，包装任务额外向 OSC 通道发 `StateChanged(Failed)`，让聊天框清空。
 - 关窗流程调用 `ChatboxService::shutdown()` 尽力清空并退出任务。
 
@@ -722,8 +726,9 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 - 单测：配置解析/校验、VRChat 配置写回、文本合成/保尾截断/9 行、typing 跳变、OSC 编码（`/chatbox/input` 的 `sTF`、`/chatbox/typing` 的 bool）、1 秒节流与清空（注入时钟）。
 - 历史句（D42）：当前句+历史顺序、保留时长边界、关闭历史句时的最后一句清空、逐句截断与仅截断一条、双语奇数行 3/2 与软借用、译文未到的当前句回退历史、预算用尽不发只有 `…` 的块。
+- 手动清除（D44）：`Timeline::clear_messages` 清空消息但保留翻译模式与去重记忆；OSC 侧历史句显示后清除不会复现、重复最终结果仍被去重、OSC 关闭时不发包；`ChatboxService::force_clear` 的命令链路收到空串。
 - 2026-11-09 真机复核：144 ASCII 显示 6 行；160 ASCII 在 144 字符处裁尾；12 个显式行只显示 L01–L09；默认 UI 每行约 24 ASCII / 15 中文 / 12 emoji；144 纯中文约 10 行，双语 144 字符会因自动换行超过 9 行而裁掉源文尾。修复后 `chatbox` 按显示宽度估算换行，客户端发的 144 中文/双语样例均为 9 行且保留尾部标记。
-- GUI：egui_mcp 验证页签、开关/模式/端口/历史句/保留时长写回、测试消息发包。
+- GUI：egui_mcp 验证页签、开关/模式/端口/历史句/保留时长写回、测试消息发包、顶栏清除按钮的可用/置灰与发包。
 - 真机：用临时工具实测 1 秒文本间隔、144 字符、typing 每秒切换、保留时长清空与空串立即清空；正式实现后仍需 10 分钟真实语音浸泡。
 
 ---

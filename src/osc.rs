@@ -1,7 +1,9 @@
-//! VRChat OSC 聊天框后台服务（D33/D39/D42）。
+//! VRChat OSC 聊天框后台服务（D33/D39/D42/D44）。
 //!
 //! 独立于 GUI 重绘：会话把 `PipelineEvent` 克隆一份发到这里，本任务维护自己的
-//! [`Timeline`]（只取我方投影）、1 秒文本节流、typing 跳变和显式清空。
+//! [`Timeline`]（只取我方投影）、1 秒文本节流、typing 跳变和显式清空。GUI 顶栏的
+//! 「清除 VRChat 聊天框」通过命令通道触发手动清空（D44）：除了立即发空串，还要丢
+//! 弃镜像时间线里的消息，否则下一次合成就把历史句重新发出去。
 //!
 //! 关键约束（2026-11-08 实测）：
 //! - `/chatbox/input` 文本最多 1 条/秒；900ms 长跑会跳字；
@@ -76,6 +78,8 @@ pub struct ChatboxService {
 
 enum Command {
     SendTest,
+    /// 手动清除聊天框（含历史句，D44）。
+    ForceClear,
     Shutdown,
 }
 
@@ -112,6 +116,11 @@ impl ChatboxService {
         self.command_tx.send(Command::SendTest).is_ok()
     }
 
+    /// 立即清空聊天框（含历史句，D44）；返回 false 表示服务已退出。
+    pub fn force_clear(&self) -> bool {
+        self.command_tx.send(Command::ForceClear).is_ok()
+    }
+
     /// 关窗时尽力清空聊天框并退出任务。
     pub fn shutdown(&self) {
         let _ = self.command_tx.send(Command::Shutdown);
@@ -135,6 +144,7 @@ async fn run(
             command = command_rx.recv() => {
                 match command {
                     Some(Command::SendTest) => runtime.send_test(),
+                    Some(Command::ForceClear) => runtime.force_clear(Instant::now()),
                     Some(Command::Shutdown) => {
                         runtime.shutdown(Instant::now());
                         break;
@@ -364,6 +374,18 @@ impl Runtime {
         if self.settings.enabled {
             // 测试消息立即发送，不走 1 秒文本窗口，也不改变 typing。
             self.sender.send_text(TEST_MESSAGE);
+        }
+    }
+
+    /// 手动强制清空（D44）：立即发空串，并丢弃镜像时间线里的当前句与历史句。
+    ///
+    /// 只发空串不够：下一个 tick 会从 [`Timeline`] 重新合成旧历史（D42）。这里清消息
+    /// 但保留翻译模式与最终句去重记忆（见 [`Timeline::clear_messages`]）。
+    fn force_clear(&mut self, now: Instant) {
+        self.timeline.clear_messages();
+        if self.settings.enabled {
+            // 复用既有清空路径：立即空串 + 关闭 typing，并重开 1 秒文本窗口。
+            self.clear(now);
         }
     }
 
@@ -608,13 +630,17 @@ mod tests {
     }
 
     fn asr_end_event(text: &str) -> PipelineEvent {
+        asr_end_event_with_id(text, None)
+    }
+
+    fn asr_end_event_with_id(text: &str, sentence_id: Option<u64>) -> PipelineEvent {
         PipelineEvent::Asr {
             speaker: Speaker::Local,
             text: text.to_string(),
             is_sentence_end: true,
             sent_bytes: 0,
             language: Some("en".to_string()),
-            sentence_id: None,
+            sentence_id,
         }
     }
 
@@ -724,5 +750,127 @@ mod tests {
         // 定稿 5 秒后清空。
         runtime.tick(start + Duration::from_secs(107));
         assert!(is_text(&recv_packet(&listener), ""));
+    }
+
+    #[test]
+    fn force_clear_drops_current_and_history_without_resurrection() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: true,
+            port,
+            display: VrchatDisplay::Source,
+            translate_enabled: false,
+            show_history: true,
+            retention: Duration::from_secs(30),
+        });
+        let start = Instant::now();
+        runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        // 两句定稿后按「新 → 旧」显示历史句。
+        runtime.on_event(asr_end_event("一"), start + Duration::from_secs(2));
+        assert!(is_text(&recv_packet(&listener), "一"));
+        runtime.on_event(asr_end_event("二"), start + Duration::from_secs(3));
+        assert!(is_text(&recv_packet(&listener), "二\n一"));
+
+        // 手动清除：立即空串，并关闭 typing。
+        runtime.force_clear(start + Duration::from_secs(4));
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        // 1 秒窗口过后也不会从镜像时间线重新合成历史句。
+        runtime.tick(start + Duration::from_secs(10));
+        assert!(recv_packet_opt(&listener).is_none(), "历史句不应复现");
+
+        // 新句仍正常显示。
+        runtime.on_event(asr_end_event("三"), start + Duration::from_secs(11));
+        assert!(is_text(&recv_packet(&listener), "三"));
+    }
+
+    #[test]
+    fn force_clear_keeps_duplicate_final_deduped() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: true,
+            port,
+            display: VrchatDisplay::Source,
+            translate_enabled: false,
+            show_history: true,
+            retention: Duration::from_secs(30),
+        });
+        let start = Instant::now();
+        runtime.on_event(PipelineEvent::StateChanged(SessionState::Running), start);
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        runtime.on_event(
+            asr_end_event_with_id("一句。", Some(7)),
+            start + Duration::from_secs(2),
+        );
+        assert!(is_text(&recv_packet(&listener), "一句。"));
+
+        runtime.force_clear(start + Duration::from_secs(3));
+        assert!(is_text(&recv_packet(&listener), ""));
+        assert!(is_typing(&recv_packet(&listener), false));
+
+        // 服务端重复下发的同一句最终结果：去重记忆仍在，不会把句子写回。
+        runtime.on_event(
+            asr_end_event_with_id("一句。", Some(7)),
+            start + Duration::from_secs(5),
+        );
+        assert!(
+            recv_packet_opt(&listener).is_none(),
+            "重复最终结果不应复活已清除的句子"
+        );
+    }
+
+    #[test]
+    fn force_clear_when_disabled_sends_nothing() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runtime = Runtime::new(ChatboxSettings {
+            enabled: false,
+            port,
+            ..ChatboxSettings::default()
+        });
+
+        runtime.force_clear(Instant::now());
+        assert!(recv_packet_opt(&listener).is_none(), "OSC 关闭时不发包");
+    }
+
+    #[tokio::test]
+    async fn service_force_clear_sends_empty_text() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = ChatboxService::spawn(
+            &tokio::runtime::Handle::current(),
+            ChatboxSettings {
+                enabled: true,
+                port,
+                ..ChatboxSettings::default()
+            },
+        );
+        assert!(service.force_clear());
+
+        let mut buffer = [0u8; 2048];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buffer))
+                .await
+                .expect("应在 2 秒内收到清空包")
+                .expect("UDP 接收失败");
+        assert!(is_text(&buffer[..len], ""));
+        service.shutdown();
     }
 }

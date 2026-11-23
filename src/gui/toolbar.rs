@@ -1,7 +1,7 @@
-//! 顶部工具栏：麦克风/他人侦听快捷开关与电平条、会话状态、开始/停止（D43）。
+//! 顶部工具栏：麦克风/他人侦听快捷开关与电平条、会话状态、开始/停止、清除聊天框（D43/D44）。
 //!
-//! 顺序固定为「音量开关和音量条 → 流水线状态 → 开始/停止」；版本号仍靠右。
-//! VAD 指示已合并进电平条配色，不再单独占一段文字。
+//! 顺序固定为「音量开关和音量条 → 流水线状态 → 开始/停止 → 清除 VRChat 聊天框」；
+//! 版本号仍靠右。VAD 指示已合并进电平条配色，不再单独占一段文字。
 
 use eframe::egui;
 
@@ -44,10 +44,12 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let mut toggle_others = false;
     let mut start = false;
     let mut stop = false;
+    let mut clear_chatbox = false;
 
     let state = app.state;
     let session_running = app.session.is_some();
     let vad_enabled = app.config.vad.enabled;
+    let osc_enabled = app.config.vrchat.osc.enabled;
     let mic_degraded = app
         .session
         .as_ref()
@@ -104,6 +106,18 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
             stop = true;
         }
 
+        ui.separator();
+        if ui
+            .add_enabled(osc_enabled, egui::Button::new("清除 VRChat 聊天框"))
+            .on_hover_text(
+                "立即清空 VRChat 聊天框；聊天框里的历史句一并丢弃（界面字幕历史不受影响）",
+            )
+            .on_disabled_hover_text("先在「VRChat」页启用 OSC 聊天框")
+            .clicked()
+        {
+            clear_chatbox = true;
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
         });
@@ -122,6 +136,9 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     }
     if stop {
         app.stop_session();
+    }
+    if clear_chatbox {
+        app.clear_chatbox();
     }
 
     ui.add_space(4.0);
