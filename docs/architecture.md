@@ -78,7 +78,7 @@ src/
 ├── log_sink.rs          log 门面 → 内存环形缓冲 + 按天文件 + panic 钩子
 ├── single_instance.rs   Windows 命名 Mutex 单实例 + 激活已有窗口
 ├── config.rs            config.toml 解析、默认值、归一化、校验、URL/路径派生
-├── config_edit.rs       配置读写：读取、最小化序列化、校验、`.bak` 备份
+├── config_edit.rs       配置读写：`update` 单一入口、最小化序列化、校验、`.bak` 备份、原子替换
 ├── cache.rs             本地共享缓存 cache.json（音色 voice_id + ASR vocabulary_id）
 ├── chatbox.rs           VRChat 聊天框文本合成：当前句+历史句、逐句截断、双语软借用（D33/D42）
 ├── osc.rs               VRChat OSC 后台服务：1 秒文本节流、typing、保留时长清空、测试消息、手动清除（D33/D42/D44）
@@ -301,9 +301,8 @@ main()
 
 ### 4.3 配置写回
 
-- 调用方先读磁盘原文，用 `AppConfig::load` 得到带 `base_dir` 的类型化配置，直接修改结构字段。
-- `AppConfig::to_toml_string` 先归一化/校验副本，再只输出与默认值不同的字段；所有空表不输出，因此空配置就是空文件。
-- 统一入口 `save(path, original, config)`：无改动直接返回；否则校验磁盘原配置仍然合法（非法则拒绝写回）并校验序列化文本；成功后把原文件复制为 `config.toml.bak`，再写盘。
+- 统一入口 `config_edit::update(path, |config| { … })`：读磁盘原文 → 解析为带 `base_dir` 的 `AppConfig` → 类型化修改 → 校验磁盘原配置与新文本 → 备份 `config.toml.bak` → **原子替换**（先写 `config.toml.tmp` 再 rename）→ 返回写好的配置。调用方拿返回值直接更新内存状态，不重新读盘（单字段保存因此只读一次文件）。
+- `AppConfig::to_toml_string` 先归一化/校验副本，再只输出与默认值不同的字段：结构体用 `derive(Serialize)` 声明字段，序列化后递归删掉与 `AppConfig::default()` 相同的项与变空的子表，并把浮点收敛成 `f32` 的最短十进制（`0.42` 而不是 `0.41999998688697815`）。因此字段只需在结构体上声明一次，**不会出现「新增字段忘了写进序列化器、写回时静默丢值」**；`custom_voices` 另按键名排序（`HashMap` 顺序不稳定）。
 - `config.toml` 由 GUI 维护，不再保留注释、字段顺序或用户手写格式。设置页整页保存时 API Key 输入框留空 = 删除 `[api] key`（`None`），不写空字符串。
 
 ### 4.4 配置指纹与热更新
@@ -519,7 +518,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - `drafts_from_config`：配置 → `VoiceDraft`（键名、显示名、有序样本，样本含语言、音频路径与 `rate`），按显示名/键名排序；
 - 界面只改草稿，直到点「保存」才写回；每个样本一行「语速」滑条与「重置」；
 - 语音识别页的草稿与保存规则见 D32；热词不是草稿的一部分，保存后由下一次会话启动同步（D31）。
-- `drafts_to_entries` 的字段校验与 `AppConfig::validate` 使用同一组规则（键名、样本、语言、音频、`rate`）；保存前还会检查音频文件存在；写回时整体替换 `AppConfig.tts.custom_voices`。
+- `drafts_to_entries` 只检查草稿列表自己的约束（键名非空/不重复），条目字段的校验（语言归一、音频、`rate`）直接调用 `config::validate_custom_voice`——与 `AppConfig::validate` 是**同一份代码**，避免「配置合法但 GUI 存不回去」；保存前还会检查音频文件存在；写回时整体替换 `AppConfig.tts.custom_voices`。
 - 音频路径策略：选中的文件在 exe 目录内 → 存相对路径；目录外 → 存绝对路径并在界面提示可能破坏便携性。
 
 ### 11.3 运行期解析与注册（`voice/mod.rs`）

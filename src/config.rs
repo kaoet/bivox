@@ -5,7 +5,7 @@
 //! 用户侧操作见 README，运行期行为见 docs/architecture.md。
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
@@ -109,7 +109,7 @@ pub const DEFAULT_VRCHAT_PROCESS: &str = "VRChat.exe";
 /// 所有字段都有默认值，空文件是合法的默认配置；`[api] key` 缺省表示未配置，
 /// 不算配置非法。字段一旦显式写出就必须合法（显式空字符串会被拒绝）。
 /// 启用 `deny_unknown_fields`：未知字段/拼写错误直接解析失败。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub api: ApiConfig,
@@ -136,13 +136,14 @@ pub struct AppConfig {
 }
 
 /// `[api]`：鉴权与业务空间域名。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
     /// 百炼 API Key，用于全部百炼 API/WebSocket 请求。
     ///
     /// `None` = 未配置，配置本身有效，开始会话前由 GUI 引导填写；
     /// 显式写空字符串非法。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 
     /// 业务空间接入域名 Host。
@@ -164,7 +165,7 @@ impl Default for ApiConfig {
 /// `[asr]`：实时语音识别中**两条线路共用**的部分。
 ///
 /// 语言列表不在这里：每条线路各有一份（`[self] languages` / `[others] languages`）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrConfig {
     /// 实时识别模型 ID；必须非空。我方与对方线路共用。
@@ -191,7 +192,7 @@ impl Default for AsrConfig {
 }
 
 /// `[tts]`：语音合成。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TtsConfig {
     /// 合成模型 ID；必须非空，与音色/复刻缓存绑定。
@@ -210,6 +211,8 @@ pub struct TtsConfig {
     /// 自定义（复刻）音色表；键名用于 `voice = "custom:<键名>"`。
     ///
     /// 每个音色至少一个样本，结构见 [`CustomVoiceConfig`]。
+    /// 序列化时按键名排序（`HashMap` 顺序不稳定，写回必须可复现）。
+    #[serde(serialize_with = "serialize_custom_voices")]
     pub custom_voices: HashMap<String, CustomVoiceConfig>,
 }
 
@@ -225,7 +228,7 @@ impl Default for TtsConfig {
 }
 
 /// `[cache]`：本地缓存文件（音色复刻记录 + ASR 预编译热词 ID）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// 本地缓存文件，供音色复刻记录与 ASR 预编译热词 ID 共用。
@@ -244,7 +247,7 @@ impl Default for CacheConfig {
 }
 
 /// 翻译粒度：决定多长的源文片段送去翻译。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TranslateGranularity {
     /// 标点或句终即送翻（延迟低，可能翻碎句）。
@@ -268,7 +271,7 @@ impl TranslateGranularity {
 ///
 /// 每条线路是否翻译、译成什么语言在 `[self] translate/target` 与
 /// `[others] translate/target`；这里只保留共用的模型与粒度。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranslateConfig {
     /// 翻译模型 ID；必须非空。
@@ -295,7 +298,7 @@ impl Default for TranslateConfig {
 ///
 /// 这条线路没有总开关：`mic` / `tts` / `[vrchat.osc] enabled` 各自控制一个能力；
 /// 三者都关时仍然可以打字上屏。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocalConfig {
     /// 是否采集麦克风；关闭后只能用打字输入（不采集、不上传，也不启动本地 VAD）。
@@ -337,7 +340,7 @@ impl Default for LocalConfig {
 /// `[others]`：对方线路——侦听 `[vrchat] process` 的音频输出（D36）。
 ///
 /// 这条线路只上屏：不写 OSC、不做 TTS；目标进程不可达按临时错误处理。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OthersConfig {
     /// 是否启用对方线路；关闭时不采集进程音频、不建第二条 ASR 连接。
@@ -367,7 +370,7 @@ impl Default for OthersConfig {
 }
 
 /// `[vrchat]`：VRChat 相关设置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VrchatConfig {
     /// 对方线路要侦听的进程（exe 文件名，含其子进程，见 D36）；不能为空。
@@ -388,7 +391,7 @@ impl Default for VrchatConfig {
 }
 
 /// `[vrchat.osc]`：OSC 聊天框输出。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VrchatOscConfig {
     /// 是否把实时字幕发送到 VRChat 的 OSC 聊天框。
@@ -427,7 +430,7 @@ impl Default for VrchatOscConfig {
 }
 
 /// VRChat 聊天框显示模式（仅翻译模式生效）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VrchatDisplay {
     /// 只显示原文。
@@ -454,10 +457,11 @@ impl VrchatDisplay {
 ///
 /// 每个样本按（TTS 模型, 音频内容）单独复刻并缓存；合成时按语言选样本，
 /// 缺语言回退到首个样本。音色前缀由配置键名自动生成。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomVoiceConfig {
     /// 显示名；省略时使用配置键名，显式空字符串非法。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
     /// 有序声线样本；至少一个，首个是默认声线。
@@ -465,7 +469,7 @@ pub struct CustomVoiceConfig {
 }
 
 /// 某个语言的一份声线样本。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomVoiceSample {
     /// 声音复刻语言代码，取值见 [`language::CLONING_LANGUAGES`]。
@@ -481,7 +485,8 @@ pub struct CustomVoiceSample {
     /// 合成语速倍率，有效范围 [`MIN_SAMPLE_RATE`]–[`MAX_SAMPLE_RATE`]。
     ///
     /// 属于样本级：只在本句选用该样本时生效，回退样本时用回退样本的 rate；
-    /// 不参与复刻/缓存。
+    /// 不参与复刻/缓存。默认值不写回（默认 [DEFAULT_SAMPLE_RATE]）。
+    #[serde(skip_serializing_if = "is_default_sample_rate")]
     pub rate: f32,
 }
 
@@ -516,22 +521,24 @@ impl CustomVoiceConfig {
 }
 
 /// `[audio]`：输入/输出音频设备。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
     /// 输入设备完整名称；`None` = 系统默认。
     ///
     /// 显式空字符串非法；启动时按完整名称精确匹配，改名/拔出会报错而不回退。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_device: Option<String>,
 
     /// 输出设备完整名称；`None` = 系统默认。
     ///
     /// 显式空字符串非法；启动时按完整名称精确匹配，改名/拔出会报错而不回退。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_device: Option<String>,
 }
 
 /// `[vad]`：本地 Silero VAD 发送门控。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VadConfig {
     /// 是否启用本地 VAD 门控；关闭后全量上传音频。
@@ -565,7 +572,7 @@ impl Default for VadConfig {
 }
 
 /// `[chunking]`：流式文本分块。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChunkingConfig {
     /// 投机分块词数阈值，必须大于 0。
@@ -592,14 +599,28 @@ impl AppConfig {
                 path.display()
             )
         })?;
-        let mut config = Self::from_toml_str(&text)
+        let config = Self::from_toml_str(&text)
             .with_context(|| format!("配置文件 {} 无效", path.display()))?;
-        config.base_dir = path
+        Ok(config.with_base_dir(path))
+    }
+
+    /// 解析已有文本并补上相对路径基准目录。
+    ///
+    /// 写回流程用：已经读过磁盘原文，不必为了拿 `base_dir` 再读一次盘。
+    pub(crate) fn from_toml_str_in(text: &str, path: &Path) -> Result<Self> {
+        let config = Self::from_toml_str(text)
+            .with_context(|| format!("配置文件 {} 无效", path.display()))?;
+        Ok(config.with_base_dir(path))
+    }
+
+    /// 把 `config.toml` 所在目录记为相对路径基准（空目录名按 `.` 处理）。
+    fn with_base_dir(mut self, path: &Path) -> Self {
+        self.base_dir = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        Ok(config)
+        self
     }
 
     /// 解析 TOML 文本，完成空值归一化与合法性校验（便于单元测试）。
@@ -617,247 +638,24 @@ impl AppConfig {
         let mut config = self.clone();
         config.normalize();
         config.validate()?;
-        toml::to_string(&config.to_toml_table()).context("序列化配置为 TOML 失败")
+        toml::to_string(&config.to_toml_table()?).context("序列化配置为 TOML 失败")
     }
 
     /// 构建只含非默认值的 TOML 表。
-    fn to_toml_table(&self) -> Table {
-        let default = Self::default();
-        let mut root = Table::new();
-
-        let mut api = Table::new();
-        if let Some(key) = &self.api.key {
-            api.insert("key".to_string(), Value::String(key.clone()));
-        }
-        if self.api.workspace_host != default.api.workspace_host {
-            api.insert(
-                "workspace_host".to_string(),
-                Value::String(self.api.workspace_host.clone()),
-            );
-        }
-        insert_table(&mut root, "api", api);
-
-        let mut asr = Table::new();
-        if self.asr.model != default.asr.model {
-            asr.insert("model".to_string(), Value::String(self.asr.model.clone()));
-        }
-        if !self.asr.hotwords.is_empty() {
-            asr.insert("hotwords".to_string(), string_array(&self.asr.hotwords));
-        }
-        insert_table(&mut root, "asr", asr);
-
-        let mut local = Table::new();
-        if self.local.mic != default.local.mic {
-            local.insert("mic".to_string(), Value::Boolean(self.local.mic));
-        }
-        if self.local.languages != default.local.languages {
-            local.insert("languages".to_string(), string_array(&self.local.languages));
-        }
-        if self.local.translate != default.local.translate {
-            local.insert(
-                "translate".to_string(),
-                Value::Boolean(self.local.translate),
-            );
-        }
-        if self.local.target != default.local.target {
-            local.insert(
-                "target".to_string(),
-                Value::String(self.local.target.clone()),
-            );
-        }
-        if self.local.tts != default.local.tts {
-            local.insert("tts".to_string(), Value::Boolean(self.local.tts));
-        }
-        insert_table(&mut root, "self", local);
-
-        let mut others = Table::new();
-        if self.others.enabled != default.others.enabled {
-            others.insert("enabled".to_string(), Value::Boolean(self.others.enabled));
-        }
-        if self.others.languages != default.others.languages {
-            others.insert(
-                "languages".to_string(),
-                string_array(&self.others.languages),
-            );
-        }
-        if self.others.translate != default.others.translate {
-            others.insert(
-                "translate".to_string(),
-                Value::Boolean(self.others.translate),
-            );
-        }
-        if self.others.target != default.others.target {
-            others.insert(
-                "target".to_string(),
-                Value::String(self.others.target.clone()),
-            );
-        }
-        insert_table(&mut root, "others", others);
-
-        let mut tts = Table::new();
-        if self.tts.model != default.tts.model {
-            tts.insert("model".to_string(), Value::String(self.tts.model.clone()));
-        }
-        if self.tts.voice != default.tts.voice {
-            tts.insert("voice".to_string(), Value::String(self.tts.voice.clone()));
-        }
-        if self.tts.dialect != default.tts.dialect {
-            tts.insert(
-                "dialect".to_string(),
-                Value::String(self.tts.dialect.clone()),
-            );
-        }
-        if !self.tts.custom_voices.is_empty() {
-            let mut voices = Table::new();
-            let mut names: Vec<&String> = self.tts.custom_voices.keys().collect();
-            names.sort();
-            for name in names {
-                let voice = &self.tts.custom_voices[name];
-                let mut voice_table = Table::new();
-                if let Some(display_name) = &voice.name {
-                    voice_table.insert("name".to_string(), Value::String(display_name.clone()));
-                }
-
-                let mut samples = Vec::with_capacity(voice.samples.len());
-                for sample in &voice.samples {
-                    let mut sample_table = Table::new();
-                    sample_table.insert(
-                        "language".to_string(),
-                        Value::String(sample.language.clone()),
-                    );
-                    sample_table.insert(
-                        "audio".to_string(),
-                        Value::String(sample.audio.to_string_lossy().into_owned()),
-                    );
-                    // 默认语速不写，缺省即 1.0。
-                    if sample.rate != DEFAULT_SAMPLE_RATE {
-                        sample_table.insert("rate".to_string(), float_value(sample.rate));
-                    }
-                    samples.push(Value::Table(sample_table));
-                }
-                voice_table.insert("samples".to_string(), Value::Array(samples));
-                voices.insert(name.clone(), Value::Table(voice_table));
-            }
-            tts.insert("custom_voices".to_string(), Value::Table(voices));
-        }
-        insert_table(&mut root, "tts", tts);
-
-        let mut cache = Table::new();
-        if self.cache.file != default.cache.file {
-            cache.insert(
-                "file".to_string(),
-                Value::String(self.cache.file.to_string_lossy().into_owned()),
-            );
-        }
-        insert_table(&mut root, "cache", cache);
-
-        let mut audio = Table::new();
-        if let Some(device) = &self.audio.input_device {
-            audio.insert("input_device".to_string(), Value::String(device.clone()));
-        }
-        if let Some(device) = &self.audio.output_device {
-            audio.insert("output_device".to_string(), Value::String(device.clone()));
-        }
-        insert_table(&mut root, "audio", audio);
-
-        let mut vad = Table::new();
-        if self.vad.enabled != default.vad.enabled {
-            vad.insert("enabled".to_string(), Value::Boolean(self.vad.enabled));
-        }
-        if self.vad.threshold != default.vad.threshold {
-            vad.insert("threshold".to_string(), float_value(self.vad.threshold));
-        }
-        if self.vad.min_silence_ms != default.vad.min_silence_ms {
-            vad.insert(
-                "min_silence_ms".to_string(),
-                Value::Integer(i64::from(self.vad.min_silence_ms)),
-            );
-        }
-        if self.vad.tail_ms != default.vad.tail_ms {
-            vad.insert(
-                "tail_ms".to_string(),
-                Value::Integer(i64::from(self.vad.tail_ms)),
-            );
-        }
-        if self.vad.debug != default.vad.debug {
-            vad.insert("debug".to_string(), Value::Boolean(self.vad.debug));
-        }
-        insert_table(&mut root, "vad", vad);
-
-        let mut chunking = Table::new();
-        if self.chunking.words != default.chunking.words {
-            chunking.insert(
-                "words".to_string(),
-                Value::Integer(i64::try_from(self.chunking.words).unwrap_or(i64::MAX)),
-            );
-        }
-        insert_table(&mut root, "chunking", chunking);
-
-        let mut translate = Table::new();
-        if self.translate.model != default.translate.model {
-            translate.insert(
-                "model".to_string(),
-                Value::String(self.translate.model.clone()),
-            );
-        }
-        if self.translate.granularity != default.translate.granularity {
-            translate.insert(
-                "granularity".to_string(),
-                Value::String(self.translate.granularity.label().to_string()),
-            );
-        }
-        if self.translate.show_source != default.translate.show_source {
-            translate.insert(
-                "show_source".to_string(),
-                Value::Boolean(self.translate.show_source),
-            );
-        }
-        insert_table(&mut root, "translate", translate);
-
-        let mut vrchat = Table::new();
-        if self.vrchat.process != default.vrchat.process {
-            vrchat.insert(
-                "process".to_string(),
-                Value::String(self.vrchat.process.clone()),
-            );
-        }
-        let mut osc = Table::new();
-        if self.vrchat.osc.enabled != default.vrchat.osc.enabled {
-            osc.insert(
-                "enabled".to_string(),
-                Value::Boolean(self.vrchat.osc.enabled),
-            );
-        }
-        if self.vrchat.osc.port != default.vrchat.osc.port {
-            osc.insert(
-                "port".to_string(),
-                Value::Integer(i64::from(self.vrchat.osc.port)),
-            );
-        }
-        if self.vrchat.osc.display != default.vrchat.osc.display {
-            osc.insert(
-                "display".to_string(),
-                Value::String(self.vrchat.osc.display.label().to_string()),
-            );
-        }
-        if self.vrchat.osc.show_history != default.vrchat.osc.show_history {
-            osc.insert(
-                "show_history".to_string(),
-                Value::Boolean(self.vrchat.osc.show_history),
-            );
-        }
-        if self.vrchat.osc.retention_secs != default.vrchat.osc.retention_secs {
-            osc.insert(
-                "retention_secs".to_string(),
-                Value::Integer(i64::from(self.vrchat.osc.retention_secs)),
-            );
-        }
-        if !osc.is_empty() {
-            vrchat.insert("osc".to_string(), Value::Table(osc));
-        }
-        insert_table(&mut root, "vrchat", vrchat);
-
-        root
+    ///
+    /// 做法：把 `self` 与 `Self::default()` 分别序列化成 TOML，再递归删掉与默认值相同的项
+    /// 与由此变空的子表。字段只在结构体上声明一次（`derive(Serialize)`），因此不会出现
+    /// 「新增字段忘了写进序列化器、写回时静默丢值」。
+    fn to_toml_table(&self) -> Result<Table> {
+        let value = toml::Value::try_from(self).context("序列化配置失败")?;
+        let defaults = toml::Value::try_from(Self::default()).context("序列化默认配置失败")?;
+        let (Value::Table(mut table), Value::Table(defaults)) = (value, defaults) else {
+            // 顶层是结构体，必然序列化为表；这里只是收窄类型
+            anyhow::bail!("配置序列化结果不是 TOML 表");
+        };
+        prune_defaults(&mut table, &defaults);
+        tidy_floats(&mut table);
+        Ok(table)
     }
 
     /// 去掉各字符串字段的首尾空白，并完成语言代码等归一化。
@@ -884,8 +682,10 @@ impl AppConfig {
             custom.name = trim_optional(custom.name.take());
             for sample in &mut custom.samples {
                 sample.language = sample.language.trim().to_lowercase();
+                trim_path(&mut sample.audio);
             }
         }
+        trim_path(&mut self.cache.file);
     }
 
     /// 校验显式写出的值、取值范围与跨字段约束。
@@ -968,53 +768,7 @@ impl AppConfig {
         }
 
         for (name, custom) in &self.tts.custom_voices {
-            if name.trim().is_empty() {
-                bail!("[tts.custom_voices] 中存在空的配置名");
-            }
-            validate_optional_non_empty(
-                custom.name.as_deref(),
-                &format!("[tts.custom_voices.{name}] name"),
-            )?;
-            if custom.samples.is_empty() {
-                bail!(
-                    "自定义音色 [{name}] 至少要有一个 [[tts.custom_voices.{name}.samples]] 声线样本"
-                );
-            }
-
-            let mut seen_languages = std::collections::HashSet::new();
-            for (index, sample) in custom.samples.iter().enumerate() {
-                if sample.audio.as_os_str().is_empty()
-                    || sample.audio.to_string_lossy().trim().is_empty()
-                {
-                    bail!(
-                        "自定义音色 [{name}] 的第 {} 个声线样本缺少 audio（样例音频路径）",
-                        index + 1
-                    );
-                }
-                if !is_valid_sample_rate(sample.rate) {
-                    bail!(
-                        "自定义音色 [{name}] 的第 {} 个声线样本 rate {:?} 无效；\
-                         语速倍率必须是 {MIN_SAMPLE_RATE}~{MAX_SAMPLE_RATE} 之间的数字（默认 {DEFAULT_SAMPLE_RATE}）",
-                        index + 1,
-                        sample.rate
-                    );
-                }
-                if !is_cloning_language(language::canonical_language(&sample.language)) {
-                    bail!(
-                        "自定义音色 [{name}] 的声线样本 language {:?} 不受支持；\
-                         可用代码: {:?}",
-                        sample.language,
-                        language::CLONING_LANGUAGES
-                    );
-                }
-                let canonical = language::canonical_language(&sample.language).to_string();
-                if !seen_languages.insert(canonical) {
-                    bail!(
-                        "自定义音色 [{name}] 中语言 {:?} 的声线样本重复",
-                        sample.language
-                    );
-                }
-            }
+            validate_custom_voice(name, custom)?;
         }
         Ok(())
     }
@@ -1101,24 +855,141 @@ impl AppConfig {
     }
 }
 
-/// 只在表非空时插入，避免生成 `[section]` 空段。
-fn insert_table(root: &mut Table, name: &str, table: Table) {
-    if !table.is_empty() {
-        root.insert(name.to_string(), Value::Table(table));
+/// 递归删掉与默认值相同的项；因此变空的子表整段丢掉（空配置就是空文件）。
+fn prune_defaults(table: &mut Table, defaults: &Table) {
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        // 默认配置里没有这一项：来自 map 型字段（如 `custom_voices`）的条目。元素自己的
+        // 默认值已在序列化时用 `skip_serializing_if` 省掉，这里原样保留。
+        let Some(default) = defaults.get(&key) else {
+            continue;
+        };
+        let keep = match table.get_mut(&key) {
+            Some(Value::Table(child)) => {
+                if let Value::Table(default_child) = default {
+                    prune_defaults(child, default_child);
+                }
+                !child.is_empty()
+            }
+            Some(value) => *value != *default,
+            None => false,
+        };
+        if !keep {
+            table.remove(&key);
+        }
     }
 }
 
-/// 字符串数组 -> TOML array。
-fn string_array(values: &[String]) -> Value {
-    Value::Array(values.iter().cloned().map(Value::String).collect())
+/// 把 TOML float 收敛成 `f32` 的最短十进制表示。
+///
+/// `serde` 把 `f32` 序列化成 `f64`（`0.42` → `0.41999998688697815`），直接写盘会让配置文件
+/// 难读；这里按「`f32` 的最短表示 → `f64`」还原成 `0.42`。读回时再转回同一个 `f32`，往返无损。
+fn tidy_floats(table: &mut Table) {
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        if let Some(value) = table.get_mut(&key) {
+            tidy_value(value);
+        }
+    }
 }
 
-/// f32 按最短十进制表示转成 TOML float，避免 1.3 写成二进制尾差。
-fn float_value(value: f32) -> Value {
-    match format!("{value}").parse::<f64>() {
-        Ok(value) => Value::Float(value),
-        // best-effort: f32 的 Display 输出一定可被 f64 解析，这里只是不 panic 的兜底。
-        Err(_) => Value::Float(f64::from(value)),
+fn tidy_value(value: &mut Value) {
+    match value {
+        Value::Float(float) => {
+            if let Ok(shortest) = format!("{}", *float as f32).parse::<f64>() {
+                *float = shortest;
+            }
+        }
+        Value::Table(child) => tidy_floats(child),
+        Value::Array(items) => items.iter_mut().for_each(tidy_value),
+        _ => {}
+    }
+}
+
+/// `custom_voices` 的序列化：键名排序，保证写回可复现（`HashMap` 顺序不稳定）。
+fn serialize_custom_voices<S>(
+    voices: &HashMap<String, CustomVoiceConfig>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(voices.len()))?;
+    let mut names: Vec<&String> = voices.keys().collect();
+    names.sort();
+    for name in names {
+        map.serialize_entry(name, &voices[name])?;
+    }
+    map.end()
+}
+
+/// 语速是默认值时省略（缺省即 `DEFAULT_SAMPLE_RATE`）。
+fn is_default_sample_rate(rate: &f32) -> bool {
+    *rate == DEFAULT_SAMPLE_RATE
+}
+
+/// 校验一个自定义音色条目（配置键名 + 内容）。
+///
+/// `[tts.custom_voices]` 与 GUI 的「语音合成」页草稿共用这一份规则：两边各写一份时，
+/// 语言别名（如 `tl` → `fil`）的处理很容易漂移成「配置合法但 GUI 存不回去」。
+pub fn validate_custom_voice(name: &str, custom: &CustomVoiceConfig) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("[tts.custom_voices] 中存在空的配置名");
+    }
+    validate_optional_non_empty(
+        custom.name.as_deref(),
+        &format!("[tts.custom_voices.{name}] name"),
+    )?;
+    if custom.samples.is_empty() {
+        bail!("自定义音色 [{name}] 至少要有一个 [[tts.custom_voices.{name}.samples]] 声线样本");
+    }
+
+    let mut seen_languages = std::collections::HashSet::new();
+    for (index, sample) in custom.samples.iter().enumerate() {
+        if sample.audio.as_os_str().is_empty() || sample.audio.to_string_lossy().trim().is_empty() {
+            bail!(
+                "自定义音色 [{name}] 的第 {} 个声线样本缺少 audio（样例音频路径）",
+                index + 1
+            );
+        }
+        if !is_valid_sample_rate(sample.rate) {
+            bail!(
+                "自定义音色 [{name}] 的第 {} 个声线样本 rate {:?} 无效；\
+                 语速倍率必须是 {MIN_SAMPLE_RATE}~{MAX_SAMPLE_RATE} 之间的数字（默认 {DEFAULT_SAMPLE_RATE}）",
+                index + 1,
+                sample.rate
+            );
+        }
+        if !is_cloning_language(language::canonical_language(&sample.language)) {
+            bail!(
+                "自定义音色 [{name}] 的声线样本 language {:?} 不受支持；可用代码: {:?}",
+                sample.language,
+                language::CLONING_LANGUAGES
+            );
+        }
+        let canonical = language::canonical_language(&sample.language).to_string();
+        if !seen_languages.insert(canonical) {
+            bail!(
+                "自定义音色 [{name}] 中语言 {:?} 的声线样本重复",
+                sample.language
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 去掉路径字段的首尾空白（非 UTF-8 路径原样保留，避免 lossy 转换把路径改坏）。
+///
+/// 与其它字符串字段保持一致：显式空白路径在归一后变成空路径，由 `validate` 拒绝；
+/// 否则 GUI 用 `trim()` 比较、运行期用原值读文件，会表现为「设置页永远显示未保存」。
+fn trim_path(path: &mut PathBuf) {
+    let Some(text) = path.to_str() else {
+        return;
+    };
+    if text.trim().len() != text.len() {
+        *path = PathBuf::from(text.trim());
     }
 }
 
@@ -1682,6 +1553,9 @@ retention_secs = 12
 
         assert_eq!(round.to_toml_string().unwrap(), out, "序列化应稳定");
         assert_eq!(out.matches("rate = ").count(), 1, "默认语速不应写回: {out}");
+        // 浮点按 f32 的最短十进制写回，不出现 0.41999998688697815 这类二进制尾差
+        assert!(out.contains("threshold = 0.42"), "{out}");
+        assert!(out.contains("rate = 1.3"), "{out}");
     }
 
     #[test]

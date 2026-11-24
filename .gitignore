@@ -5,6 +5,8 @@
 /config.toml
 # GUI 写回配置前的备份（便携模式运行产物）
 /config.toml.bak
+# 原子写用的临时文件（写完会 rename 掉；崩溃时可能残留）
+/config.toml.tmp
 # 便携模式运行产物：日志与崩溃记录（若把 exe 放在仓库根）
 /logs/
 /crash.log

@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use eframe::egui;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
@@ -475,9 +474,9 @@ impl BivoxApp {
             return;
         }
         match self.try_save_tts_tab() {
-            Ok(()) => {
+            Ok(config) => {
                 self.voice_edit_error = None;
-                self.reload_config();
+                self.apply_config(config);
                 info!("已保存语音合成设置（{}）", self.paths.config_file.display());
             }
             Err(err) => {
@@ -488,74 +487,71 @@ impl BivoxApp {
         }
     }
 
-    fn try_save_tts_tab(&self) -> anyhow::Result<()> {
+    fn try_save_tts_tab(&self) -> anyhow::Result<AppConfig> {
         let model_dirty = self.tts_model_dirty();
         let drafts_dirty = self.voice_drafts_dirty();
         let voice_dirty = self.voice_input_dirty();
         let dialect_dirty = self.tts_dialect_dirty();
         let wanted_voice = self.voice_draft_value();
 
-        let original = config_edit::read(&self.paths.config_file)?;
-        let mut config = AppConfig::load(&self.paths.config_file)
-            .context("磁盘上的配置已无效，无法保存语音合成设置")?;
-
-        if model_dirty {
-            let model = self.tts_model.trim();
-            if model.is_empty() {
-                anyhow::bail!("合成模型不能为空");
+        config_edit::update(&self.paths.config_file, |config| {
+            if model_dirty {
+                let model = self.tts_model.trim();
+                if model.is_empty() {
+                    anyhow::bail!("合成模型不能为空");
+                }
+                config.tts.model = model.to_string();
             }
-            config.tts.model = model.to_string();
-        }
 
-        if drafts_dirty {
-            let entries = editor::drafts_to_entries(&self.voice_drafts)?;
-            // 样例音频必须存在（相对路径按配置文件目录解析）
-            for (key, voice) in &entries {
-                for sample in &voice.samples {
-                    let path = config.resolve_path(&sample.audio);
-                    if !path.is_file() {
-                        anyhow::bail!("音色 `{key}` 的样例音频不存在：{}", path.display());
+            if drafts_dirty {
+                let entries = editor::drafts_to_entries(&self.voice_drafts)?;
+                // 样例音频必须存在（相对路径按配置文件目录解析）
+                for (key, voice) in &entries {
+                    for sample in &voice.samples {
+                        let path = config.resolve_path(&sample.audio);
+                        if !path.is_file() {
+                            anyhow::bail!("音色 `{key}` 的样例音频不存在：{}", path.display());
+                        }
                     }
+                }
+
+                // 没有显式改当前音色时：生效自定义音色被删除/改名 → 自动回退
+                let current = config.custom_voice_name().map(str::to_string);
+                let fallback = if voice_dirty {
+                    None
+                } else {
+                    current.and_then(|current| {
+                        if entries.iter().any(|(key, _)| key == &current) {
+                            None
+                        } else {
+                            Some(
+                                entries
+                                    .first()
+                                    .map(|(first, _)| format!("{CUSTOM_VOICE_PREFIX}{first}"))
+                                    .unwrap_or_else(|| DEFAULT_VOICE.to_string()),
+                            )
+                        }
+                    })
+                };
+
+                config.tts.custom_voices = entries.into_iter().collect();
+                if let Some(fallback) = fallback {
+                    config.tts.voice = fallback;
                 }
             }
 
-            // 没有显式改当前音色时：生效自定义音色被删除/改名 → 自动回退
-            let current = config.custom_voice_name().map(str::to_string);
-            let fallback = if voice_dirty {
-                None
-            } else {
-                current.and_then(|current| {
-                    if entries.iter().any(|(key, _)| key == &current) {
-                        None
-                    } else {
-                        Some(
-                            entries
-                                .first()
-                                .map(|(first, _)| format!("{CUSTOM_VOICE_PREFIX}{first}"))
-                                .unwrap_or_else(|| DEFAULT_VOICE.to_string()),
-                        )
-                    }
-                })
-            };
-
-            config.tts.custom_voices = entries.into_iter().collect();
-            if let Some(fallback) = fallback {
-                config.tts.voice = fallback;
+            if voice_dirty {
+                if wanted_voice.is_empty() {
+                    anyhow::bail!("当前音色不能为空");
+                }
+                config.tts.voice = wanted_voice;
             }
-        }
 
-        if voice_dirty {
-            if wanted_voice.is_empty() {
-                anyhow::bail!("当前音色不能为空");
+            if dialect_dirty {
+                config.tts.dialect = self.tts_dialect.trim().to_string();
             }
-            config.tts.voice = wanted_voice;
-        }
-
-        if dialect_dirty {
-            config.tts.dialect = self.tts_dialect.trim().to_string();
-        }
-
-        config_edit::save(&self.paths.config_file, &original, &config)
+            Ok(())
+        })
     }
 
     /// 放弃语音合成页的全部改动：自定义音色草稿 + 顶部「当前音色」。
@@ -607,9 +603,9 @@ impl BivoxApp {
             return;
         }
         match self.try_save_asr_tab() {
-            Ok(()) => {
+            Ok(config) => {
                 self.asr_edit_error = None;
-                self.reload_config();
+                self.apply_config(config);
                 info!("已保存语音识别设置（{}）", self.paths.config_file.display());
             }
             Err(err) => {
@@ -620,20 +616,19 @@ impl BivoxApp {
         }
     }
 
-    fn try_save_asr_tab(&self) -> anyhow::Result<()> {
-        let model = self.asr_model.trim();
+    fn try_save_asr_tab(&self) -> anyhow::Result<AppConfig> {
+        let model = self.asr_model.trim().to_string();
         if model.is_empty() {
             anyhow::bail!("识别模型不能为空");
         }
         let hotwords = self.hotwords_draft_list();
         crate::config::validate_hotwords(&hotwords)?;
 
-        let original = config_edit::read(&self.paths.config_file)?;
-        let mut config = AppConfig::load(&self.paths.config_file)
-            .context("磁盘上的配置已无效，无法保存语音识别设置")?;
-        config.asr.model = model.to_string();
-        config.asr.hotwords = hotwords;
-        config_edit::save(&self.paths.config_file, &original, &config)
+        config_edit::update(&self.paths.config_file, |config| {
+            config.asr.model = model;
+            config.asr.hotwords = hotwords;
+            Ok(())
+        })
     }
 
     /// 放弃语音识别页的全部改动，恢复为配置文件里的值。
@@ -660,9 +655,9 @@ impl BivoxApp {
             return;
         }
         match self.try_save_self_tab() {
-            Ok(()) => {
+            Ok(config) => {
                 self.self_edit_error = None;
-                self.reload_config();
+                self.apply_config(config);
                 info!("已保存「自己」设置（{}）", self.paths.config_file.display());
             }
             Err(err) => {
@@ -673,18 +668,17 @@ impl BivoxApp {
         }
     }
 
-    fn try_save_self_tab(&self) -> anyhow::Result<()> {
+    fn try_save_self_tab(&self) -> anyhow::Result<AppConfig> {
         if self.self_languages.is_empty() {
             anyhow::bail!("语言列表不能为空（至少保留一种语言）");
         }
-        let original = config_edit::read(&self.paths.config_file)?;
-        let mut config = AppConfig::load(&self.paths.config_file)
-            .context("磁盘上的配置已无效，无法保存「自己」设置")?;
-        config.local.languages = self.self_languages.clone();
-        config.local.translate = self.self_translate;
-        config.local.target = self.self_target.clone();
-        config.local.tts = self.self_tts;
-        config_edit::save(&self.paths.config_file, &original, &config)
+        config_edit::update(&self.paths.config_file, |config| {
+            config.local.languages = self.self_languages.clone();
+            config.local.translate = self.self_translate;
+            config.local.target = self.self_target.clone();
+            config.local.tts = self.self_tts;
+            Ok(())
+        })
     }
 
     /// 放弃「自己」页的改动，恢复为配置文件里的值。
@@ -710,9 +704,9 @@ impl BivoxApp {
             return;
         }
         match self.try_save_others_tab() {
-            Ok(()) => {
+            Ok(config) => {
                 self.others_edit_error = None;
-                self.reload_config();
+                self.apply_config(config);
                 info!("已保存「他人」设置（{}）", self.paths.config_file.display());
             }
             Err(err) => {
@@ -723,17 +717,16 @@ impl BivoxApp {
         }
     }
 
-    fn try_save_others_tab(&self) -> anyhow::Result<()> {
+    fn try_save_others_tab(&self) -> anyhow::Result<AppConfig> {
         if self.others_languages.is_empty() {
             anyhow::bail!("语言列表不能为空（至少保留一种语言）");
         }
-        let original = config_edit::read(&self.paths.config_file)?;
-        let mut config = AppConfig::load(&self.paths.config_file)
-            .context("磁盘上的配置已无效，无法保存「他人」设置")?;
-        config.others.languages = self.others_languages.clone();
-        config.others.translate = self.others_translate;
-        config.others.target = self.others_target.clone();
-        config_edit::save(&self.paths.config_file, &original, &config)
+        config_edit::update(&self.paths.config_file, |config| {
+            config.others.languages = self.others_languages.clone();
+            config.others.translate = self.others_translate;
+            config.others.target = self.others_target.clone();
+            Ok(())
+        })
     }
 
     /// 放弃「他人」页的改动，恢复为配置文件里的值。
@@ -945,8 +938,9 @@ impl BivoxApp {
             config.local.mic = enabled;
             Ok(())
         }) {
-            Ok(()) => {
-                self.config.local.mic = enabled;
+            Ok(config) => {
+                // 快捷开关不算 D20 热重启（D43）：直接换上新配置，再刷运行指纹
+                self.config = config;
                 if let Some(session) = &self.session {
                     session.set_mic_enabled(enabled);
                 }
@@ -981,8 +975,9 @@ impl BivoxApp {
             config.others.enabled = enabled;
             Ok(())
         }) {
-            Ok(()) => {
-                self.config.others.enabled = enabled;
+            Ok(config) => {
+                // 快捷开关不算 D20 热重启（D43）：直接换上新配置，再刷运行指纹
+                self.config = config;
                 if let Some(session) = &self.session {
                     session.set_others_enabled(enabled);
                 }
@@ -1026,37 +1021,36 @@ impl BivoxApp {
         self.vad_active = false;
         self.timeline.drop_open(Speaker::Local);
         self.refresh_running_signature();
-        if let Err(err) = self.write_config(|config| {
+        match self.write_config(|config| {
             config.local.mic = false;
             Ok(())
         }) {
-            let message = format!("{err:#}");
-            self.config_write_error = Some(message.clone());
-            self.config_write_error_tab = None;
-            warn!("麦克风启动失败后写回关闭状态失败：{message}");
+            Ok(config) => self.config = config,
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.config_write_error = Some(message.clone());
+                self.config_write_error_tab = None;
+                warn!("麦克风启动失败后写回关闭状态失败：{message}");
+            }
         }
         self.pipeline_warning = Some(format!("麦克风线路启动失败，已自动关闭：{detail}"));
         warn!("麦克风线路启动失败，已自动关闭：{detail}");
     }
 
-    /// 读原文 → 解析为类型化配置 → 修改 → 最小化序列化并写回。
+    /// 读原文 → 解析为类型化配置 → 修改 → 最小化序列化并写回；返回写好的配置。
+    ///
+    /// 调用方把返回值交给 [`Self::apply_config`]（或直接赋给 `config`），不要重新读盘。
     fn write_config(
         &mut self,
         edit: impl FnOnce(&mut AppConfig) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let original = config_edit::read(&self.paths.config_file)?;
-        let mut config = AppConfig::load(&self.paths.config_file)
-            .context("磁盘上的配置已无效，已拒绝写回（请先修正或删除配置文件）")?;
-        edit(&mut config)?;
-        config_edit::save(&self.paths.config_file, &original, &config)
+    ) -> anyhow::Result<AppConfig> {
+        config_edit::update(&self.paths.config_file, edit)
     }
 
-    fn finish_config_write(&mut self, result: anyhow::Result<()>, success_message: &str) {
+    fn finish_config_write(&mut self, result: anyhow::Result<AppConfig>, success_message: &str) {
         match result {
-            Ok(()) => {
-                self.config_write_error = None;
-                self.config_write_error_tab = None;
-                self.reload_config();
+            Ok(config) => {
+                self.apply_config(config);
                 info!("{success_message}（{}）", self.paths.config_file.display());
             }
             Err(err) => {

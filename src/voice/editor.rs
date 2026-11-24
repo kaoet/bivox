@@ -2,16 +2,13 @@
 //!
 //! GUI 流程：`drafts_from_config` 读出草稿 → 界面直接改草稿（含每个样本的语速）→
 //! `drafts_to_entries` 校验并生成 `(配置键名, CustomVoiceConfig)` 列表 →
-//! 合并进 `AppConfig` 后由 `config_edit::save` 写回（写前校验 + `.bak`）。
+//! 合并进 `AppConfig` 后由 `config_edit::update` 写回（写前校验 + `.bak` + 原子替换）。
 
 use std::collections::HashSet;
 
 use anyhow::{Result, bail};
 
-use crate::config::{
-    AppConfig, CustomVoiceConfig, CustomVoiceSample, DEFAULT_SAMPLE_RATE, MAX_SAMPLE_RATE,
-    MIN_SAMPLE_RATE, is_valid_sample_rate,
-};
+use crate::config::{AppConfig, CustomVoiceConfig, CustomVoiceSample};
 
 /// 一个自定义音色的编辑草稿。
 ///
@@ -112,6 +109,10 @@ pub fn drafts_from_config(config: &AppConfig) -> Vec<VoiceDraft> {
 }
 
 /// 校验草稿并转成写回用的 `(配置键名, 音色)` 列表（保留草稿顺序）。
+///
+/// 条目的字段规则（语言别名归一、样例音频、语速范围）统一走
+/// [`crate::config::validate_custom_voice`]，避免与配置校验各写一份而漂移；
+/// 这里只额外检查「键名不能空 / 不能重复」这类只在草稿列表里成立的约束。
 pub fn drafts_to_entries(drafts: &[VoiceDraft]) -> Result<Vec<(String, CustomVoiceConfig)>> {
     let mut keys = HashSet::new();
     let mut entries = Vec::with_capacity(drafts.len());
@@ -124,35 +125,10 @@ pub fn drafts_to_entries(drafts: &[VoiceDraft]) -> Result<Vec<(String, CustomVoi
         if !keys.insert(key.to_string()) {
             bail!("配置键名 `{key}` 重复");
         }
-        if draft.samples.is_empty() {
-            bail!("音色 `{key}` 至少需要一个声线样本");
-        }
 
-        let mut languages = HashSet::new();
-        for (sample_index, sample) in draft.samples.iter().enumerate() {
-            let language = sample.language.trim();
-            if language.is_empty() {
-                bail!("音色 `{key}` 的第 {} 个样本缺少语言", sample_index + 1);
-            }
-            if !crate::language::is_cloning_language(language) {
-                bail!("音色 `{key}` 的语言 `{language}` 不在声音复刻支持列表里");
-            }
-            if !languages.insert(language.to_string()) {
-                bail!("音色 `{key}` 的语言 `{language}` 重复，请删除多余样本");
-            }
-            if sample.audio.trim().is_empty() {
-                bail!("音色 `{key}` 的语言 `{language}` 缺少样例音频");
-            }
-            if !is_valid_sample_rate(sample.rate) {
-                bail!(
-                    "音色 `{key}` 的语言 `{language}` 的语速 {} 无效；\
-                     语速倍率必须在 {MIN_SAMPLE_RATE}~{MAX_SAMPLE_RATE} 之间（默认 {DEFAULT_SAMPLE_RATE}）",
-                    sample.rate
-                );
-            }
-        }
-
-        entries.push((key.to_string(), draft.to_config()));
+        let entry = draft.to_config();
+        crate::config::validate_custom_voice(key, &entry)?;
+        entries.push((key.to_string(), entry));
     }
 
     Ok(entries)
@@ -169,6 +145,7 @@ pub fn config_audio_path(exe_dir: &std::path::Path, picked: &std::path::Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_SAMPLE_RATE;
 
     const TOML: &str = r#"
 [api]
@@ -254,6 +231,7 @@ audio = "C:/voices/b-ja.wav"
 
         let err = |drafts: &[VoiceDraft]| drafts_to_entries(drafts).unwrap_err().to_string();
 
+        // 报错文案来自 `config::validate_custom_voice`（草稿与配置文件共用一份规则）
         assert!(err(&[draft("", vec![sample("zh", "a.wav")])]).contains("键名不能为空"));
         assert!(
             err(&[
@@ -262,9 +240,9 @@ audio = "C:/voices/b-ja.wav"
             ])
             .contains("重复")
         );
-        assert!(err(&[draft("a", vec![])]).contains("至少需要一个声线样本"));
-        assert!(err(&[draft("a", vec![sample("", "a.wav")])]).contains("缺少语言"));
-        assert!(err(&[draft("a", vec![sample("xx", "a.wav")])]).contains("不在声音复刻支持列表"));
+        assert!(err(&[draft("a", vec![])]).contains("至少要有一个"));
+        assert!(err(&[draft("a", vec![sample("", "a.wav")])]).contains("不受支持"));
+        assert!(err(&[draft("a", vec![sample("xx", "a.wav")])]).contains("不受支持"));
         assert!(
             err(&[draft(
                 "a",
@@ -272,7 +250,7 @@ audio = "C:/voices/b-ja.wav"
             )])
             .contains("重复")
         );
-        assert!(err(&[draft("a", vec![sample("zh", "  ")])]).contains("缺少样例音频"));
+        assert!(err(&[draft("a", vec![sample("zh", "  ")])]).contains("缺少 audio"));
         assert!(
             err(&[draft(
                 "a",
@@ -283,6 +261,17 @@ audio = "C:/voices/b-ja.wav"
                 }]
             )])
             .contains("语速")
+        );
+
+        // 语言别名按归一后的代码判断：`tl`（菲律宾语）等于 `fil`，不能因为配置里存的是
+        // 别名就拒绝保存（否则会出现「配置合法但 GUI 存不回去」）。
+        assert!(drafts_to_entries(&[draft("a", vec![sample("tl", "a.wav")])]).is_ok());
+        assert!(
+            err(&[draft(
+                "a",
+                vec![sample("tl", "a.wav"), sample("fil", "b.wav")]
+            )])
+            .contains("重复")
         );
     }
 
