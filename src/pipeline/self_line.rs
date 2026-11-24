@@ -144,6 +144,33 @@ async fn next_incoming(
     }
 }
 
+/// 把 VAD 状态变化推给界面（顶栏电平条配色），降级时只告警一次。
+///
+/// 静音期没有 ASR 事件，所以 Tick 与每条 ASR 事件处理完都要调一次。
+fn report_vad(
+    handle: &PipelineSessionHandle,
+    emit: &mut (dyn FnMut(PipelineEvent) + Send),
+    last_active: &mut bool,
+    degraded_reported: &mut bool,
+) {
+    let vad_active = handle.vad_active();
+    if vad_active != *last_active {
+        *last_active = vad_active;
+        emit(PipelineEvent::VadActive {
+            speaker: Speaker::Local,
+            active: vad_active,
+        });
+    }
+    if handle.vad_degraded() && !*degraded_reported {
+        *degraded_reported = true;
+        log::error!("本地 VAD 推理失败，已降级为全量上传音频");
+        emit(PipelineEvent::Warning {
+            context: "本地 VAD 推理失败".to_string(),
+            detail: "已降级为全量上传音频（会增加 ASR 费用）；停止后重新开始会话可重试".to_string(),
+        });
+    }
+}
+
 /// 运行调度循环，直到会话被取消或任一后台通道关闭。
 pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send)) {
     let Params {
@@ -211,23 +238,12 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                     break;
                 }
                 // 静音期间没有 ASR 事件，也要把 VAD 状态变化推给界面
-                let vad_active = handle.vad_active();
-                if vad_active != last_vad_active {
-                    last_vad_active = vad_active;
-                    emit(PipelineEvent::VadActive {
-                        speaker: Speaker::Local,
-                        active: vad_active,
-                    });
-                }
-                if handle.vad_degraded() && !vad_degraded_reported {
-                    vad_degraded_reported = true;
-                    log::error!("本地 VAD 推理失败，已降级为全量上传音频");
-                    emit(PipelineEvent::Warning {
-                        context: "本地 VAD 推理失败".to_string(),
-                        detail: "已降级为全量上传音频（会增加 ASR 费用）；停止后重新开始会话可重试"
-                            .to_string(),
-                    });
-                }
+                report_vad(
+                    handle,
+                    emit,
+                    &mut last_vad_active,
+                    &mut vad_degraded_reported,
+                );
             }
             Incoming::Typed(None) => {
                 // 发送端已释放（通常会话正在结束），不再轮询该分支。
@@ -244,24 +260,11 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                     if let Some(runtime) = translation.as_mut() {
                         // 翻译模式：立即收口旧 TTS task、丢弃该句未返回的译文，
                         // 再把打字内容交给翻译 worker（结果回来后才送 TTS/字幕）。
-                        if runtime.tts_open
-                            && !runtime.tts_closed
-                            && !tts.finish(&runtime.target_language).await
-                        {
+                        if !runtime.finish_if_open(&tts).await {
                             break;
                         }
                         // 旧句已有部分译文：先让界面把当前句归档，避免被下一句覆盖。
-                        if !runtime.end_event_sent {
-                            emit(PipelineEvent::Translation {
-                                speaker: Speaker::Local,
-                                text: runtime.translated.clone(),
-                                sent_bytes: runtime.translated.len(),
-                                is_sentence_end: true,
-                                language: runtime.target_language.clone(),
-                                sentence_id: runtime.sentence_id,
-                            });
-                            runtime.end_event_sent = true;
-                        }
+                        runtime.emit_end_if_needed(emit);
                         runtime.bump_generation();
                         chunker.reset();
                         language_state.on_event("", true);
@@ -447,25 +450,10 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                         if runtime.pending > 0 {
                             runtime.finish_pending = true;
                         } else {
-                            if runtime.tts_open && !runtime.tts_closed {
-                                if !tts.finish(&runtime.target_language).await {
-                                    break;
-                                }
-                                runtime.tts_closed = true;
+                            if !runtime.finish_if_open(&tts).await {
+                                break;
                             }
-                            if !runtime.end_event_sent {
-                                // 即使没有任何译文（例如全部翻译失败）也要收口当前句，
-                                // 否则界面上的源文行会一直挂着。
-                                emit(PipelineEvent::Translation {
-                                    speaker: Speaker::Local,
-                                    text: runtime.translated.clone(),
-                                    sent_bytes: runtime.translated.len(),
-                                    is_sentence_end: true,
-                                    language: runtime.target_language.clone(),
-                                    sentence_id: runtime.sentence_id,
-                                });
-                                runtime.end_event_sent = true;
-                            }
+                            runtime.emit_end_if_needed(emit);
                             runtime.reset_sentence();
                         }
                     }
@@ -529,14 +517,12 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                 }
 
                 // 处理 ASR 事件后同样检查 VAD 状态变化（语音段起止）
-                let vad_active = handle.vad_active();
-                if vad_active != last_vad_active {
-                    last_vad_active = vad_active;
-                    emit(PipelineEvent::VadActive {
-                        speaker: Speaker::Local,
-                        active: vad_active,
-                    });
-                }
+                report_vad(
+                    handle,
+                    emit,
+                    &mut last_vad_active,
+                    &mut vad_degraded_reported,
+                );
 
                 if handle.is_cancelled() {
                     break;
@@ -588,42 +574,20 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                         sentence_id: runtime.sentence_id,
                     });
                     runtime.end_event_sent = done.is_sentence_end;
-                } else if done.is_sentence_end && runtime.tts_open && !runtime.tts_closed {
+                } else if done.is_sentence_end {
                     // 译文为空也要收口：发「只结束」请求，让 TTS 侧正常 finish-task。
-                    if !tts.finish(&runtime.target_language).await {
+                    if !runtime.finish_if_open(&tts).await {
                         break;
                     }
-                    runtime.tts_closed = true;
-                    emit(PipelineEvent::Translation {
-                        speaker: Speaker::Local,
-                        text: runtime.translated.clone(),
-                        sent_bytes: runtime.translated.len(),
-                        is_sentence_end: true,
-                        language: runtime.target_language.clone(),
-                        sentence_id: runtime.sentence_id,
-                    });
-                    runtime.end_event_sent = true;
+                    runtime.emit_end_if_needed(emit);
                 }
 
                 // 句终屏障：源文已句终且最后一条译文刚回来，补一个收口请求并复位本句状态。
                 if runtime.pending == 0 && (runtime.finish_pending || done.is_sentence_end) {
-                    if runtime.tts_open && !runtime.tts_closed {
-                        if !tts.finish(&runtime.target_language).await {
-                            break;
-                        }
-                        runtime.tts_closed = true;
+                    if !runtime.finish_if_open(&tts).await {
+                        break;
                     }
-                    if !runtime.end_event_sent {
-                        emit(PipelineEvent::Translation {
-                            speaker: Speaker::Local,
-                            text: runtime.translated.clone(),
-                            sent_bytes: runtime.translated.len(),
-                            is_sentence_end: true,
-                            language: runtime.target_language.clone(),
-                            sentence_id: runtime.sentence_id,
-                        });
-                        runtime.end_event_sent = true;
-                    }
+                    runtime.emit_end_if_needed(emit);
                     runtime.reset_sentence();
                 }
 
@@ -688,6 +652,43 @@ impl TranslationRuntime {
         self.sentence_id = None;
         self.source_language = None;
         self.finish_pending = false;
+    }
+
+    /// 若当前 TTS task 还开着，补一个「只结束、不追加文本」的请求并标记已关闭。
+    ///
+    /// 四处收口（打字打断、源文句终、译文为空句终、句终屏障解除）共用这一份；
+    /// 返回 `false` 表示 TTS 任务已退出（会话该结束）。
+    async fn finish_if_open(&mut self, tts: &TtsSink<'_>) -> bool {
+        if !(self.tts_open && !self.tts_closed) {
+            return true;
+        }
+        if !tts.finish(&self.target_language).await {
+            return false;
+        }
+        self.tts_closed = true;
+        true
+    }
+
+    /// 句终事件：把当前累计译文（可能为空）作为最后一条 [`PipelineEvent::Translation`]。
+    ///
+    /// 即使一句译文都没有（例如全部翻译失败）也要发，否则界面上的原文行会一直挂着。
+    fn end_event(&self) -> PipelineEvent {
+        PipelineEvent::Translation {
+            speaker: Speaker::Local,
+            text: self.translated.clone(),
+            sent_bytes: self.translated.len(),
+            is_sentence_end: true,
+            language: self.target_language.clone(),
+            sentence_id: self.sentence_id,
+        }
+    }
+
+    /// 需要时发送句终事件（同一句只发一次）。
+    fn emit_end_if_needed(&mut self, emit: &mut (dyn FnMut(PipelineEvent) + Send)) {
+        if !self.end_event_sent {
+            emit(self.end_event());
+            self.end_event_sent = true;
+        }
     }
 }
 
@@ -886,5 +887,66 @@ mod tests {
         );
         assert_eq!(long.chars().count(), MAX_TYPED_INPUT_CHARS);
         assert!(long.is_char_boundary(long.len()));
+    }
+
+    fn runtime_with_target(
+        target: &str,
+    ) -> (TranslationRuntime, UnboundedReceiver<TranslationJob>) {
+        let (tx_job, rx_job) = tokio::sync::mpsc::unbounded_channel();
+        (TranslationRuntime::new(target.to_string(), tx_job), rx_job)
+    }
+
+    #[tokio::test]
+    async fn finish_if_open_only_closes_an_open_task() {
+        let (mut runtime, _jobs) = runtime_with_target("en");
+        let (tts_tx, _tts_rx) = mpsc::channel(4);
+        let tts = TtsSink {
+            tx: Some(tts_tx),
+            voice: None,
+        };
+
+        // 任务没开着：什么都不做
+        assert!(runtime.finish_if_open(&tts).await);
+        assert!(!runtime.tts_closed);
+
+        // 任务开着：标记为已关闭（只发「结束」，不追加文本）
+        runtime.tts_open = true;
+        assert!(runtime.finish_if_open(&tts).await);
+        assert!(runtime.tts_closed);
+
+        // 已关闭后再调用不会改变状态
+        assert!(runtime.finish_if_open(&tts).await);
+        assert!(runtime.tts_closed);
+    }
+
+    #[tokio::test]
+    async fn emit_end_if_needed_sends_one_end_event_per_sentence() {
+        let (mut runtime, _jobs) = runtime_with_target("ja");
+        runtime.translated = "译文".to_string();
+        runtime.sentence_id = Some(7);
+
+        let mut events = Vec::new();
+        let mut emit = |event| events.push(event);
+        runtime.emit_end_if_needed(&mut emit);
+        runtime.emit_end_if_needed(&mut emit);
+
+        assert_eq!(events.len(), 1, "同一句只发一次句终事件");
+        let PipelineEvent::Translation {
+            speaker,
+            text,
+            sent_bytes,
+            is_sentence_end,
+            language,
+            sentence_id,
+        } = &events[0]
+        else {
+            panic!("应为 Translation 事件");
+        };
+        assert_eq!(*speaker, Speaker::Local);
+        assert_eq!(text, "译文");
+        assert_eq!(*sent_bytes, "译文".len());
+        assert!(*is_sentence_end);
+        assert_eq!(language, "ja");
+        assert_eq!(*sentence_id, Some(7));
     }
 }
