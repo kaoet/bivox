@@ -45,10 +45,10 @@ impl AudioPlaybackHandle {
         if let Ok(mut queue) = self.sample_queue.lock() {
             queue.clear();
         }
-        if let Some(ref resampler_mutex) = self.resampler {
-            if let Ok(mut resampler) = resampler_mutex.lock() {
-                resampler.input_fifo.clear();
-            }
+        if let Some(ref resampler_mutex) = self.resampler
+            && let Ok(mut resampler) = resampler_mutex.lock()
+        {
+            resampler.input_fifo.clear();
         }
     }
 

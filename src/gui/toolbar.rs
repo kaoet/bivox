@@ -8,16 +8,15 @@ use eframe::egui;
 use crate::app::BivoxApp;
 use crate::events::SessionState;
 use crate::gui::meter::{self, AudioIcon, MeterSpec, VadVisual};
+use crate::gui::theme;
 
 /// 状态灯颜色。
 fn state_color(state: SessionState) -> egui::Color32 {
     match state {
         SessionState::Idle => egui::Color32::GRAY,
-        SessionState::Starting | SessionState::Stopping => {
-            egui::Color32::from_rgb(0xd8, 0x9a, 0x1b)
-        }
-        SessionState::Running => egui::Color32::from_rgb(0x3c, 0xc9, 0x6f),
-        SessionState::Failed => egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+        SessionState::Starting | SessionState::Stopping => theme::AMBER,
+        SessionState::Running => theme::GREEN,
+        SessionState::Failed => theme::RED,
     }
 }
 

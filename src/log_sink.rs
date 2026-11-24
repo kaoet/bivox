@@ -213,18 +213,18 @@ impl log::Log for Sink {
         // `colored` 生成的 ANSI 颜色码在 GUI/日志文件里没有意义，会出现 `[36m` 之类的乱码
         let message = strip_ansi(&record.args().to_string());
 
-        if let Ok(mut guard) = self.file.lock() {
-            if let Some(file) = guard.as_mut() {
-                // best-effort: 日志写盘失败不应影响主流程
-                let _ = writeln!(
-                    file,
-                    "[{}] {:5} {}",
-                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
-                    record.level(),
-                    message
-                );
-                let _ = file.flush();
-            }
+        if let Ok(mut guard) = self.file.lock()
+            && let Some(file) = guard.as_mut()
+        {
+            // best-effort: 日志写盘失败不应影响主流程
+            let _ = writeln!(
+                file,
+                "[{}] {:5} {}",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                record.level(),
+                message
+            );
+            let _ = file.flush();
         }
 
         if let Ok(mut pending) = self.pending.lock() {
@@ -240,11 +240,11 @@ impl log::Log for Sink {
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.file.lock() {
-            if let Some(file) = guard.as_mut() {
-                // best-effort: 退出前尽力把日志刷到磁盘
-                let _ = file.flush();
-            }
+        if let Ok(mut guard) = self.file.lock()
+            && let Some(file) = guard.as_mut()
+        {
+            // best-effort: 退出前尽力把日志刷到磁盘
+            let _ = file.flush();
         }
     }
 }

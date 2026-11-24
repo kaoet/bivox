@@ -7,46 +7,23 @@
 use eframe::egui;
 
 use crate::app::{BivoxApp, Tab};
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
+use crate::gui::{theme, widgets};
 
 pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_salt("settings_scroll")
         .show(ui, |ui| {
-            let mut save = false;
-            let mut reset = false;
-            ui.horizontal(|ui| {
-                ui.heading("设置");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dirty = app.settings_tab_dirty();
-                    if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
-                        save = true;
-                    }
-                    if ui
-                        .add_enabled(dirty, egui::Button::new("放弃更改"))
-                        .clicked()
-                    {
-                        reset = true;
-                    }
-                    if dirty {
-                        ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-                    }
-                });
-            });
-            if save {
+            let action = widgets::save_bar(ui, "设置", app.settings_tab_dirty());
+            if action.save {
                 app.save_settings_tab();
             }
-            if reset {
+            if action.reset {
                 app.reset_settings_tab();
             }
-            if let Some(error) = app.config_write_error_for(Tab::Settings) {
-                ui.colored_label(RED, format!("保存失败：{error}"));
-            }
+            widgets::error_line(ui, app.config_write_error_for(Tab::Settings));
             if let Some(notice) = &app.api_key_notice {
-                ui.colored_label(AMBER, notice);
+                ui.colored_label(theme::AMBER, notice);
             }
             ui.label(
                 egui::RichText::new(

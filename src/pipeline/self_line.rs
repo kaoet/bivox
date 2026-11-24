@@ -99,6 +99,51 @@ impl TtsSink<'_> {
     }
 }
 
+/// 调度循环的一次输入。
+enum Incoming {
+    Typed(Option<TypedInput>),
+    Asr(Option<AsrEvent>),
+    Mt(Option<TranslationDone>),
+    Tick,
+}
+
+/// 取下一个要处理的事件。
+///
+/// 句终屏障未完成时先不把下一句的 ASR 事件交给分块器/界面：等上一句最后一条译文
+/// 回来、句终事件发出后，再按原顺序补处理缓存里的事件。没有缓存事件时等待任意来源。
+async fn next_incoming(
+    barrier_pending: bool,
+    asr_backlog: &mut VecDeque<AsrEvent>,
+    typed_rx: &mut UnboundedReceiver<TypedInput>,
+    typed_rx_open: bool,
+    rx_mt: &mut Option<UnboundedReceiver<TranslationDone>>,
+    asr_events: &mut Option<mpsc::Receiver<AsrEvent>>,
+) -> Incoming {
+    if !barrier_pending && let Some(event) = asr_backlog.pop_front() {
+        return Incoming::Asr(Some(event));
+    }
+
+    tokio::select! {
+        // 打字输入优先于还没处理的 ASR 事件：按下回车后不再多送当前句的 chunk。
+        biased;
+        cmd = typed_rx.recv(), if typed_rx_open => Incoming::Typed(cmd),
+        // 翻译结果要先于后续 ASR 事件处理，保证 TTS 入队顺序与源文一致。
+        done = async {
+            match rx_mt.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending::<Option<TranslationDone>>().await,
+            }
+        } => Incoming::Mt(done),
+        event = async {
+            match asr_events.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending::<Option<AsrEvent>>().await,
+            }
+        } => Incoming::Asr(event),
+        _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => Incoming::Tick,
+    }
+}
+
 /// 运行调度循环，直到会话被取消或任一后台通道关闭。
 pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send)) {
     let Params {
@@ -144,45 +189,21 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
     // 本地 VAD 降级为全量上传时只告警一次
     let mut vad_degraded_reported = false;
 
-    enum Incoming {
-        Typed(Option<TypedInput>),
-        Asr(Option<AsrEvent>),
-        Mt(Option<TranslationDone>),
-        Tick,
-    }
-
     loop {
         // 句终屏障未完成时先不把下一句的 ASR 事件交给分块器/界面：等上一句最后一条
         // 译文回来、句终事件发出后，再按原顺序处理缓存里的事件。
-        let incoming = loop {
-            let barrier_pending = translation
-                .as_ref()
-                .is_some_and(|runtime| runtime.finish_pending);
-            if !barrier_pending {
-                if let Some(event) = asr_backlog.pop_front() {
-                    break Incoming::Asr(Some(event));
-                }
-            }
-            break tokio::select! {
-                // 打字输入优先于还没处理的 ASR 事件：按下回车后不再多送当前句的 chunk。
-                biased;
-                cmd = typed_rx.recv(), if typed_rx_open => Incoming::Typed(cmd),
-                // 翻译结果要先于后续 ASR 事件处理，保证 TTS 入队顺序与源文一致。
-                done = async {
-                    match rx_mt.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending::<Option<TranslationDone>>().await,
-                    }
-                } => Incoming::Mt(done),
-                event = async {
-                    match asr_events.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending::<Option<AsrEvent>>().await,
-                    }
-                } => Incoming::Asr(event),
-                _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => Incoming::Tick,
-            };
-        };
+        let barrier_pending = translation
+            .as_ref()
+            .is_some_and(|runtime| runtime.finish_pending);
+        let incoming = next_incoming(
+            barrier_pending,
+            &mut asr_backlog,
+            &mut typed_rx,
+            typed_rx_open,
+            &mut rx_mt,
+            &mut asr_events,
+        )
+        .await;
 
         match incoming {
             Incoming::Tick => {
@@ -223,10 +244,11 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                     if let Some(runtime) = translation.as_mut() {
                         // 翻译模式：立即收口旧 TTS task、丢弃该句未返回的译文，
                         // 再把打字内容交给翻译 worker（结果回来后才送 TTS/字幕）。
-                        if runtime.tts_open && !runtime.tts_closed {
-                            if !tts.finish(&runtime.target_language).await {
-                                break;
-                            }
+                        if runtime.tts_open
+                            && !runtime.tts_closed
+                            && !tts.finish(&runtime.target_language).await
+                        {
+                            break;
                         }
                         // 旧句已有部分译文：先让界面把当前句归档，避免被下一句覆盖。
                         if !runtime.end_event_sent {
@@ -485,12 +507,12 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
 
                     // 句终但本事件没有可送的新文本（chunker 已消费完）：TTS 侧 task 还开着，
                     // 补一个「只结束、不追加文本」的请求，避免下一句的音色/语言漏进旧 task。
-                    if event.is_sentence_end && !sent_sentence_end {
-                        if let Some(language) = tts_task_language.clone() {
-                            if tts.finish(&language).await {
-                                sent_sentence_end = true;
-                            }
-                        }
+                    if event.is_sentence_end
+                        && !sent_sentence_end
+                        && let Some(language) = tts_task_language.clone()
+                        && tts.finish(&language).await
+                    {
+                        sent_sentence_end = true;
                     }
 
                     // 带上「已送入 TTS 的字节前缀」：界面把这段显示为正常色，其余显示为弱色；

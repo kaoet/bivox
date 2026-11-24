@@ -8,10 +8,7 @@
 use eframe::egui;
 
 use crate::app::{BivoxApp, Tab};
-use crate::gui::widgets;
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
+use crate::gui::{theme, widgets};
 
 /// 从配置里取出当前设备设置（`None` = 系统默认）。
 fn current_devices(app: &BivoxApp) -> (Option<String>, Option<String>) {
@@ -30,9 +27,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
-    if let Some(error) = app.config_write_error_for(Tab::Audio) {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.config_write_error_for(Tab::Audio));
     ui.add_space(8.0);
 
     let (configured_input, configured_output) = current_devices(app);
@@ -61,21 +56,18 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     }
 
     let mut mismatch = Vec::new();
-    if let Some(name) = &configured_input {
-        if !input_names.contains(name) {
-            mismatch.push(format!("配置的输入设备 {name:?} 不在当前设备列表中"));
-        }
+    if let Some(name) = &configured_input
+        && !input_names.contains(name)
+    {
+        mismatch.push(format!("配置的输入设备 {name:?} 不在当前设备列表中"));
     }
-    if let Some(name) = &configured_output {
-        if !output_names.contains(name) {
-            mismatch.push(format!("配置的输出设备 {name:?} 不在当前设备列表中"));
-        }
+    if let Some(name) = &configured_output
+        && !output_names.contains(name)
+    {
+        mismatch.push(format!("配置的输出设备 {name:?} 不在当前设备列表中"));
     }
     for message in mismatch {
-        ui.colored_label(
-            egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
-            format!("⚠ {message}（可能已改名或被拔掉）"),
-        );
+        ui.colored_label(theme::AMBER, format!("⚠ {message}（可能已改名或被拔掉）"));
     }
 
     if input != configured_input || output != configured_output {
@@ -127,22 +119,11 @@ fn show_vad_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
     });
 
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let dirty = app.vad_settings_dirty();
-        if ui
-            .add_enabled(dirty, egui::Button::new("保存 VAD 设置"))
-            .clicked()
-        {
-            app.save_vad_settings();
-        }
-        if ui
-            .add_enabled(dirty, egui::Button::new("放弃更改"))
-            .clicked()
-        {
-            app.reset_vad_settings();
-        }
-        if dirty {
-            ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-        }
-    });
+    let action = widgets::save_row(ui, "保存 VAD 设置", app.vad_settings_dirty());
+    if action.save {
+        app.save_vad_settings();
+    }
+    if action.reset {
+        app.reset_vad_settings();
+    }
 }

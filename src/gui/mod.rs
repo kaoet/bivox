@@ -5,6 +5,8 @@
 
 pub mod asr_tab;
 pub mod audio_tab;
+pub mod bubble;
+pub mod drag_reorder;
 pub mod language_list;
 pub mod log_panel;
 pub mod meter;
@@ -12,6 +14,7 @@ pub mod others_tab;
 pub mod realtime_tab;
 pub mod self_tab;
 pub mod settings_tab;
+pub mod theme;
 pub mod toolbar;
 pub mod translate_tab;
 pub mod tts_current_voice;

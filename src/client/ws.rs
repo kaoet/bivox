@@ -129,10 +129,10 @@ where
 
         match msg {
             Some(Ok(Message::Text(text))) => {
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    if predicate(&value) {
-                        return Ok(value);
-                    }
+                if let Ok(value) = serde_json::from_str::<Value>(&text)
+                    && predicate(&value)
+                {
+                    return Ok(value);
                 }
             }
             Some(Ok(Message::Close(_))) => bail!("WebSocket 在握手完成前被服务端关闭"),

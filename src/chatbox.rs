@@ -68,19 +68,18 @@ pub fn compose(view: &SpeakerView<'_>, options: ChatboxOptions, now: Instant) ->
     // 关闭历史句时最多装一块（当前句，或当前句不可渲染时的最后一条历史句）。
     let max_blocks = if options.show_history { usize::MAX } else { 1 };
 
-    if let Some(current) = view.current {
-        if let Some(truncated) = add_block(
+    if let Some(current) = view.current
+        && let Some(truncated) = add_block(
             current,
             view.translation,
             options.display,
             &mut units_left,
             &mut lines_left,
             &mut blocks,
-        ) {
-            if truncated || blocks.len() >= max_blocks {
-                return finish(blocks);
-            }
-        }
+        )
+        && (truncated || blocks.len() >= max_blocks)
+    {
+        return finish(blocks);
     }
 
     for message in &view.history {
@@ -101,10 +100,9 @@ pub fn compose(view: &SpeakerView<'_>, options: ChatboxOptions, now: Instant) ->
             &mut units_left,
             &mut lines_left,
             &mut blocks,
-        ) {
-            if truncated || blocks.len() >= max_blocks {
-                break;
-            }
+        ) && (truncated || blocks.len() >= max_blocks)
+        {
+            break;
         }
     }
 

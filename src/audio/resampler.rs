@@ -41,16 +41,14 @@ impl MonoResampler {
             if let (Ok(in_adapter), Ok(mut out_adapter)) = (
                 InterleavedSlice::new(&self.input_fifo[..self.in_frames], 1, self.in_frames),
                 InterleavedSlice::new_mut(&mut self.out_buf[..self.out_frames], 1, self.out_frames),
-            ) {
-                if self
-                    .resampler
-                    .process_into_buffer(&in_adapter, &mut out_adapter, None)
-                    .is_ok()
-                {
-                    for &s in &self.out_buf[..self.out_frames] {
-                        let clamped = s.clamp(-1.0, 1.0);
-                        on_sample((clamped * 32767.0) as i16);
-                    }
+            ) && self
+                .resampler
+                .process_into_buffer(&in_adapter, &mut out_adapter, None)
+                .is_ok()
+            {
+                for &s in &self.out_buf[..self.out_frames] {
+                    let clamped = s.clamp(-1.0, 1.0);
+                    on_sample((clamped * 32767.0) as i16);
                 }
             }
             self.input_fifo.drain(0..self.in_frames);

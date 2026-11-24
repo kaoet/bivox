@@ -8,11 +8,8 @@
 use eframe::egui;
 
 use crate::app::BivoxApp;
-use crate::gui::language_list;
+use crate::gui::{language_list, widgets};
 use crate::language::TRANSLATION_LANGUAGES;
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
@@ -26,35 +23,14 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
 }
 
 fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
-    let mut save = false;
-    let mut reset = false;
-    ui.horizontal(|ui| {
-        ui.heading("自己");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let dirty = app.self_tab_dirty();
-            if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
-                save = true;
-            }
-            if ui
-                .add_enabled(dirty, egui::Button::new("放弃更改"))
-                .clicked()
-            {
-                reset = true;
-            }
-            if dirty {
-                ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-            }
-        });
-    });
-    if save {
+    let action = widgets::save_bar(ui, "自己", app.self_tab_dirty());
+    if action.save {
         app.save_self_tab();
     }
-    if reset {
+    if action.reset {
         app.reset_self_tab();
     }
-    if let Some(error) = &app.self_edit_error {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.self_edit_error.as_deref());
     ui.label(
         egui::RichText::new(
             "本页是我方线路的专属设置：麦克风、说的语言、要不要翻译、要不要合成语音。\

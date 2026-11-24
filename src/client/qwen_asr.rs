@@ -129,20 +129,7 @@ impl QwenAsrClient {
         let task_id = Uuid::new_v4().simple().to_string();
         let mut stream = ws::connect_authenticated(api_key, ws_url).await?;
 
-        let mut parameters = json!({
-            "format": "pcm",
-            "sample_rate": 16000,
-            "vad_model": ASR_VAD_MODEL,
-            // 心跳：长时间只有静音音频时保持会话不被服务端超时断开
-            "heartbeat": true
-        });
-        if !language_hints.is_empty() {
-            parameters["language_hints"] = json!(language_hints);
-        }
-        if let Some(vocabulary_id) = vocabulary_id.filter(|id| !id.is_empty()) {
-            // D31：预编译热词列表 ID；必须放在 payload.parameters 里。
-            parameters["vocabulary_id"] = json!(vocabulary_id);
-        }
+        let parameters = run_task_parameters(language_hints, vocabulary_id);
 
         let run_task_payload = json!({
             "header": {
@@ -325,6 +312,31 @@ impl ReconnectingSession for QwenAsrClient {
     }
 }
 
+/// 组装 run-task 的 `payload.parameters`。
+///
+/// 语言提示与预编译热词都只在非空时出现：没有配置热词就不能带 `vocabulary_id`
+/// 空串（D31），语言列表为空时也不发空数组。
+fn run_task_parameters(
+    language_hints: &[String],
+    vocabulary_id: Option<&str>,
+) -> serde_json::Value {
+    let mut parameters = json!({
+        "format": "pcm",
+        "sample_rate": 16000,
+        "vad_model": ASR_VAD_MODEL,
+        // 心跳：长时间只有静音音频时保持会话不被服务端超时断开
+        "heartbeat": true
+    });
+    if !language_hints.is_empty() {
+        parameters["language_hints"] = json!(language_hints);
+    }
+    if let Some(vocabulary_id) = vocabulary_id.filter(|id| !id.is_empty()) {
+        // D31：预编译热词列表 ID；必须放在 payload.parameters 里。
+        parameters["vocabulary_id"] = json!(vocabulary_id);
+    }
+    parameters
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,68 +480,26 @@ mod tests {
         assert!(reset.load(Ordering::SeqCst), "重连应置位 VAD 重置标志");
     }
 
-    /// run-task 里应带上配置的全部语言提示。
-    #[tokio::test]
-    async fn sends_all_language_hints() {
-        use std::time::Duration;
-        use tokio::net::TcpListener;
-        use tokio::sync::oneshot;
-        use tokio_tungstenite::accept_async;
+    /// run-task 的 parameters 只带配置了的语言提示与热词（D31）。
+    #[test]
+    fn run_task_parameters_only_include_configured_fields() {
+        let hints = vec!["zh".to_string(), "ja".to_string()];
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel();
-
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(tcp).await.unwrap();
-            if let Some(Ok(Message::Text(text))) = ws.next().await {
-                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                let _ = tx.send(value);
-            }
-            let _ = ws.next().await;
-        });
-
-        let (_tx_audio, rx_audio) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let (tx_events, _rx_events) = tokio::sync::mpsc::channel(8);
-        let is_running = Arc::new(AtomicBool::new(true));
-        let client = tokio::spawn(QwenAsrClient::run_duplex(
-            "sk-test".to_string(),
-            "qwen-audio-3.1-asr-flash-streaming".to_string(),
-            format!("ws://{addr}/api-ws/v1/inference"),
-            vec![
-                "zh".to_string(),
-                "ja".to_string(),
-                "en".to_string(),
-                "ko".to_string(),
-                "fr".to_string(),
-            ],
-            None,
-            None,
-            rx_audio,
-            tx_events,
-            is_running.clone(),
-        ));
-
-        let value = tokio::time::timeout(Duration::from_secs(3), rx)
-            .await
-            .expect("应收到 run-task")
-            .expect("run-task 解析失败");
-        assert_eq!(
-            value["payload"]["parameters"]["language_hints"],
-            json!(["zh", "ja", "en", "ko", "fr"]),
-            "language_hints 应原样传给服务端"
-        );
+        let plain = run_task_parameters(&hints, None);
+        assert_eq!(plain["language_hints"], json!(["zh", "ja"]));
         assert!(
-            value["payload"]["parameters"]
-                .get("vocabulary_id")
-                .is_none(),
+            plain.get("vocabulary_id").is_none(),
             "未配置热词时不应出现 vocabulary_id"
         );
+        assert_eq!(plain["sample_rate"], 16000);
 
-        is_running.store(false, Ordering::SeqCst);
-        client.abort();
-        server.abort();
+        let with_vocabulary = run_task_parameters(&hints, Some("vocab-1"));
+        assert_eq!(with_vocabulary["vocabulary_id"], "vocab-1");
+
+        // 空串等于没配置；空语言列表不写空数组
+        let empty = run_task_parameters(&[], Some(""));
+        assert!(empty.get("language_hints").is_none());
+        assert!(empty.get("vocabulary_id").is_none());
     }
 
     /// 配置了预编译热词时，run-task 应在 payload.parameters 里带 vocabulary_id（D31）。

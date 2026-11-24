@@ -15,14 +15,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let options: Vec<(String, String)> = app
         .voice_drafts
         .iter()
-        .map(|draft| {
-            let name = if draft.display_name.trim().is_empty() {
-                draft.key.clone()
-            } else {
-                format!("{}（{}）", draft.display_name, draft.key)
-            };
-            (draft.key.clone(), name)
-        })
+        .map(|draft| (draft.key.clone(), draft.dropdown_label()))
         .collect();
 
     ui.horizontal(|ui| {

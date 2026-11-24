@@ -216,32 +216,32 @@ pub async fn resolve_custom_voice(
         };
         let prefix = sample_prefix(name, multi_language.then_some(canonical_language.as_str()));
 
-        if let Some(entry) = cache.get(&config.tts.model, hash).cloned() {
-            if !entry.voice_id.is_empty() {
-                match verify_cached_voice(api, &entry.voice_id).await {
-                    CachedVoiceState::Usable => {
-                        log::info!(
-                            "🎙️ 自定义音色「{}」语言 {} 命中缓存: {}",
-                            display_name,
-                            canonical_language,
-                            entry.voice_id.cyan()
-                        );
-                        entries.insert(hash.clone(), entry);
-                        continue;
-                    }
-                    CachedVoiceState::Missing => log::info!(
-                        "♻️ 自定义音色「{}」语言 {} 的缓存 voice_id 已不存在，将重新复刻",
+        if let Some(entry) = cache.get(&config.tts.model, hash).cloned()
+            && !entry.voice_id.is_empty()
+        {
+            match verify_cached_voice(api, &entry.voice_id).await {
+                CachedVoiceState::Usable => {
+                    log::info!(
+                        "🎙️ 自定义音色「{}」语言 {} 命中缓存: {}",
                         display_name,
-                        canonical_language
-                    ),
-                    CachedVoiceState::Unverified(reason) => {
-                        log::warn!(
-                            "⚠️ 无法校验音色 {} 是否仍有效（{reason}），先继续使用缓存",
-                            entry.voice_id
-                        );
-                        entries.insert(hash.clone(), entry);
-                        continue;
-                    }
+                        canonical_language,
+                        entry.voice_id.cyan()
+                    );
+                    entries.insert(hash.clone(), entry);
+                    continue;
+                }
+                CachedVoiceState::Missing => log::info!(
+                    "♻️ 自定义音色「{}」语言 {} 的缓存 voice_id 已不存在，将重新复刻",
+                    display_name,
+                    canonical_language
+                ),
+                CachedVoiceState::Unverified(reason) => {
+                    log::warn!(
+                        "⚠️ 无法校验音色 {} 是否仍有效（{reason}），先继续使用缓存",
+                        entry.voice_id
+                    );
+                    entries.insert(hash.clone(), entry);
+                    continue;
                 }
             }
         }
@@ -391,13 +391,13 @@ async fn prepare_sample(
     let audio_path_text = audio_path.display().to_string();
 
     // 读文件前先按元数据做大小预检：避免误指向超大文件时先读入内存（可能 OOM）。
-    if let Ok(metadata) = std::fs::metadata(audio_path) {
-        if metadata.len() > MAX_AUDIO_BYTES as u64 {
-            bail!(
-                "自定义音色「{display_name}」语言 {canonical_language} 的样例音频 {:.1} MB 超过百炼上限 10 MB，请先裁剪或压缩",
-                metadata.len() as f64 / (1024.0 * 1024.0)
-            );
-        }
+    if let Ok(metadata) = std::fs::metadata(audio_path)
+        && metadata.len() > MAX_AUDIO_BYTES as u64
+    {
+        bail!(
+            "自定义音色「{display_name}」语言 {canonical_language} 的样例音频 {:.1} MB 超过百炼上限 10 MB，请先裁剪或压缩",
+            metadata.len() as f64 / (1024.0 * 1024.0)
+        );
     }
 
     let bytes = match std::fs::read(audio_path) {

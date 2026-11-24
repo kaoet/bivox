@@ -38,6 +38,25 @@ pub struct SampleDraft {
 }
 
 impl VoiceDraft {
+    /// 列表/标题里的显示名：`display_name` 为空时退回配置键名。
+    ///
+    /// 与 [`CustomVoiceConfig::display_name`] 是同一条规则；新建的草稿还没填显示名时
+    /// 用它兜底，避免界面出现空白标题。
+    pub fn label(&self) -> &str {
+        let name = self.display_name.trim();
+        if name.is_empty() { &self.key } else { name }
+    }
+
+    /// 下拉选项里的文本：有显示名时是「显示名（键名）」，否则只有键名。
+    pub fn dropdown_label(&self) -> String {
+        let name = self.display_name.trim();
+        if name.is_empty() {
+            self.key.clone()
+        } else {
+            format!("{name}（{}）", self.key)
+        }
+    }
+
     /// 从配置结构生成草稿。
     pub fn from_config(key: &str, voice: &CustomVoiceConfig) -> Self {
         Self {

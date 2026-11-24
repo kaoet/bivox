@@ -1,8 +1,76 @@
-//! 通用小部件：错误横幅、键值行等。
+//! 通用小部件：错误横幅、页签保存栏、键值行、设备/方言下拉等。
 
 use eframe::egui;
 
+use crate::gui::theme;
 use crate::language::CHINESE_DIALECTS;
+
+/// 页签「保存 / 放弃更改」的点击结果。
+///
+/// 由 [`save_bar`] / [`save_row`] 返回、调用方读它去改 `BivoxApp`：绘制闭包里只收集
+/// 意图，不在闭包内同时可变借用整个 `app`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TabAction {
+    pub save: bool,
+    pub reset: bool,
+}
+
+/// 页签标题行：标题 + 右对齐的「保存 / 放弃更改」+「● 未保存」。
+///
+/// 只在有改动时按钮可用（`dirty`）。
+pub fn save_bar(ui: &mut egui::Ui, title: &str, dirty: bool) -> TabAction {
+    let mut action = TabAction::default();
+    ui.horizontal(|ui| {
+        ui.heading(title);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            action = save_buttons(ui, "保存", dirty);
+            dirty_mark(ui, dirty);
+        });
+    });
+    action
+}
+
+/// 页内小节的「保存 / 放弃更改」按钮行（无标题，如「保存 VAD 设置」）。
+pub fn save_row(ui: &mut egui::Ui, save_label: &str, dirty: bool) -> TabAction {
+    let mut action = TabAction::default();
+    ui.horizontal(|ui| {
+        action = save_buttons(ui, save_label, dirty);
+        dirty_mark(ui, dirty);
+    });
+    action
+}
+
+/// 「● 未保存」小字提示（无改动时不占位）。
+pub fn dirty_mark(ui: &mut egui::Ui, dirty: bool) {
+    if dirty {
+        ui.label(egui::RichText::new("● 未保存").color(theme::AMBER).small());
+    }
+}
+
+/// 页内「保存失败：…」红字；`None` 时不占位。
+pub fn error_line(ui: &mut egui::Ui, error: Option<&str>) {
+    if let Some(error) = error {
+        ui.colored_label(theme::RED, format!("保存失败：{error}"));
+    }
+}
+
+/// 「保存 + 放弃更改」两个按钮（右向左布局时「保存」在最右）。
+fn save_buttons(ui: &mut egui::Ui, save_label: &str, dirty: bool) -> TabAction {
+    let mut action = TabAction::default();
+    if ui
+        .add_enabled(dirty, egui::Button::new(save_label))
+        .clicked()
+    {
+        action.save = true;
+    }
+    if ui
+        .add_enabled(dirty, egui::Button::new("放弃更改"))
+        .clicked()
+    {
+        action.reset = true;
+    }
+    action
+}
 
 /// 顶部错误横幅（启动检查失败、崩溃信息都走这里）。
 pub fn banner(ui: &mut egui::Ui, title: &str, detail: &str, color: egui::Color32) {

@@ -11,9 +11,7 @@ use crate::config::{
     DEFAULT_VRCHAT_PROCESS, MAX_VRCHAT_RETENTION_SECS, MIN_VRCHAT_RETENTION_SECS, VrchatDisplay,
     VrchatOscConfig,
 };
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
+use crate::gui::widgets;
 
 fn current(app: &BivoxApp) -> VrchatOscConfig {
     app.config.vrchat.osc.clone()
@@ -33,9 +31,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         egui::RichText::new("对方语音从本机哪个进程采集，以及字幕要不要发到 VRChat 聊天框。")
             .weak(),
     );
-    if let Some(error) = app.config_write_error_for(Tab::Vrchat) {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.config_write_error_for(Tab::Vrchat));
     ui.add_space(8.0);
 
     show_process(app, ui);
@@ -62,7 +58,7 @@ fn show_process(app: &mut BivoxApp, ui: &mut egui::Ui) {
             app.save_vrchat_process();
         }
         if dirty {
-            ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+            widgets::dirty_mark(ui, dirty);
         }
     });
     ui.label(

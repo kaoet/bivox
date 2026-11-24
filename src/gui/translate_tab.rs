@@ -9,9 +9,7 @@ use eframe::egui;
 
 use crate::app::{BivoxApp, Tab};
 use crate::config::{DEFAULT_TRANSLATE_MODEL, TranslateGranularity};
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
+use crate::gui::widgets;
 
 /// 本页编辑的当前值（都来自共用的 `[translate]`）。
 struct Current {
@@ -34,9 +32,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
-    if let Some(error) = app.config_write_error_for(Tab::Translate) {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.config_write_error_for(Tab::Translate));
     ui.add_space(8.0);
 
     let configured = current(app);
@@ -63,7 +59,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
             app.save_translate_model();
         }
         if app.translate_model_dirty() {
-            ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
+            widgets::dirty_mark(ui, true);
         }
     });
     ui.label(

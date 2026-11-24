@@ -14,7 +14,7 @@ Bivox 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 
 - 纯 GUI（egui/eframe），便携模式：配置、缓存、日志都在 exe 同目录（D4）；
 - 内部全异步：tokio runtime 跑后台任务，eframe 占主线程（D5）；
-- 两个二进制：`bivox.exe`（GUI 主程序）与 `admin.exe`（百炼音色/热词调试 CLI，不随发布包分发，D19）；
+- 四个二进制：`bivox.exe`（GUI 主程序）与 `admin.exe` / `vad_debug.exe` / `loopback_debug.exe` 三个调试 CLI（都不随发布包分发，D19）；
 - 外部依赖：阿里云百炼 DashScope 的 Qwen-Audio 实时 ASR/TTS WebSocket 接口、声音复刻 HTTP 接口，以及 ASR 预编译热词管理 HTTP 接口（D31）；
 - 翻译模式（`[self] translate`，D25）：ASR/打字文本先经 `qwen-mt-flash` 翻译成目标语言，再用目标语言音色合成，字幕以「译文 + 原文」双语呈现（M2，D26；独立 GUI 翻译页是 M3）；
 - VRChat OSC 聊天框（`[vrchat.osc]`，D33/D42）：会话事件额外喂给独立后台任务，按固定 1 秒文本间隔、typing 跳变、可配置的历史句窗口（默认保留最近 30 秒）更新本机 `127.0.0.1:9000` 的 ChatBox；
@@ -120,13 +120,16 @@ src/
 │   └── mock_http.rs     单元测试用的手写 HTTP mock
 ├── gui/
 │   ├── toolbar.rs       顶栏布局：麦克风/他人开关与电平条、状态、开始/停止、清除聊天框、版本号（D43/D44）
+│   ├── theme.rs         通用配色（错误/告警/正常/提示），各页签共用
 │   ├── meter.rs         顶栏图标开关 + 20 段电平条（VAD 合并配色，D43）
-│   ├── realtime_tab.rs  实时页：气泡时间线（我方靠右 / 他人靠左，底部嵌入打字输入行）
+│   ├── realtime_tab.rs  实时页：气泡时间线的列表（滚动、空状态），单条气泡在 `bubble`
+│   ├── bubble.rs        单条消息气泡：左右分侧、宽度贴合、原文/译文两行、外侧语言代码（D16/D26/D39）
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
 │   ├── audio_tab.rs     音频页：输入/输出设备
 │   ├── self_tab.rs      「自己」页：`[self]` 麦克风/语言列表/翻译/合成开关（D38）
 │   ├── others_tab.rs    「他人」页：`[others]` 开关/语言列表/翻译（D38）
 │   ├── language_list.rs 有序语言列表编辑器（两页共用，D38）
+│   ├── drag_reorder.rs  拖动排序（「≡」手柄 + 插入位置指示线；语言列表与音色样本共用）
 │   ├── asr_tab.rs       语音识别页：共用的识别模型与预编译热词
 │   ├── tts_tab.rs           语音合成页外壳：页头（保存/放弃）+ 中文方言 + 布局与草稿增删
 │   ├── tts_current_voice.rs 语音合成页：顶部「当前音色」选择
@@ -135,7 +138,7 @@ src/
 │   ├── vrchat_tab.rs    VRChat 页：采集进程、OSC 开关/端口/显示模式/历史句/保留时长、发送测试消息（D33/D38/D42）
 │   ├── settings_tab.rs  设置页：API Key、高级设置、整页保存
 │   ├── log_panel.rs     底部日志面板
-│   ├── widgets.rs       通用小部件（错误横幅、键值行、设备下拉）
+│   ├── widgets.rs       通用小部件（错误横幅、页签保存栏、错误行、键值行、设备下拉）
 │   └── mod.rs           GUI 组件入口
 ├── bin/
 │   ├── admin.rs         调试 CLI：参数解析 + 终端输出
@@ -162,7 +165,7 @@ src/
 | `config`/`config_edit` | 配置模型与安全写回 | 独立（config_edit 依赖 config 校验） |
 | `events` | 跨线程数据结构 | 被 app 与 pipeline 共用 |
 
-两条 bin 共用同一个 lib；`admin` 只使用 `config`、`voice::{api, admin}`、`asr::{api, admin}`，不启动 GUI、不读写缓存。
+四个 bin 共用同一个 lib。`admin` 只使用 `config`、`voice::{api, admin}`、`asr::{api, admin}`，不启动 GUI、不读写缓存；`vad_debug` / `loopback_debug` 只用 `audio` 与 `config`（VAD 调参、进程环回采集），不联网、不需要 API Key。
 
 ---
 
@@ -605,13 +608,13 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ## 13. 测试与验证
 
-- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`；lib 目标当前共 **270** 个（以 `cargo test` 输出为准；`bin` 下的调试工具另有少量单测）。
+- 测试全部是模块内 `#[cfg(test)]` / `#[tokio::test]`；数量以 `cargo test` 输出为准（`bin` 下的调试工具另有少量单测）。
 - 覆盖重点：配置解析/校验、`config_edit` 写回、音色草稿、字幕 reducer、语言判定、分块（含翻译模式策略与安全尾）、ASR/TTS 协议解析、翻译客户端（协议/重试/错误）、缓存、预编译热词注册与管理 API、VAD、PCM 电平映射与平滑、`Timeline::drop_open`、进程环回配速与进程发现、单实例命名、VRChat 聊天框合成/截断/OSC 编码/1 秒节流等纯逻辑。
 - Mock 方式：WebSocket 测试在测试内起本地 `TcpListener` 手写握手/报文；HTTP 测试使用 `voice/mock_http.rs`；**不访问真实百炼网络**。
 - UI 验证：`EGUI_INSPECTION=1` + egui_mcp 做真实点击与截图；顶栏开关需要额外验证「运行中只启停该线路、不重启会话」「页签 checkbox 同步」「900px 最小宽度」；没有 UI 自动化测试（不使用 egui_kittest，D14）。
 - 静态截图：glow 变体 + `EFRAME_SCREENSHOT_TO`（wgpu 不支持该调试特性）。
 - 发布前人工冒烟：开始/停止、配置保存、双开单实例、release 启动、便携目录行为。
-- CI（`.github/workflows/ci.yml`）在 windows-latest 上跑 `cargo fmt --check` / `cargo build --bins` / `cargo test`；提交前仍须在本机执行同一组门禁（具体命令与提交规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)）。
+- CI（`.github/workflows/ci.yml`）在 windows-latest 上跑 `cargo fmt --check` / `cargo build --bins` / `cargo test` / `cargo clippy --all-targets -- -D warnings`，工具链钉在 1.99.1（clippy 的默认 lint 集合随版本变化，门禁需要可复现）；提交前仍须在本机执行同一组门禁（具体命令与提交规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)）。
 
 ---
 
@@ -637,7 +640,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - `/chatbox/typing` 实测不占文本 1 条/秒预算；若未来 VRChat 版本变化，需要重新评估。
 - 144 按 UTF-16 码元预算、9 个显示行（含自动换行）；默认 UI 行宽已实测（ASCII 24 / 中文 15 / emoji 12），但 UI 缩放、字体和复杂 ZWJ emoji 仍可能影响换行，截断模型保留保守余量。
 - 只支持与本机 VRChat 通信（loopback），不支持远程主机或 OSCQuery 自动发现。
-- 没有 CI；UI 与真实音频链路的回归依赖人工验证。
+- 没有 UI 自动化测试（D14），UI 与真实音频链路的回归依赖 egui_mcp 运行期观测 + 人工验证。
 
 ---
 

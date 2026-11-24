@@ -128,6 +128,12 @@ impl Timeline {
     ///   不同 id 的相同文本是两次真实发音，必须各自保留。
     ///
     /// 翻译模式：只刷新原文与「已送翻译」前缀，句终由 [`Self::apply_translation`] 负责（D26）。
+    // 参数逐项对应 `PipelineEvent::Asr` 的同名字段，调用方几乎都是直接透传；包成结构体
+    // 只会让 40 多处调用点（多数是单测里的一行）各多写一层，反而更难读。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "逐项对应 PipelineEvent::Asr 的字段，包结构体只会让调用点更难读"
+    )]
     pub(crate) fn apply_asr(
         &mut self,
         speaker: Speaker,
@@ -187,6 +193,10 @@ impl Timeline {
     /// 翻译模式：并入一条译文事件；`is_sentence_end` 时把当前消息定稿。
     ///
     /// 去重、上限与普通模式一致；`language` 是译文语言，`source_language` 来自此前的源文事件。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "逐项对应 PipelineEvent::Translation 的字段，包结构体只会让调用点更难读"
+    )]
     pub(crate) fn apply_translation(
         &mut self,
         speaker: Speaker,

@@ -285,11 +285,11 @@ impl AppCache {
 
     /// 把内存中的缓存原子写入磁盘（临时文件 + rename），并自动创建父目录。
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("创建缓存目录 {} 失败", parent.display()))?;
-            }
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建缓存目录 {} 失败", parent.display()))?;
         }
 
         let json = serde_json::to_string_pretty(&self.file).context("序列化本地缓存失败")?;

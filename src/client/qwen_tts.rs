@@ -273,14 +273,13 @@ impl QwenTtsClient {
             loop {
                 if let Some(chunk) = pending_chunk.take() {
                     // 空文本的人造句终请求：不追加文本，只发 finish-task 结束当前 task
-                    if !chunk.text.is_empty() {
-                        if let Err(e) =
+                    if !chunk.text.is_empty()
+                        && let Err(e) =
                             Self::send_continue_chunk(&mut write, &task_id, &chunk).await
-                        {
-                            return Ok(SessionEnd::Disconnected(format!(
-                                "发送 continue-task 失败: {e:#}"
-                            )));
-                        }
+                    {
+                        return Ok(SessionEnd::Disconnected(format!(
+                            "发送 continue-task 失败: {e:#}"
+                        )));
                     }
                     if chunk.is_sentence_end {
                         if let Err(e) = Self::send_finish_task(&mut write, &task_id).await {

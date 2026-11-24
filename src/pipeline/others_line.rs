@@ -266,16 +266,15 @@ pub async fn run(params: Params) {
     // 收尾：放掉翻译 runtime（关闭 job 通道），再等 worker 退出。
     drop(translation);
     drop(rx_mt);
-    if let Some(worker) = mt_worker.take() {
-        if tokio::time::timeout(MT_SHUTDOWN_TIMEOUT, worker)
+    if let Some(worker) = mt_worker.take()
+        && tokio::time::timeout(MT_SHUTDOWN_TIMEOUT, worker)
             .await
             .is_err()
-        {
-            log::warn!(
-                "他人语音：等待翻译 worker 收尾超时（{}s）",
-                MT_SHUTDOWN_TIMEOUT.as_secs()
-            );
-        }
+    {
+        log::warn!(
+            "他人语音：等待翻译 worker 收尾超时（{}s）",
+            MT_SHUTDOWN_TIMEOUT.as_secs()
+        );
     }
 }
 
@@ -448,7 +447,12 @@ async fn drive(
                     None => std::future::pending::<Option<TranslationDone>>().await,
                 }
             } => {
-                if let (Some(runtime), Some(done)) = (translation.as_mut(), done_mt) {
+                // 翻译 worker 已退出（通道关闭）：已关闭的 `recv()` 会立刻返回 `None`，
+                // 若继续 select 会每轮都命中有就绪臂而忙等，因此与 self_line 一致直接结束。
+                let Some(done) = done_mt else {
+                    break;
+                };
+                if let Some(runtime) = translation.as_mut() {
                     on_translation_done(done, emit, runtime);
                 }
             }

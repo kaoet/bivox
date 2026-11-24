@@ -13,9 +13,7 @@ use eframe::egui;
 
 use crate::app::BivoxApp;
 use crate::config::{DEFAULT_ASR_MODEL, MAX_ASR_HOTWORDS, normalize_hotwords};
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
+use crate::gui::{theme, widgets};
 
 pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
@@ -26,35 +24,14 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
 
 fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     // Tab 级操作：保存 / 放弃更改 作用于「模型 + 热词」
-    let mut save = false;
-    let mut reset = false;
-    ui.horizontal(|ui| {
-        ui.heading("语音识别");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let dirty = app.asr_tab_dirty();
-            if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
-                save = true;
-            }
-            if ui
-                .add_enabled(dirty, egui::Button::new("放弃更改"))
-                .clicked()
-            {
-                reset = true;
-            }
-            if dirty {
-                ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-            }
-        });
-    });
-    if save {
+    let action = widgets::save_bar(ui, "语音识别", app.asr_tab_dirty());
+    if action.save {
         app.save_asr_tab();
     }
-    if reset {
+    if action.reset {
         app.reset_asr_tab();
     }
-    if let Some(error) = &app.asr_edit_error {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.asr_edit_error.as_deref());
     ui.label(
         egui::RichText::new(
             "本页只放两条线路共用的部分：识别模型与预编译热词。语言列表在「自己」「他人」页。\
@@ -97,7 +74,7 @@ fn show_hotwords(app: &mut BivoxApp, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("预编译热词").strong());
         let counter = egui::RichText::new(format!("({count}/{MAX_ASR_HOTWORDS})")).small();
         if over_limit {
-            ui.colored_label(RED, counter);
+            ui.colored_label(theme::RED, counter);
         } else {
             ui.label(counter.weak());
         }

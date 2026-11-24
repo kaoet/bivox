@@ -97,7 +97,7 @@ mod tests {
         QwenMtClient::new(
             "sk-test",
             "qwen-mt-flash",
-            &format!("{}/compatible-mode/v1/chat/completions", server.base_url()),
+            format!("{}/compatible-mode/v1/chat/completions", server.base_url()),
         )
         .expect("构造翻译客户端")
     }

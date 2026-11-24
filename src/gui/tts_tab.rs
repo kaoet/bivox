@@ -24,40 +24,16 @@ use crate::gui::{tts_current_voice, tts_voice_editor, widgets};
 use crate::language::CLONING_LANGUAGES;
 use crate::voice::editor::{SampleDraft, VoiceDraft};
 
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
-
 pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     // Tab 级操作：保存 / 放弃更改 作用于「当前音色 + 自定义音色草稿」全部改动
-    let mut save = false;
-    let mut reset = false;
-    ui.horizontal(|ui| {
-        ui.heading("语音合成");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let dirty = app.tts_tab_dirty();
-            if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
-                save = true;
-            }
-            if ui
-                .add_enabled(dirty, egui::Button::new("放弃更改"))
-                .clicked()
-            {
-                reset = true;
-            }
-            if dirty {
-                ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-            }
-        });
-    });
-    if save {
+    let action = widgets::save_bar(ui, "语音合成", app.tts_tab_dirty());
+    if action.save {
         app.save_tts_tab();
     }
-    if reset {
+    if action.reset {
         app.reset_tts_tab();
     }
-    if let Some(error) = &app.voice_edit_error {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.voice_edit_error.as_deref());
     ui.label(
         egui::RichText::new(
             "上方选择合成模型、当前音色与中文方言；下方编辑自定义音色。改动后点右上角「保存」\
@@ -213,11 +189,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
                     ui.style_mut().interaction.selectable_labels = false;
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.heading(if draft.display_name.trim().is_empty() {
-                            draft.key.as_str()
-                        } else {
-                            draft.display_name.as_str()
-                        });
+                        ui.heading(draft.label());
                     });
                     ui.add_space(4.0);
 

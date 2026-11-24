@@ -15,6 +15,7 @@
 use eframe::egui;
 
 use crate::audio::meter::percent_to_dbfs;
+use crate::gui::theme;
 
 /// 一条电平条的段数。
 pub const BAR_SEGMENTS: usize = 20;
@@ -22,10 +23,6 @@ const BAR_WIDTH: f32 = 100.0;
 const BAR_HEIGHT: f32 = 14.0;
 const SEG_WIDTH: f32 = 3.4;
 const SEG_GAP: f32 = 1.6;
-
-const GREEN: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xc9, 0x6f);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 
 /// 一条线路的 VAD 视觉状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,13 +188,14 @@ fn icon_button(
         .on_hover_text(hint)
 }
 
+/// 分段配色：绿 0–70%、黄 70–90%、红 90–100%（D43）。
 fn segment_color(index: usize) -> egui::Color32 {
     if index < 14 {
-        GREEN
+        theme::GREEN
     } else if index < 18 {
-        AMBER
+        theme::AMBER
     } else {
-        RED
+        theme::RED
     }
 }
 

@@ -296,33 +296,31 @@ impl TextChunker {
                     // 中文连续文字：超过设定的字符数阈值（默认 12 字 + guard_tail_chars）
                     let char_count = pending_slice.chars().count();
                     let cjk_threshold = self.chunk_word_threshold * 2;
-                    if char_count >= cjk_threshold + self.guard_tail_chars {
-                        if let Some((idx, ch)) = pending_slice.char_indices().nth(cjk_threshold - 1)
-                        {
-                            let mut cut_idx = idx + ch.len_utf8();
-                            // 避免在中英混排时截断英文单词
-                            if ch.is_ascii_alphanumeric() {
-                                for (next_idx, next_ch) in pending_slice[cut_idx..].char_indices() {
-                                    if !next_ch.is_ascii_alphanumeric() {
-                                        cut_idx += next_idx;
-                                        break;
-                                    }
+                    if char_count >= cjk_threshold + self.guard_tail_chars
+                        && let Some((idx, ch)) = pending_slice.char_indices().nth(cjk_threshold - 1)
+                    {
+                        let mut cut_idx = idx + ch.len_utf8();
+                        // 避免在中英混排时截断英文单词
+                        if ch.is_ascii_alphanumeric() {
+                            for (next_idx, next_ch) in pending_slice[cut_idx..].char_indices() {
+                                if !next_ch.is_ascii_alphanumeric() {
+                                    cut_idx += next_idx;
+                                    break;
                                 }
                             }
-                            cut_point = Some(cut_idx);
                         }
+                        cut_point = Some(cut_idx);
                     }
                 } else {
                     // 英文/西文空格分词：超过设定单词数（默认 6 词 + guard_words）
                     let words: Vec<&str> = pending_slice.split_whitespace().collect();
                     let guard_words = (self.guard_tail_chars / 2).max(1);
 
-                    if words.len() >= self.chunk_word_threshold + guard_words {
-                        if let Some(cut_idx) =
+                    if words.len() >= self.chunk_word_threshold + guard_words
+                        && let Some(cut_idx) =
                             find_word_boundary_cut(pending_slice, self.chunk_word_threshold)
-                        {
-                            cut_point = Some(cut_idx);
-                        }
+                    {
+                        cut_point = Some(cut_idx);
                     }
                 }
             }

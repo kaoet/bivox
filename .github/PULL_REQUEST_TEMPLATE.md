@@ -7,6 +7,7 @@
 - [ ] `cargo fmt --check`
 - [ ] `cargo build --bins`
 - [ ] `cargo test`
+- [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `git diff --check`
 - [ ] GUI / 交互改动已用 egui_mcp 或截图做运行期验证
 

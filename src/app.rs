@@ -574,10 +574,10 @@ impl BivoxApp {
         self.sync_from_config();
         self.sync_voice_inputs();
         self.voice_edit_error = None;
-        if let Some(index) = wanted_index {
-            if let Some(draft) = self.voice_drafts.get(index) {
-                self.selected_voice = Some(draft.key.clone());
-            }
+        if let Some(index) = wanted_index
+            && let Some(draft) = self.voice_drafts.get(index)
+        {
+            self.selected_voice = Some(draft.key.clone());
         }
     }
 
@@ -1121,7 +1121,7 @@ impl BivoxApp {
             return;
         }
         // 未配置 Key 不算配置无效：配置本身是合法的，只是还不能启动实时会话。
-        if self.config.api.key.as_deref().map_or(true, str::is_empty) {
+        if self.config.api.key.as_deref().is_none_or(str::is_empty) {
             self.tab = Tab::Settings;
             self.api_key_notice = Some("尚未配置 API Key；填写后即可开始实时会话。".to_string());
             info!("未配置 API Key，已跳转到设置页");
@@ -1459,12 +1459,7 @@ impl BivoxApp {
                 }
             }
         };
-        gui::widgets::banner(
-            ui,
-            "他人语音",
-            &text,
-            egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
-        );
+        gui::widgets::banner(ui, "他人语音", &text, gui::theme::AMBER);
         // 倒计时每秒都在变：即使没有新事件也要让界面继续刷新。
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
@@ -1475,57 +1470,37 @@ impl BivoxApp {
                 ui,
                 "程序发生崩溃",
                 &format!("{detail}（详情见 crash.log）"),
-                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+                gui::theme::RED,
             );
         }
         if let Some(detail) = self.startup_error.clone() {
-            gui::widgets::banner(
-                ui,
-                "启动检查未通过",
-                &detail,
-                egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
-            );
+            gui::widgets::banner(ui, "启动检查未通过", &detail, gui::theme::AMBER);
         }
         if let Some(detail) = self.config_reload_error.clone() {
             gui::widgets::banner(
                 ui,
                 "配置重新加载失败",
                 &format!("{detail}（已保留当前运行配置；修复磁盘配置前无法写回）"),
-                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
+                gui::theme::RED,
             );
         }
         if let Some(detail) = self.config_write_error.clone()
             && self.config_write_error_tab.is_none()
         {
-            gui::widgets::banner(
-                ui,
-                "配置写回失败",
-                &detail,
-                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-            );
+            gui::widgets::banner(ui, "配置写回失败", &detail, gui::theme::RED);
             if ui.button("清除错误").clicked() {
                 self.config_write_error = None;
             }
         }
         self.others_status_banner(ui);
         if let Some(detail) = self.pipeline_warning.clone() {
-            gui::widgets::banner(
-                ui,
-                "运行告警",
-                &detail,
-                egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
-            );
+            gui::widgets::banner(ui, "运行告警", &detail, gui::theme::AMBER);
             if ui.button("清除告警").clicked() {
                 self.pipeline_warning = None;
             }
         }
         if let Some(detail) = self.pipeline_error.clone() {
-            gui::widgets::banner(
-                ui,
-                "实时管线错误",
-                &detail,
-                egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-            );
+            gui::widgets::banner(ui, "实时管线错误", &detail, gui::theme::RED);
             if ui.button("清除错误").clicked() {
                 self.pipeline_error = None;
             }

@@ -7,11 +7,8 @@
 use eframe::egui;
 
 use crate::app::BivoxApp;
-use crate::gui::language_list;
+use crate::gui::{language_list, widgets};
 use crate::language::TRANSLATION_LANGUAGES;
-
-const RED: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0x1b);
 
 pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
@@ -25,35 +22,14 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
 }
 
 fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
-    let mut save = false;
-    let mut reset = false;
-    ui.horizontal(|ui| {
-        ui.heading("他人");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let dirty = app.others_tab_dirty();
-            if ui.add_enabled(dirty, egui::Button::new("保存")).clicked() {
-                save = true;
-            }
-            if ui
-                .add_enabled(dirty, egui::Button::new("放弃更改"))
-                .clicked()
-            {
-                reset = true;
-            }
-            if dirty {
-                ui.label(egui::RichText::new("● 未保存").color(AMBER).small());
-            }
-        });
-    });
-    if save {
+    let action = widgets::save_bar(ui, "他人", app.others_tab_dirty());
+    if action.save {
         app.save_others_tab();
     }
-    if reset {
+    if action.reset {
         app.reset_others_tab();
     }
-    if let Some(error) = &app.others_edit_error {
-        ui.colored_label(RED, format!("保存失败：{error}"));
-    }
+    widgets::error_line(ui, app.others_edit_error.as_deref());
     ui.label(
         egui::RichText::new(
             "本页是他人线路的专属设置：说的话从「VRChat」页配置的进程采集，只上屏，\

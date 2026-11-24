@@ -164,7 +164,7 @@ impl<D: FrameDetector> SpeechGate<D> {
         // 1. 拆成 32ms 帧，逐帧更新概率状态机
         let mut onset = false;
         let mut any_active = false;
-        for pair in chunk.chunks_exact(2) {
+        for pair in chunk.as_chunks::<2>().0 {
             self.carry.push(i16::from_le_bytes([pair[0], pair[1]]));
             if self.carry.len() < self.frame_samples {
                 continue;
@@ -479,7 +479,7 @@ mod tests {
             emitted.push(gate.process_chunk(silence_chunk()).len());
         }
         assert_eq!(emitted, vec![0, 0, 1, 0, 0, 1]);
-        assert!(gate.process_chunk(silence_chunk()).len() == 0);
+        assert!(gate.process_chunk(silence_chunk()).is_empty());
     }
 
     #[test]

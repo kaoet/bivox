@@ -160,7 +160,7 @@ struct Level {
 
 impl Level {
     fn accumulate(&mut self, pcm: &[u8]) {
-        for frame in pcm.chunks_exact(2) {
+        for frame in pcm.as_chunks::<2>().0 {
             let value = f64::from(i16::from_le_bytes([frame[0], frame[1]])) / 32768.0;
             self.sum_squares += value * value;
             self.peak = self.peak.max(value.abs());
@@ -221,7 +221,7 @@ impl WavSink {
     }
 
     fn append(&mut self, pcm: &[u8]) -> Result<()> {
-        for frame in pcm.chunks_exact(2) {
+        for frame in pcm.as_chunks::<2>().0 {
             self.writer
                 .write_sample(i16::from_le_bytes([frame[0], frame[1]]))
                 .context("写 WAV 失败")?;

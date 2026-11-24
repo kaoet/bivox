@@ -7,7 +7,7 @@
 - 用户使用说明：[`README.md`](README.md)
 - AI 代理入口：[`AGENTS.md`](AGENTS.md)（只做导航，不重复本文件规则）
 
-项目已发布（当前 `Cargo.toml` 版本 0.1.1），但仍不兼容旧配置/旧缓存格式（见 `docs/decisions.md` D41）。
+项目已发布（当前 `Cargo.toml` 版本 0.1.2），但仍不兼容旧配置/旧缓存格式（见 `docs/decisions.md` D41）。
 
 ---
 
@@ -37,7 +37,7 @@
 ## 2. 构建与运行
 
 ```bash
-cargo build --bins        # 构建三个 bin：bivox（GUI）、admin 与 vad_debug（调试 CLI）
+cargo build --bins        # 构建四个 bin：bivox（GUI）+ admin / vad_debug / loopback_debug（调试 CLI）
 cargo run                 # 启动 GUI（默认 wgpu 后端，debug 版保留控制台）
 cargo run --bin admin -- voice list   # 音色与热词列表调试 CLI，见第 9 节
 cargo run --release --bin vad_debug -- --seconds 15   # VAD 调参工具，见第 10 节
@@ -166,23 +166,26 @@ cargo run --no-default-features --features "renderer-glow,eframe/__screenshot"
 **任何 `git commit` 之前都必须执行以下流程，没有例外：**
 
 ```bash
-cargo fmt              # 1. 格式化整个项目（不是只格式化本次改动的文件）
-cargo fmt --check      # 2. 退出码必须为 0
-cargo build --bins     # 3. 全部 bin 都要编译通过
-cargo test             # 4. 全部测试通过
-git diff --check       # 5. 无空白符错误
+cargo fmt                                  # 1. 格式化整个项目（不是只格式化本次改动的文件）
+cargo fmt --check                          # 2. 退出码必须为 0
+cargo build --bins                         # 3. 全部 bin 都要编译通过
+cargo test                                 # 4. 全部测试通过
+cargo clippy --all-targets -- -D warnings  # 5. 零告警（含测试与 bin）
+git diff --check                           # 6. 无空白符错误
 git add -A
-git commit -m "..."    # 6. 以上全部通过后才允许提交
+git commit -m "..."                        # 7. 以上全部通过后才允许提交
 ```
 
 约束：
 
 - `cargo fmt --check` 失败时**不允许**提交；
+- `cargo clippy` 有告警时**不允许**提交。确实不该改的地方（例如逐项透传事件字段的 8 参数函数）用 `#[expect(clippy::xxx, reason = "...")]` 定点声明，不要整文件/整 crate `allow`，也不要在 CI 里关掉这条检查；
 - 不允许使用 `--no-verify` 或任何方式绕过检查；
 - 如果 `cargo fmt` 顺带改到与本次任务无关的文件，必须把这些纯格式改动一并提交或单独提交，不能为了让 diff 好看而撤销它们（否则全项目 `cargo fmt --check` 会失败）；
+- 纯机械的 clippy 修复（`collapsible_if` 之类会扫到十几个文件）单独一个提交，不要混进业务改动；
 - 一个提交只做一件逻辑上的事；提交信息简洁说明“做了什么、为什么”；
-- 文档改动也应跑完上述门禁（至少 `cargo fmt --check`、`cargo build --bins`、`cargo test`），保持仓库始终可构建；
-- CI（`.github/workflows/ci.yml`）在 GitHub 上跑同一组检查（`fmt --check` / `build --bins` / `test`），它不能替代本地门禁：提交前仍必须在本机全部跑过。
+- 文档改动也应跑完上述门禁（至少 `cargo fmt --check`、`cargo build --bins`、`cargo test`、`cargo clippy`），保持仓库始终可构建；
+- CI（`.github/workflows/ci.yml`）在 GitHub 上跑同一组检查（`fmt --check` / `build --bins` / `test` / `clippy -D warnings`），工具链钉在 1.99.1 以保证门禁可复现；它不能替代本地门禁：提交前仍必须在本机全部跑过。
 
 ---
 
@@ -209,7 +212,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 - **新增/修改配置字段时必须同时提供 GUI 编辑入口**（D3）：不允许只存在于 `config.toml`、只能手改的字段；字段归哪个页签见 D22/D27/D32/D38。
 - 写回流程：读原文件 → 解析为 `AppConfig` → 类型化修改 → 校验磁盘原配置和新文本 → 备份 `config.toml.bak` → 写盘；无改动不写盘。
 - 主程序不读 `%APPDATA%`、注册表、当前工作目录，也不用环境变量改配置路径；
-- 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md`；
+- 同一便携目录只允许一个实例；日志保留 7 天；发布 zip 只含 `bivox.exe` + `README.md` + `THIRD_PARTY_NOTICES.md` + `LICENSE-MIT` / `LICENSE-APACHE`；
 - 不要提交 `config.toml`、`config.toml.bak`、`cache.json`、`logs/`、`crash.log`。
 
 ### 音色、缓存与热词
@@ -221,7 +224,7 @@ git commit -m "..."    # 6. 以上全部通过后才允许提交
 
 ### 语言策略
 
-- `[asr] languages` 有序（首个默认）；整份列表原样传给 ASR API 的 `language_hints`（数量上限由服务端处理）；
+- `[self] languages` / `[others] languages` 各自有序（首个默认）；整份列表原样传给 ASR API 的 `language_hints`（服务端可能只采信前 4 种，因此顺序有意义：最常用的放前面）；
 - 本地语言判定始终使用完整列表；规则见 `src/language.rs`（假名/谚文强证据、纯汉字 ≥6 切中文、拉丁需主导、短文本粘性）；
 - 判定在每句首个 TTS chunk 前完成并冻结；不要改成“等整句再判”（会破坏低延迟）；
 - 合成始终传目标语言 `language_hints`；非中英语种附带内置 `instruction`；这两者与复刻样本语种无关。

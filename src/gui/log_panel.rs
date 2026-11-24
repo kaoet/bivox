@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::BivoxApp;
+use crate::gui::theme;
 use crate::log_sink::LogLine;
 
 /// 界面每帧最多渲染的行数（避免大量 label 拖慢立即模式）。
@@ -38,8 +39,8 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
 
 fn render(ui: &egui::Ui, line: &LogLine) -> egui::RichText {
     let color = match line.level {
-        log::Level::Error => egui::Color32::from_rgb(0xe0, 0x4b, 0x4b),
-        log::Level::Warn => egui::Color32::from_rgb(0xd8, 0x9a, 0x1b),
+        log::Level::Error => theme::RED,
+        log::Level::Warn => theme::AMBER,
         log::Level::Info => ui.visuals().text_color(),
         log::Level::Debug | log::Level::Trace => egui::Color32::GRAY,
     };

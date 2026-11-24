@@ -488,10 +488,10 @@ impl OthersSupervisor {
         if let Some(running) = self.line_running.take() {
             running.store(false, Ordering::SeqCst);
         }
-        if let Some(task) = self.task.take() {
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await.is_err() {
-                log::warn!("等待他人线路收尾超时（{}s）", SHUTDOWN_TIMEOUT.as_secs());
-            }
+        if let Some(task) = self.task.take()
+            && tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await.is_err()
+        {
+            log::warn!("等待他人线路收尾超时（{}s）", SHUTDOWN_TIMEOUT.as_secs());
         }
         self.handle
             .others_level

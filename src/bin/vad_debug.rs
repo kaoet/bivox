@@ -287,10 +287,8 @@ impl Processor {
                 end_ms: None,
             });
         }
-        if ended {
-            if let Some(segment) = self.segments.last_mut() {
-                segment.end_ms = Some(t_ms);
-            }
+        if ended && let Some(segment) = self.segments.last_mut() {
+            segment.end_ms = Some(t_ms);
         }
 
         let note = if onset {
@@ -748,7 +746,9 @@ fn samples_to_ms(samples: usize) -> u64 {
 /// PCM16 小端字节 → 采样。
 fn bytes_to_samples(bytes: &[u8]) -> impl Iterator<Item = i16> + '_ {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
 }
 

@@ -304,7 +304,8 @@ pub struct LocalConfig {
     /// 有序语言列表，首项为默认语言。
     ///
     /// - 只列一种 = 强提示只按该语言识别；
-    /// - 语言判定以完整列表为范围，整份列表作为本方 ASR 的 `language_hints`；
+    /// - 语言判定以完整列表为范围，整份列表作为本方 ASR 的 `language_hints`
+    ///   （服务端可能只采信前 4 种，因此顺序有意义：最常用的放前面）；
     /// - 打字输入的语言判定也用它；
     /// - 取值见 [`language::ASR_LANGUAGES`]；不能为空、不能重复，归一化去空白并转小写。
     pub languages: Vec<String>,
@@ -1221,7 +1222,7 @@ pub fn validate_hotwords(hotwords: &[String]) -> Result<()> {
         if word.is_empty() {
             bail!("配置项 [asr] hotwords 第 {} 条不能为空", index + 1);
         }
-        if word.chars().any(|c| !c.is_ascii()) {
+        if !word.is_ascii() {
             let chars = word.chars().count();
             if chars > MAX_HOTWORD_CHARS {
                 bail!(

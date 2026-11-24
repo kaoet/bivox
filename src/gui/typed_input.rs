@@ -22,6 +22,7 @@ use eframe::egui;
 
 use crate::app::BivoxApp;
 use crate::events::SessionState;
+use crate::gui::theme;
 
 /// 底部输入行的面板 id。
 const PANEL_ID: &str = "typed_input_panel";
@@ -36,8 +37,6 @@ const MIN_VISIBLE_ROWS: f32 = 1.0;
 const MAX_VISIBLE_ROWS: f32 = 4.0;
 /// 高度余量：吸收 TextEdit 边框/描边与纯文本排版之间的 1~2px 差异，避免单行时误出滚动条。
 const HEIGHT_SLACK: f32 = 2.0;
-/// 错误文字颜色。
-const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4b, 0x4b);
 
 /// 按当前文本计算输入框应占的高度（1~4 行，含上下 margin）。
 fn measured_input_height(ui: &egui::Ui, text: &str, outer_width: f32) -> f32 {
@@ -114,7 +113,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
 
         // 输入框下方只保留错误提示（使用说明已移除）。
         if let Some(error) = app.typed_input_error.as_deref() {
-            ui.colored_label(ERROR_COLOR, error);
+            ui.colored_label(theme::RED, error);
         }
 
         // 只有“无修饰键的 Enter”才提交；Shift+Enter 已由 TextEdit 处理成换行。

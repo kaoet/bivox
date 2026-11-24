@@ -64,10 +64,10 @@ impl AsrLine {
         // 先让电平 tap 退出，从而关闭 VAD/ASR 的音频输入端。
         level_task.abort();
         let _ = level_task.await;
-        if let Some(worker) = vad_thread {
-            if !join_thread_with_timeout(worker, timeout) {
-                log::warn!("等待本地 VAD 线程收尾超时（{}s）", timeout.as_secs());
-            }
+        if let Some(worker) = vad_thread
+            && !join_thread_with_timeout(worker, timeout)
+        {
+            log::warn!("等待本地 VAD 线程收尾超时（{}s）", timeout.as_secs());
         }
         if tokio::time::timeout(timeout, task).await.is_err() {
             log::warn!("等待识别任务收尾超时（{}s）", timeout.as_secs());
