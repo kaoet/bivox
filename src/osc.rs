@@ -8,8 +8,9 @@
 //! 关键约束（2026-11-08 实测）：
 //! - `/chatbox/input` 文本最多 1 条/秒；900ms 长跑会跳字；
 //! - `/chatbox/typing` 不占文本限流；
-//! - 聊天框在最后一个文本包后约 30 秒自然过期；D42 起客户端按 `retention_secs`
-//!   主动清空，历史句也只在保留时长内显示。
+//! - VRChat 自身的聊天框有效期可在 VRChat 设置中配成 2–60 秒（默认 30 秒）；
+//!   D42 起客户端按 `retention_secs` 主动清空，历史句也只在保留时长内显示，
+//!   因此保留时长可以超过 VRChat 的当前设置——那种情况下文本会先被 VRChat 清掉。
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};

@@ -54,7 +54,7 @@ Bivox 是一个 Windows 10/11 x64 桌面应用：采集麦克风音频，实时�
 
 VRChat OSC 聊天框（D33）：
   pipeline::session::emit（事件克隆一份）→ ChatboxService 后台任务
-    └─ 自己的 Timeline + 1 秒文本节流 + typing 跳变 + 约 30 秒自然过期
+    └─ 自己的 Timeline + 1 秒文本节流 + typing 跳变 + 按 retention_secs 主动清空（默认 30 秒）
          └─ rosc 编码 → UDP 127.0.0.1:{vrchat.osc.port}（/chatbox/input、/chatbox/typing）
   顶栏「清除 VRChat 聊天框」──(Command::ForceClear)──▶ 同一任务：清镜像 Timeline + 立即空串（D44）
 
@@ -633,7 +633,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 翻译是逐块 HTTP 请求：clause 模式的实际延迟、端到端 1s 目标、16 语种 TTS 自然度与碎句译文质量尚未做真实语料评估。
 - 已送 TTS 的译文不可撤回；翻译失败的片段不发声，只按 D8 显示错误条。
 - VRChat 聊天框文本**固定最多 1 条/秒**（本机实测 900ms 长跑跳字），因此聊天框字幕是低频镜像，不是逐事件刷新；GUI 字幕不受影响（D33）。
-- 聊天框内容在定稿超过 `retention_secs`（默认 30 秒，1–30）后由客户端主动发空串清空；停止/失败/关闭 OSC/关窗立即清空（D42）。VRChat 自身约 30 秒自然过期仍存在，但客户端不再依赖它；当前句（未定稿）不受保留时长限制。
+- 聊天框内容在定稿超过 `retention_secs`（默认 30 秒，1–60）后由客户端主动发空串清空；停止/失败/关闭 OSC/关窗立即清空（D42）。VRChat 自身的聊天框有效期是 VRChat 设置里的选项（2–60 秒，默认 30 秒）：客户端不依赖它，保留时长设得比它长时文本会先被 VRChat 清掉（D45）；当前句（未定稿）不受保留时长限制。
 - `/chatbox/typing` 实测不占文本 1 条/秒预算；若未来 VRChat 版本变化，需要重新评估。
 - 144 按 UTF-16 码元预算、9 个显示行（含自动换行）；默认 UI 行宽已实测（ASCII 24 / 中文 15 / emoji 12），但 UI 缩放、字体和复杂 ZWJ emoji 仍可能影响换行，截断模型保留保守余量。
 - 只支持与本机 VRChat 通信（loopback），不支持远程主机或 OSCQuery 自动发现。
@@ -681,9 +681,9 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 ### 17.1 配置与界面
 
-- `[vrchat.osc]` 字段见 `src/config.rs`；`display` 的三种取值为 `source` / `bilingual` / `translation`；`show_history` 与 `retention_secs` 见 D42。
+- `[vrchat.osc]` 字段见 `src/config.rs`；`display` 的三种取值为 `source` / `bilingual` / `translation`；`show_history` 见 D42，`retention_secs` 见 D42/D45。
 - `[vrchat.osc]` 不进配置指纹：GUI 写回后 `ChatboxService` 通过 watch 立即读取，不重启实时管线（D20 例外）；`[vrchat] process` 是对方线路的运行配置，进指纹（D37）。
-- 「VRChat」页在「语音合成」和「翻译」之间：启用开关、发送端口、三种显示模式、显示历史句、保留时长（1–30 秒，默认 30）、发送测试消息。
+- 「VRChat」页在「语音合成」和「翻译」之间：启用开关、发送端口、三种显示模式、显示历史句、保留时长（1–60 秒，默认 30，悬停提示与 VRChat 自身有效期的关系）、发送测试消息。
   - 翻译模式未开启时三种模式仍可编辑，页面不写额外提示；
   - 无状态行、typing 说明、隐私提示；
   - 测试消息立即发送，不受 1 秒文本节流约束；不改变 typing。
@@ -710,7 +710,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - `ChatboxService` 是 `BivoxApp` 持有的常驻 tokio 任务；会话 `emit` 把 `PipelineEvent` 克隆一份发到其无界通道。
 - 文本：距上次成功文本发送 ≥ `CHATBOX_TEXT_INTERVAL`（1000ms）才发；1 秒内多次变化只发最新内容；相同文本只在同一段显示内去重，新当前句/打字输入会重置去重。
 - typing：`/chatbox/typing` 只在当前句开始/结束时发送；实测不占文本预算。
-- 清空（D42）：没有可显示内容时发空串；已定稿内容超过 `retention_secs` 后由客户端主动发空串清空（默认 30 秒，与 VRChat 自然过期对齐，不需要心跳重发）。停止/失败/关闭 OSC/关窗仍立即清空。
+- 清空（D42）：没有可显示内容时发空串；已定稿内容超过 `retention_secs` 后由客户端主动发空串清空（默认 30 秒；上限 60 秒见 D45，VRChat 自身有效期设得更短时文本会先被 VRChat 清掉，不需要心跳重发）。停止/失败/关闭 OSC/关窗仍立即清空。
 - 手动清除（D44）：`ChatboxService::force_clear()` 发 `Command::ForceClear`，`Runtime::force_clear()` 先按上面的 `clear()` 立即发空串并关闭 typing（不等 1 秒窗口、不重试），再 `Timeline::clear_messages()` 丢弃镜像里的当前句与历史句；只清消息，保留翻译模式与最终句去重记忆，避免服务端重复最终结果把句子写回。OSC 关闭时按钮禁用，任务也不发包。
 - 发送：`rosc` 编码 `/chatbox/input` `(text, true, false)` 或 `/chatbox/typing`，`std::net::UdpSocket` 发到 `127.0.0.1:port`；不 bind 9000、不用 bundle。
 - 失败只写 debug 日志；VRChat 未运行是正常状态，不弹错误。

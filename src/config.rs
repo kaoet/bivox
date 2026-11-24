@@ -97,8 +97,9 @@ pub const MIN_VRCHAT_RETENTION_SECS: u32 = 1;
 
 /// 聊天框文本保留时长的最大值（秒）。
 ///
-/// 取 30 秒与 VRChat 聊天框的自然过期时长对齐，避免额外的心跳重发（D42）。
-pub const MAX_VRCHAT_RETENTION_SECS: u32 = 30;
+/// VRChat 自身的聊天框有效期可在 VRChat 设置中配成 2–60 秒（默认 30 秒），
+/// 因此上限取 60，与 VRChat 能支持的最长有效期对齐（D45）。
+pub const MAX_VRCHAT_RETENTION_SECS: u32 = 60;
 
 /// 对方线路默认监听的目标进程（VRChat 的 exe 文件名）。
 pub const DEFAULT_VRCHAT_PROCESS: &str = "VRChat.exe";
@@ -405,7 +406,7 @@ pub struct VrchatOscConfig {
     /// 关闭时只显示当前句；没有当前句时显示最后一条定稿消息。
     pub show_history: bool,
 
-    /// 聊天框文本保留时长（秒），范围 [`MIN_VRCHAT_RETENTION_SECS`]–[`MAX_VRCHAT_RETENTION_SECS`]（D42）。
+    /// 聊天框文本保留时长（秒），范围 [`MIN_VRCHAT_RETENTION_SECS`]–[`MAX_VRCHAT_RETENTION_SECS`]（D42/D45）。
     ///
     /// 两种模式都生效：历史句的年龄上限；关闭历史句时是最后一条消息定稿后的存活时间。
     /// 当前句（未定稿）不受此限制。
@@ -2081,7 +2082,20 @@ rate = 1.25
             "port=0 应被拒绝: {err:#}"
         );
 
-        for retention in ["0", "31"] {
+        // 上限 60 秒是 VRChat 聊天框有效期可配的最大值（D45）：边界值必须被接受。
+        for retention in ["1", "60"] {
+            let config = AppConfig::from_toml_str(&format!(
+                "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nretention_secs = {retention}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.vrchat.osc.retention_secs,
+                retention.parse::<u32>().unwrap(),
+                "retention_secs={retention} 应被接受"
+            );
+        }
+
+        for retention in ["0", "61"] {
             let err = AppConfig::from_toml_str(&format!(
                 "[api]\nkey = \"sk-test\"\n\n[vrchat.osc]\nretention_secs = {retention}\n"
             ))

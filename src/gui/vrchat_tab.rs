@@ -133,15 +133,20 @@ fn show_osc(app: &mut BivoxApp, ui: &mut egui::Ui) {
     }
     ui.horizontal(|ui| {
         ui.label("保留时长");
-        let response = ui.add(
-            egui::DragValue::new(&mut osc.retention_secs)
-                .range(MIN_VRCHAT_RETENTION_SECS..=MAX_VRCHAT_RETENTION_SECS)
-                .speed(1.0)
-                .max_decimals(0)
-                .suffix(" 秒")
-                // 同上：失焦/回车时才把文本写回，避免每帧重建的值让输入框回到旧值。
-                .update_while_editing(false),
-        );
+        let response = ui
+            .add(
+                egui::DragValue::new(&mut osc.retention_secs)
+                    .range(MIN_VRCHAT_RETENTION_SECS..=MAX_VRCHAT_RETENTION_SECS)
+                    .speed(1.0)
+                    .max_decimals(0)
+                    .suffix(" 秒")
+                    // 同上：失焦/回车时才把文本写回，避免每帧重建的值让输入框回到旧值。
+                    .update_while_editing(false),
+            )
+            .on_hover_text(
+                "VRChat 设置里的聊天框有效期可配 2–60 秒（默认 30 秒）；\
+                 保留时长超过它时，文本会先被 VRChat 清掉。",
+            );
         let enter = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         // 失焦后的提交发生在下一帧（此时 response 已是按钮而不是 TextEdit），
         // 所以必须用 changed() 捕获这一帧的值变化。
