@@ -122,7 +122,7 @@
 **决定**
 
 - 后台 → 界面统一走 `tokio::sync::mpsc::unbounded_channel::<PipelineEvent>()`；后台每次发事件后调用 `ctx.request_repaint()`，界面每帧 `try_recv()` 排空。
-- 事件里不出现 egui 类型，保持可测试。变体与字段以 `src/events.rs` 为唯一事实源（本文件不复述清单）；新增变体时必须同时更新 vents.rs 的事件处理、docs/architecture.md 的事件契约表。
+- 事件里不出现 egui 类型，保持可测试。变体与字段以 `src/events.rs` 为唯一事实源（本文件不复述清单）；新增变体时必须同时更新 `src/events.rs` 的事件处理、docs/architecture.md 的事件契约表。
 - 反向命令（GUI → 会话）同样走通道：`PipelineSessionHandle` 持有打字输入的无界 `Sender`，会话调度循环用 `biased` select 优先处理它（D24）。
 - 管线内部（音频、ASR 事件、TTS 输入）使用有界 channel（容量 100）；音频回调用 `try_send`，满即丢包。
 
@@ -502,7 +502,7 @@
 **边界**
 
 - 原文行是辅助信息：若整句译文全部失败，当前原文行在句终时被清空，不落历史（与"字幕 = 听到的内容"一致）。
-- 语言代码画在气泡外侧、字号 11pt（不是单独一列），il 这类三字母代码在该宽度下仍完整可见。
+- 语言代码画在气泡外侧、字号 11pt（不是单独一列），`fil` 这类三字母代码在该宽度下仍完整可见。
 
 ---
 
