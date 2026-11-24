@@ -497,8 +497,8 @@ async fn drive(
 
 /// 翻译模式：把一条 ASR 事件并入句子状态、送翻译，并把源文交给界面。
 ///
-/// 返回 alse 表示翻译 worker 已退出：本句之后不会再有译文，线路应当结束
-/// （与我方线路统一，见 self_line::dispatch_translation_jobs）。
+/// 返回 `false` 表示翻译 worker 已退出：本句之后不会再有译文，线路应当结束
+/// （与我方线路统一，见 `self_line::dispatch_translation_jobs`）。
 fn on_asr_translated(
     event: AsrEvent,
     emit: &Emitter,
