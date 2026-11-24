@@ -25,11 +25,13 @@ use crate::client::AsrEvent;
 use crate::client::qwen_mt::QwenMtClient;
 use crate::config::{TranslateGranularity, VadConfig};
 use crate::events::{OthersLineState, OthersStatus, PipelineEvent, Speaker};
-use crate::language::{LanguageTracker, canonical_language};
+use crate::language::LanguageTracker;
 use crate::pipeline::asr_line::{self, AsrLineParams};
 use crate::pipeline::chunker::{ChunkPolicy, TextChunker};
-use crate::pipeline::self_line::{SentenceLanguageState, TranslationRuntime};
-use crate::pipeline::translator::{self, TranslationDone, TranslationJob};
+use crate::pipeline::self_line::{
+    SentenceLanguageState, TranslationRuntime, dispatch_translation_jobs,
+};
+use crate::pipeline::translator::{self, TranslationDone};
 
 /// 重连退避：1s → 2s → 4s → 8s → 10s（封顶，之后一直用 10s）。
 const BACKOFF: [Duration; 5] = [
@@ -381,7 +383,11 @@ async fn drive(
             && !runtime.finish_pending
             && let Some(event) = backlog.pop_front()
         {
-            on_asr_translated(event, emit, state, runtime);
+            if !on_asr_translated(event, emit, state, runtime, || {
+                !session_running.load(Ordering::SeqCst)
+            }) {
+                break;
+            }
             continue;
         }
 
@@ -432,7 +438,11 @@ async fn drive(
                             if runtime.finish_pending {
                                 backlog.push_back(event);
                             } else {
-                                on_asr_translated(event, emit, state, runtime);
+                                if !on_asr_translated(event, emit, state, runtime, || {
+                                !session_running.load(Ordering::SeqCst)
+                            }) {
+                                break;
+                            }
                             }
                         } else {
                             forward_asr(event, emit, &mut tracker, &mut sentence_language);
@@ -486,12 +496,16 @@ async fn drive(
 }
 
 /// 翻译模式：把一条 ASR 事件并入句子状态、送翻译，并把源文交给界面。
+///
+/// 返回 alse 表示翻译 worker 已退出：本句之后不会再有译文，线路应当结束
+/// （与我方线路统一，见 self_line::dispatch_translation_jobs）。
 fn on_asr_translated(
     event: AsrEvent,
     emit: &Emitter,
     state: &mut TranslateState,
     runtime: &mut TranslationRuntime,
-) {
+    cancelled: impl Fn() -> bool,
+) -> bool {
     state.sentence.on_event(&event.text, event.is_sentence_end);
     if runtime.sentence_id.is_none() {
         runtime.sentence_id = event.sentence_id;
@@ -500,25 +514,9 @@ fn on_asr_translated(
     let chunks = state
         .chunker
         .process_stream(&event.text, event.is_sentence_end);
-    for chunk in chunks {
-        let source_language = state.sentence.language_for_chunk();
-        if runtime.source_language.is_none() {
-            runtime.source_language = Some(source_language.clone());
-        }
-        // 源语言与目标语言相同：跳过 MT，直接原样显示。
-        let skip = canonical_language(&source_language) == runtime.target_language.as_str();
-        let job = TranslationJob {
-            generation: runtime.generation,
-            text: chunk.chunk_text,
-            source_language,
-            skip_translation: skip,
-            is_sentence_end: chunk.is_sentence_end,
-        };
-        runtime.pending = runtime.pending.saturating_add(1);
-        if runtime.tx_job.send(job).is_err() {
-            log::warn!("他人语音：翻译 worker 已退出，本句可能缺少译文");
-        }
-        state.sentence.on_chunk(chunk.is_sentence_end);
+    if !dispatch_translation_jobs(chunks, runtime, &mut state.sentence, &cancelled) {
+        log::warn!("他人语音：翻译 worker 已退出，停止他人线路");
+        return false;
     }
 
     // 源文随 Asr 事件刷新（译文由 Translation 事件累积）；句终时整句都已送翻译。
@@ -548,6 +546,7 @@ fn on_asr_translated(
         }
     }
     state.sentence.on_event_end(event.is_sentence_end);
+    true
 }
 
 /// 翻译模式：并入一条译文；屏障满足时把当前句定稿。

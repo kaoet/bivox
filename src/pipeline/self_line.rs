@@ -18,7 +18,7 @@ use crate::client::qwen_tts::TtsChunkRequest;
 use crate::config::TranslateGranularity;
 use crate::events::{PipelineEvent, Speaker};
 use crate::language::{LanguageTracker, canonical_language};
-use crate::pipeline::chunker::{ChunkPolicy, TextChunker};
+use crate::pipeline::chunker::{ChunkPolicy, TextChunk, TextChunker};
 use crate::pipeline::session::{
     CANCEL_POLL_INTERVAL, MAX_TYPED_INPUT_CHARS, PipelineSessionHandle, TypedInput,
 };
@@ -169,6 +169,43 @@ fn report_vad(
             detail: "已降级为全量上传音频（会增加 ASR 费用）；停止后重新开始会话可重试".to_string(),
         });
     }
+}
+
+/// 把一批源文 chunk 转成翻译任务发给 worker（我方与他人线路共用）。
+///
+/// 返回 `false` 表示翻译 worker 已退出：本句之后不会再有译文回来，线路应当结束
+/// （两条线路统一这一语义——只 warn 会留下一条永远没有字幕的线路）。
+/// `cancelled` 为真时提前结束，但仍返回 `true`，让调用方按正常的取消路径收尾。
+pub(crate) fn dispatch_translation_jobs(
+    chunks: Vec<TextChunk>,
+    runtime: &mut TranslationRuntime,
+    language_state: &mut SentenceLanguageState,
+    cancelled: impl Fn() -> bool,
+) -> bool {
+    for chunk in chunks {
+        if cancelled() {
+            return true;
+        }
+        let source_language = language_state.language_for_chunk();
+        if runtime.source_language.is_none() {
+            runtime.source_language = Some(source_language.clone());
+        }
+        // 源语言与目标语言相同（含中文句子切到中文模式）：跳过 MT，直送 TTS。
+        let skip = canonical_language(&source_language) == runtime.target_language.as_str();
+        let job = TranslationJob {
+            generation: runtime.generation,
+            text: chunk.chunk_text,
+            source_language,
+            skip_translation: skip,
+            is_sentence_end: chunk.is_sentence_end,
+        };
+        runtime.pending = runtime.pending.saturating_add(1);
+        if runtime.tx_job.send(job).is_err() {
+            return false;
+        }
+        language_state.on_chunk(chunk.is_sentence_end);
+    }
+    true
 }
 
 /// 调度循环一次处理的去向。
@@ -401,28 +438,10 @@ impl SelfLineState<'_> {
         let chunks = self
             .chunker
             .process_stream(&event.text, event.is_sentence_end);
-        for chunk in chunks {
-            if self.handle.is_cancelled() {
-                break;
-            }
-            let source_language = self.language_state.language_for_chunk();
-            if runtime.source_language.is_none() {
-                runtime.source_language = Some(source_language.clone());
-            }
-            // 源语言与目标语言相同（含中文句子切到中文模式）：跳过 MT，直送 TTS。
-            let skip = canonical_language(&source_language) == runtime.target_language.as_str();
-            let job = TranslationJob {
-                generation: runtime.generation,
-                text: chunk.chunk_text,
-                source_language,
-                skip_translation: skip,
-                is_sentence_end: chunk.is_sentence_end,
-            };
-            runtime.pending = runtime.pending.saturating_add(1);
-            if runtime.tx_job.send(job).is_err() {
-                break;
-            }
-            self.language_state.on_chunk(chunk.is_sentence_end);
+        if !dispatch_translation_jobs(chunks, runtime, &mut self.language_state, || {
+            self.handle.is_cancelled()
+        }) {
+            return Step::Stop;
         }
 
         // 把源文交给界面（Translation 事件只带译文）；句终时整句都已送翻译，
@@ -1027,5 +1046,51 @@ mod tests {
         assert!(*is_sentence_end);
         assert_eq!(language, "ja");
         assert_eq!(*sentence_id, Some(7));
+    }
+
+    /// 翻译 worker 退出（接收端被丢弃）后，派发应返回 `false` 让线路结束，
+    /// 而不是静默丢任务继续跑（我方与他人线路共用这一语义）。
+    #[tokio::test]
+    async fn dispatch_stops_when_worker_is_gone() {
+        let (tx_job, rx_job) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = TranslationRuntime::new("en".to_string(), tx_job);
+        let mut language_state = SentenceLanguageState::new(vec!["zh".to_string()]);
+        drop(rx_job);
+
+        let chunks = vec![TextChunk {
+            chunk_text: "你好。".to_string(),
+            is_sentence_end: true,
+        }];
+        assert!(
+            !dispatch_translation_jobs(chunks, &mut runtime, &mut language_state, || false),
+            "worker 已退出时应返回 false"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_sends_every_chunk_while_worker_alive() {
+        let (tx_job, mut rx_job) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = TranslationRuntime::new("en".to_string(), tx_job);
+        let mut language_state = SentenceLanguageState::new(vec!["zh".to_string()]);
+
+        let chunks = vec![
+            TextChunk {
+                chunk_text: "你好，".to_string(),
+                is_sentence_end: false,
+            },
+            TextChunk {
+                chunk_text: "世界。".to_string(),
+                is_sentence_end: true,
+            },
+        ];
+        assert!(dispatch_translation_jobs(
+            chunks,
+            &mut runtime,
+            &mut language_state,
+            || false
+        ));
+        assert_eq!(runtime.pending, 2);
+        assert!(rx_job.try_recv().is_ok());
+        assert!(rx_job.try_recv().is_ok());
     }
 }
