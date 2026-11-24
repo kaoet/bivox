@@ -11,7 +11,7 @@
 
 use eframe::egui;
 
-use crate::app::BivoxApp;
+use crate::app::{BivoxApp, Tab};
 use crate::config::{DEFAULT_ASR_MODEL, MAX_ASR_HOTWORDS, normalize_hotwords};
 use crate::gui::{theme, widgets};
 
@@ -31,7 +31,7 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     if action.reset {
         app.reset_asr_tab();
     }
-    widgets::error_line(ui, app.asr_edit_error.as_deref());
+    widgets::error_line(ui, app.error_for(Tab::Asr));
     ui.label(
         egui::RichText::new(
             "本页只放两条线路共用的部分：识别模型与预编译热词。语言列表在「自己」「他人」页。\
@@ -51,9 +51,9 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
 fn show_model(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("识别模型");
-        ui.add(egui::TextEdit::singleline(&mut app.asr_model).desired_width(380.0));
+        ui.add(egui::TextEdit::singleline(&mut app.drafts.asr.model).desired_width(380.0));
         if ui.button("恢复默认").clicked() {
-            app.asr_model = DEFAULT_ASR_MODEL.to_string();
+            app.drafts.asr.model = DEFAULT_ASR_MODEL.to_string();
         }
     });
     ui.label(
@@ -66,7 +66,13 @@ fn show_model(app: &mut BivoxApp, ui: &mut egui::Ui) {
 
 /// 「预编译热词」：多行文本（一行一个）；标题右侧显示归一化后的条数 / 上限。
 fn show_hotwords(app: &mut BivoxApp, ui: &mut egui::Ui) {
-    let lines: Vec<String> = app.asr_hotwords.lines().map(str::to_string).collect();
+    let lines: Vec<String> = app
+        .drafts
+        .asr
+        .hotwords
+        .lines()
+        .map(str::to_string)
+        .collect();
     let count = normalize_hotwords(&lines).len();
     let over_limit = count > MAX_ASR_HOTWORDS;
 
@@ -80,7 +86,7 @@ fn show_hotwords(app: &mut BivoxApp, ui: &mut egui::Ui) {
         }
     });
     ui.add(
-        egui::TextEdit::multiline(&mut app.asr_hotwords)
+        egui::TextEdit::multiline(&mut app.drafts.asr.hotwords)
             .desired_rows(6)
             .desired_width(f32::INFINITY)
             .hint_text("一行一个热词，例如：原神"),

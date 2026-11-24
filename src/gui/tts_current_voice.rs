@@ -9,11 +9,13 @@ use crate::app::{BivoxApp, VoiceMode};
 
 /// 顶部「当前音色」：Radio 二选一（未选中的控件禁用）。
 pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
-    let mut mode = app.voice_mode;
-    let mut existing = app.voice_input.clone();
-    let mut custom_key = app.voice_custom_key.clone();
+    let mut mode = app.drafts.tts.mode;
+    let mut existing = app.drafts.tts.input.clone();
+    let mut custom_key = app.drafts.tts.custom_key.clone();
     let options: Vec<(String, String)> = app
-        .voice_drafts
+        .drafts
+        .tts
+        .drafts
         .iter()
         .map(|draft| (draft.key.clone(), draft.dropdown_label()))
         .collect();
@@ -55,7 +57,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         });
     });
 
-    app.voice_mode = mode;
-    app.voice_input = existing;
-    app.voice_custom_key = custom_key;
+    app.drafts.tts.mode = mode;
+    app.drafts.tts.input = existing;
+    app.drafts.tts.custom_key = custom_key;
 }

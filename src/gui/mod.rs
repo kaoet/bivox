@@ -5,6 +5,7 @@
 
 pub mod asr_tab;
 pub mod audio_tab;
+pub mod banners;
 pub mod bubble;
 pub mod drag_reorder;
 pub mod language_list;

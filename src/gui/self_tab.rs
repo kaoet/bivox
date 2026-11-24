@@ -7,7 +7,7 @@
 
 use eframe::egui;
 
-use crate::app::BivoxApp;
+use crate::app::{BivoxApp, Tab};
 use crate::gui::{language_list, widgets};
 use crate::language::TRANSLATION_LANGUAGES;
 
@@ -30,7 +30,7 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     if action.reset {
         app.reset_self_tab();
     }
-    widgets::error_line(ui, app.self_edit_error.as_deref());
+    widgets::error_line(ui, app.error_for(Tab::Local));
     ui.label(
         egui::RichText::new(
             "本页是我方线路的专属设置：麦克风、说的语言、要不要翻译、要不要合成语音。\
@@ -52,12 +52,12 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     );
 
     ui.add_space(10.0);
-    language_list::show(ui, "self_languages", &mut app.self_languages);
+    language_list::show(ui, "self_languages", &mut app.drafts.local.languages);
 
     ui.add_space(10.0);
-    ui.checkbox(&mut app.self_translate, "把我说的话翻译成目标语言");
-    let mut target = app.self_target.clone();
-    ui.add_enabled_ui(app.self_translate, |ui| {
+    ui.checkbox(&mut app.drafts.local.translate, "把我说的话翻译成目标语言");
+    let mut target = app.drafts.local.target.clone();
+    ui.add_enabled_ui(app.drafts.local.translate, |ui| {
         ui.horizontal(|ui| {
             ui.label("目标语言");
             egui::ComboBox::from_id_salt("self_target")
@@ -74,10 +74,10 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
                 });
         });
     });
-    app.self_target = target;
+    app.drafts.local.target = target;
 
     ui.add_space(10.0);
-    ui.checkbox(&mut app.self_tts, "合成语音并播放");
+    ui.checkbox(&mut app.drafts.local.tts, "合成语音并播放");
     ui.label(
         egui::RichText::new("关闭后不解析音色、不建 TTS，只上屏（仍可发 OSC 聊天框）。").weak(),
     );

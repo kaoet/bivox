@@ -72,7 +72,7 @@ VRChat OSC 聊天框（D33）：
 src/
 ├── main.rs              GUI 入口：便携路径 → 单实例 → app::run
 ├── lib.rs               库入口：暴露模块；校验渲染后端 feature
-├── app.rs               BivoxApp：启动准备、状态、事件泵、配置写回编排、热重启、退出
+├── app/                 应用主体：mod.rs（状态、事件泵、配置写回编排、热重启、退出）+ drafts.rs（各页签草稿）
 ├── events.rs            PipelineEvent / SessionState / Speaker（后台 → GUI 的事件契约）
 ├── paths.rs             AppPaths（便携路径）+ 空配置初始化
 ├── log_sink.rs          log 门面 → 内存环形缓冲 + 按天文件 + panic 钩子
@@ -122,6 +122,7 @@ src/
 │   ├── toolbar.rs       顶栏布局：麦克风/他人开关与电平条、状态、开始/停止、清除聊天框、版本号（D43/D44）
 │   ├── theme.rs         通用配色（错误/告警/正常/提示），各页签共用
 │   ├── meter.rs         顶栏图标开关 + 20 段电平条（VAD 合并配色，D43）
+│   ├── banners.rs       顶部横幅：崩溃 / 启动 / 配置 / 他人线路状态 / 运行告警 / 管线错误
 │   ├── realtime_tab.rs  实时页：气泡时间线的列表（滚动、空状态），单条气泡在 `bubble`
 │   ├── bubble.rs        单条消息气泡：左右分侧、宽度贴合、原文/译文两行、外侧语言代码（D16/D26/D39）
 │   ├── typed_input.rs   实时页底部：多行打字输入框 + Enter/「朗读」提交
@@ -192,16 +193,17 @@ main()
 
 ### 3.2 应用状态
 
-`BivoxApp`（`src/app.rs`）集中保存：
+`BivoxApp`（`src/app/mod.rs`）集中保存：
 
 - 路径与运行时：`paths`、`runtime`、`egui_ctx`；
 - 会话：`state: SessionState`、`session: Option<PipelineSessionHandle>`、`events_rx`、`running_config_signature`、`restart_pending`；
 - VRChat：`chatbox: ChatboxService`（后台 OSC 任务句柄；不参与配置指纹）；
-- 配置：`config: AppConfig`（启动时已校验，始终有效）、`config_reload_error`、`api_key_input`、`api_key_notice`、设备列表与当前设备；
+- 配置：`config: AppConfig`（启动时已校验，始终有效）、`config_reload_error`、`api_key_notice`、设备列表 `input_devices` / `output_devices`；
+- 页签草稿：`drafts: Drafts`（`src/app/drafts.rs`）——每页一个结构化草稿（`settings` / `asr` / `tts` / `local` / `others` / `vad` + `translate_model` / `vrchat_process`），各自带 `from_config`（从配置生成）、`is_dirty`（与配置比较）、`apply_to`（写回配置）。逐字段的 `sync_*` / `*_dirty` 不再散在 `BivoxApp` 上；
+- 页签错误：`errors: BTreeMap<Tab, String>`（页内红字，`error_for(tab)` 取用）与 `config_write_error`（不归属任何页签的写回失败，走顶部横幅）；
 - 打字输入：`typed_input`（输入框内容）、`typed_input_error`（行内错误）；提交通过 `PipelineSessionHandle::speak_typed` 走命令通道；
-- 音色编辑：`voice_drafts`（未保存草稿）、`selected_voice`、`voice_mode` / `voice_input` / `voice_custom_key`；
-- 语音识别编辑：`asr_model` / `asr_languages` / `asr_hotwords`（未保存草稿）、`asr_edit_error`；
-- 展示：`timeline`、`log`、`vad_active` / `vad_active_others`、顶栏两条电平的平滑值 `mic_level` / `others_level`（`audio::meter::MeterSmoother`）、错误/告警横幅（`startup_error` / `config_reload_error` / `pipeline_warning` / `pipeline_error` / `config_write_error` / `crash`）；
+- 音色编辑的界面选中态：`selected_voice`、`voice_list_scroll_to_end`（只是 UI 状态，不属于配置草稿）；
+- 展示：`timeline`、`log`、`vad_active` / `vad_active_others`、顶栏两条电平的平滑值 `mic_level` / `others_level`（`audio::meter::MeterSmoother`）、其余横幅字段（`startup_error` / `config_reload_error` / `pipeline_warning` / `pipeline_error` / `crash`，绘制在 `gui/banners.rs`）；
 - 生命周期：`closing`。
 
 `[api] key = None` 不算配置无效：GUI 正常打开；点「开始」时跳转设置页并显示 `api_key_notice`。真正非法的配置在启动阶段就弹窗退出，不会进入 `BivoxApp`。

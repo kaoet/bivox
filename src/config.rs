@@ -1026,14 +1026,14 @@ pub fn normalize_hotwords(hotwords: &[String]) -> Vec<String> {
 }
 
 /// 语言列表归一：逐项去首尾空白并转小写（别名由 [`language::canonical_language`] 处理）。
-fn normalize_languages(languages: &mut [String]) {
+pub(crate) fn normalize_languages(languages: &mut [String]) {
     for language in languages.iter_mut() {
         *language = language.trim().to_lowercase();
     }
 }
 
 /// 译文语言归一：去首尾空白、转小写，并做别名归一（如 `tl` → `fil`）。
-fn normalize_target(target: &mut String) {
+pub(crate) fn normalize_target(target: &mut String) {
     *target = language::canonical_language(target.trim().to_lowercase().as_str()).to_string();
 }
 

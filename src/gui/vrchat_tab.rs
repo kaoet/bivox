@@ -31,7 +31,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         egui::RichText::new("对方语音从本机哪个进程采集，以及字幕要不要发到 VRChat 聊天框。")
             .weak(),
     );
-    widgets::error_line(ui, app.config_write_error_for(Tab::Vrchat));
+    widgets::error_line(ui, app.error_for(Tab::Vrchat));
     ui.add_space(8.0);
 
     show_process(app, ui);
@@ -45,12 +45,12 @@ fn show_process(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("监听进程");
         ui.add(
-            egui::TextEdit::singleline(&mut app.vrchat_process)
+            egui::TextEdit::singleline(&mut app.drafts.vrchat_process)
                 .desired_width(220.0)
                 .hint_text(DEFAULT_VRCHAT_PROCESS),
         );
-        let dirty = app.vrchat_process.trim() != app.config.vrchat.process.as_str();
-        let can_apply = dirty && !app.vrchat_process.trim().is_empty();
+        let dirty = app.drafts.vrchat_process.trim() != app.config.vrchat.process.as_str();
+        let can_apply = dirty && !app.drafts.vrchat_process.trim().is_empty();
         if ui
             .add_enabled(can_apply, egui::Button::new("应用"))
             .clicked()

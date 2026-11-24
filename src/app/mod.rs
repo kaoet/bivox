@@ -1,6 +1,8 @@
 //! GUI 应用主体：启动准备、全局状态、面板布局、事件泵、退出流程。
 
-use std::collections::VecDeque;
+mod drafts;
+
+use std::collections::{BTreeMap, VecDeque};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -11,8 +13,7 @@ use tokio::sync::mpsc;
 use crate::audio::device::AudioDeviceManager;
 use crate::audio::meter::MeterSmoother;
 use crate::config::{
-    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VAD_MIN_SILENCE_MS, DEFAULT_VAD_TAIL_MS,
-    DEFAULT_VAD_THRESHOLD, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
+    AppConfig, CUSTOM_VOICE_PREFIX, DEFAULT_VOICE, TranslateGranularity, VrchatDisplay,
 };
 use crate::config_edit;
 use crate::events::{OthersLineState, OthersStatus, PipelineEvent, SessionState, Speaker};
@@ -22,22 +23,26 @@ use crate::osc::{ChatboxService, ChatboxSettings};
 use crate::paths::AppPaths;
 use crate::pipeline::session::{MAX_TYPED_INPUT_CHARS, PipelineSessionHandle, TypedInput};
 use crate::timeline::Timeline;
-use crate::voice::editor::{self, VoiceDraft};
+use crate::voice::editor;
 
 /// 窗口标题。
 pub const WINDOW_TITLE: &str = "Bivox — 实时语音识别与合成";
 
+pub use drafts::Drafts;
+use drafts::{AsrDraft, LocalDraft, OthersDraft, SettingsDraft, TtsDraft, VadDraft};
+
 /// 语音合成页顶部「当前音色」的选择方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VoiceMode {
     /// 现有音色：内置音色名或任意 voice_id（输入框）。
+    #[default]
     Existing,
     /// 自定义音色：从 `[tts.custom_voices]` 里选（下拉菜单），写 `custom:<键名>`。
     Custom,
 }
 
 /// 页签。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tab {
     Realtime,
     Audio,
@@ -87,11 +92,6 @@ fn normalize_device(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// 横幅倒计时：把「下一次重试时刻」换算成向上取整的秒数（已过期按 0）。
-fn retry_seconds(deadline: Instant, now: Instant) -> u64 {
-    deadline.saturating_duration_since(now).as_secs_f64().ceil() as u64
-}
-
 /// 应用状态。
 pub struct BivoxApp {
     pub paths: AppPaths,
@@ -113,16 +113,14 @@ pub struct BivoxApp {
     pub egui_ctx: Option<egui::Context>,
     /// 当前有效配置；启动时加载失败会直接退出，因此这里始终是合法配置。
     pub config: AppConfig,
+    /// 各页签的未保存草稿（状态与 `sync/dirty/apply` 都在 [`drafts`] 里）。
+    pub drafts: Drafts,
     /// 语音合成页左栏当前选中的自定义音色（配置键名）；`None` = 未选中。
+    ///
+    /// 只是界面选中态，不是配置草稿，所以不放进 [`Drafts`]。
     pub selected_voice: Option<String>,
-    /// 设置页的 API Key 草稿（点「保存」才写回 config.toml；留空保存 = 清除）。
-    pub api_key_input: String,
     /// 启动实时会话时发现未配置 API Key 的提示（设置页顶部显示）。
     pub api_key_notice: Option<String>,
-    /// 设置页「高级设置」草稿：接入域名 / 缓存文件 / 分块词数。
-    pub settings_workspace_host: String,
-    pub settings_cache_file: String,
-    pub settings_chunk_words: usize,
     /// 实时页底部「打字输入」的输入框内容。
     pub typed_input: String,
     /// 打字输入的行内错误（超长、会话未开始等）。
@@ -130,63 +128,18 @@ pub struct BivoxApp {
     /// 设备下拉的可选项（启动时与「刷新设备」时重新枚举）。
     pub input_devices: Vec<String>,
     pub output_devices: Vec<String>,
-    /// 最近一次写回配置失败的原因（成功时清空）。
+    /// 页签级的保存/校验错误（页内红字）；同一页签最多一条。
+    pub errors: BTreeMap<Tab, String>,
+    /// 不归属任何页签的写回错误（顶栏横幅 + 「清除错误」）。
+    ///
+    /// 目前只有顶栏快捷开关（麦克风/他人侦听）写回失败走这里：它不属于任何一个页签。
     pub config_write_error: Option<String>,
-    /// 最近一次写回失败所属页签（用于页内错误提示）。
-    pub config_write_error_tab: Option<Tab>,
     /// 运行中重新加载配置失败的原因（保留旧配置；成功时清空）。
     pub config_reload_error: Option<String>,
     /// 实时对话时间线（两条线路的消息：最新在前，未完成消息按进度分色）。
     pub timeline: Timeline,
-    /// 语音合成页的音色编辑草稿（保存前只改这里，`config` 不变）。
-    pub voice_drafts: Vec<VoiceDraft>,
     /// 音色列表在下一次绘制时滚到底部（新增音色后使用，滚完即清）。
     pub voice_list_scroll_to_end: bool,
-    /// 音色编辑的校验/保存错误（红色显示）。
-    pub voice_edit_error: Option<String>,
-    /// 「当前音色」选项：现有音色 / 自定义音色。
-    pub voice_mode: VoiceMode,
-    /// 「当前音色」→ 现有音色的输入框草稿。
-    pub voice_input: String,
-    /// 「当前音色」→ 自定义音色的配置键名草稿。
-    pub voice_custom_key: String,
-    /// 语音合成页「中文方言」草稿（保存前只改这里，`config` 不变）。
-    pub tts_dialect: String,
-    /// 语音合成页合成模型草稿。
-    pub tts_model: String,
-    /// 翻译页翻译模型草稿（「应用模型」按钮写回）。
-    pub translate_model: String,
-    /// 音频页 VAD 参数草稿（点「保存 VAD 设置」写回）。
-    pub vad_enabled: bool,
-    pub vad_threshold: f32,
-    pub vad_min_silence_ms: u32,
-    pub vad_tail_ms: u32,
-    pub vad_debug: bool,
-    /// 语音识别页的 ASR 模型草稿。
-    pub asr_model: String,
-    /// 语音识别页的热词草稿（多行文本，一行一个）。
-    pub asr_hotwords: String,
-    /// 语音识别页保存/校验错误（红色显示）。
-    pub asr_edit_error: Option<String>,
-    /// 「自己」页草稿：语言列表 / 翻译 / 译文语言 / 合成开关。
-    ///
-    /// 麦克风开关不在这里：它切换即写回配置（D43），不参与本页的脏状态。
-    pub self_languages: Vec<String>,
-    pub self_translate: bool,
-    pub self_target: String,
-    pub self_tts: bool,
-    /// 「自己」页保存/校验错误（红色显示）。
-    pub self_edit_error: Option<String>,
-    /// 「他人」页草稿：语言列表 / 翻译 / 译文语言。
-    ///
-    /// 侦听开关不在这里：它切换即写回配置（D43），不参与本页的脏状态。
-    pub others_languages: Vec<String>,
-    pub others_translate: bool,
-    pub others_target: String,
-    /// 「他人」页保存/校验错误（红色显示）。
-    pub others_edit_error: Option<String>,
-    /// VRChat 页的目标进程草稿（点「应用」写回 `[vrchat] process`）。
-    pub vrchat_process: String,
     /// 运行期告警（顶部黄色横幅显示，可手动清除）。
     pub pipeline_warning: Option<String>,
     /// 实时管线报错（顶部横幅显示，可手动清除）。
@@ -239,47 +192,18 @@ impl BivoxApp {
             restart_pending: false,
             egui_ctx: None,
             config,
+            drafts: Drafts::default(),
             selected_voice: None,
-            api_key_input: String::new(),
             api_key_notice: None,
-            settings_workspace_host: String::new(),
-            settings_cache_file: String::new(),
-            settings_chunk_words: 0,
             typed_input: String::new(),
             typed_input_error: None,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
+            errors: BTreeMap::new(),
             config_write_error: None,
-            config_write_error_tab: None,
             config_reload_error: None,
             timeline: Timeline::default(),
-            voice_drafts: Vec::new(),
             voice_list_scroll_to_end: false,
-            voice_edit_error: None,
-            voice_mode: VoiceMode::Existing,
-            voice_input: String::new(),
-            voice_custom_key: String::new(),
-            tts_dialect: String::new(),
-            tts_model: String::new(),
-            translate_model: String::new(),
-            vad_enabled: true,
-            vad_threshold: DEFAULT_VAD_THRESHOLD,
-            vad_min_silence_ms: DEFAULT_VAD_MIN_SILENCE_MS,
-            vad_tail_ms: DEFAULT_VAD_TAIL_MS,
-            vad_debug: false,
-            asr_model: String::new(),
-            asr_hotwords: String::new(),
-            asr_edit_error: None,
-            self_languages: Vec::new(),
-            self_translate: false,
-            self_target: String::new(),
-            self_tts: true,
-            self_edit_error: None,
-            others_languages: Vec::new(),
-            others_translate: false,
-            others_target: String::new(),
-            others_edit_error: None,
-            vrchat_process: String::new(),
             pipeline_warning: None,
             pipeline_error: None,
             vad_active: false,
@@ -296,10 +220,6 @@ impl BivoxApp {
             closing: false,
         };
         app.sync_from_config();
-        app.sync_voice_inputs();
-        app.sync_asr_inputs();
-        app.sync_self_inputs();
-        app.sync_others_inputs();
         app.refresh_devices();
         app
     }
@@ -312,8 +232,9 @@ impl BivoxApp {
         match AppConfig::load(&self.paths.config_file) {
             Ok(config) => {
                 self.config_reload_error = None;
+                // 重新加载成功 = 磁盘配置已合法，之前各页签的保存错误都已过期
+                self.errors.clear();
                 self.config_write_error = None;
-                self.config_write_error_tab = None;
                 self.apply_config(config);
                 info!("已重新加载配置：{}", self.paths.config_file.display());
             }
@@ -335,15 +256,11 @@ impl BivoxApp {
             self.api_key_notice = None;
         }
         self.sync_from_config();
-        self.sync_voice_inputs();
-        self.sync_asr_inputs();
-        self.sync_self_inputs();
-        self.sync_others_inputs();
         // 选中的音色若仍存在就保留（保存后不丢选择），否则清空
         let selected_exists = self
             .selected_voice
             .as_ref()
-            .is_some_and(|key| self.voice_drafts.iter().any(|draft| &draft.key == key));
+            .is_some_and(|key| self.drafts.tts.drafts.iter().any(|draft| &draft.key == key));
         if !selected_exists {
             self.selected_voice = None;
         }
@@ -355,148 +272,48 @@ impl BivoxApp {
         self.maybe_restart_session();
     }
 
-    /// 把配置里的 Key / 设备 / 音色草稿同步到界面状态（加载、重载、写回成功后调用）。
+    /// 把配置同步到各页签草稿（启动、重载、写回成功后调用）。
+    ///
+    /// 逐字段的映射在 [`Drafts::from_config`] 里；这里只处理不属于草稿的旁路状态。
     fn sync_from_config(&mut self) {
-        self.sync_settings_inputs();
-        self.vad_enabled = self.config.vad.enabled;
-        self.vad_threshold = self.config.vad.threshold;
-        self.vad_min_silence_ms = self.config.vad.min_silence_ms;
-        self.vad_tail_ms = self.config.vad.tail_ms;
-        self.vad_debug = self.config.vad.debug;
-        self.voice_drafts = editor::drafts_from_config(&self.config);
-        self.tts_model = self.config.tts.model.clone();
-        self.tts_dialect = self.config.tts.dialect.clone();
-        self.translate_model = self.config.translate.model.clone();
-        self.vrchat_process = self.config.vrchat.process.clone();
+        self.drafts = Drafts::from_config(&self.config, &self.drafts);
         self.chatbox
             .update_settings(ChatboxSettings::from_config(&self.config));
     }
 
-    /// 同步设置页草稿：API Key 与高级设置。
-    fn sync_settings_inputs(&mut self) {
-        self.api_key_input = self.config.api.key.clone().unwrap_or_default();
-        self.settings_workspace_host = self.config.api.workspace_host.clone();
-        self.settings_cache_file = self.config.cache.file.to_string_lossy().into_owned();
-        self.settings_chunk_words = self.config.chunking.words;
-    }
-
-    /// 从配置同步语音合成页顶部「当前音色」的草稿值。
-    fn sync_voice_inputs(&mut self) {
-        if let Some(name) = self.config.custom_voice_name().map(str::to_string) {
-            self.voice_mode = VoiceMode::Custom;
-            self.voice_custom_key = name;
-            if self.voice_input.trim().is_empty() {
-                self.voice_input = DEFAULT_VOICE.to_string();
-            }
-        } else {
-            self.voice_mode = VoiceMode::Existing;
-            self.voice_input = self.config.tts.voice.trim().to_string();
-            if self.voice_custom_key.is_empty() {
-                self.voice_custom_key = self
-                    .config
-                    .tts
-                    .custom_voices
-                    .keys()
-                    .next()
-                    .cloned()
-                    .unwrap_or_default();
-            }
-        }
-    }
-
-    /// 从配置同步「语音识别」页的草稿值（模型 / 热词）。
-    fn sync_asr_inputs(&mut self) {
-        self.asr_model = self.config.asr.model.clone();
-        self.asr_hotwords = self.config.asr.hotwords.join("\n");
-        self.asr_edit_error = None;
-    }
-
-    /// 从配置同步「自己」页的草稿值（麦克风不在草稿里，直接读配置）。
-    fn sync_self_inputs(&mut self) {
-        self.self_languages = self.config.local.languages.clone();
-        self.self_translate = self.config.local.translate;
-        self.self_target = self.config.local.target.clone();
-        self.self_tts = self.config.local.tts;
-        self.self_edit_error = None;
-    }
-
-    /// 从配置同步「他人」页的草稿值（侦听开关不在草稿里，直接读配置）。
-    fn sync_others_inputs(&mut self) {
-        self.others_languages = self.config.others.languages.clone();
-        self.others_translate = self.config.others.translate;
-        self.others_target = self.config.others.target.clone();
-        self.others_edit_error = None;
-    }
-
-    /// 顶部「当前音色」的草稿值（`[tts] voice` 形态）。
-    fn voice_draft_value(&self) -> String {
-        match self.voice_mode {
-            VoiceMode::Existing => self.voice_input.trim().to_string(),
-            VoiceMode::Custom => {
-                let key = self.voice_custom_key.trim();
-                if key.is_empty() {
-                    String::new()
-                } else {
-                    format!("{CUSTOM_VOICE_PREFIX}{key}")
-                }
-            }
-        }
-    }
-
-    /// 顶部「当前音色」是否与配置文件不同。
-    fn voice_input_dirty(&self) -> bool {
-        self.voice_draft_value() != self.config.tts.voice.trim()
-    }
-
-    /// 「中文方言」草稿是否与配置文件不同。
-    fn tts_dialect_dirty(&self) -> bool {
-        self.tts_dialect.trim() != self.config.tts.dialect
-    }
-
-    /// 合成模型草稿是否与配置文件不同。
-    fn tts_model_dirty(&self) -> bool {
-        self.tts_model.trim() != self.config.tts.model
-    }
-
     /// 语音合成页是否有未保存改动（模型 + 音色草稿 + 当前音色 + 中文方言）。
     pub fn tts_tab_dirty(&self) -> bool {
-        self.tts_model_dirty()
-            || self.voice_drafts_dirty()
-            || self.voice_input_dirty()
-            || self.tts_dialect_dirty()
+        self.drafts.tts.is_dirty(&self.config)
     }
 
     /// 保存语音合成页的全部改动：合成模型、`[tts.custom_voices]` 草稿、当前音色与中文方言。
     ///
-    /// 三部分合并成一次原子写回（一次校验 + 一份 `.bak`），成功后重载配置并按 D20 热重启。
+    /// 四部分合并成一次原子写回（一次校验 + 一份 `.bak`），成功后应用配置并按 D20 热重启。
     pub fn save_tts_tab(&mut self) {
         if !self.tts_tab_dirty() {
             return;
         }
         match self.try_save_tts_tab() {
             Ok(config) => {
-                self.voice_edit_error = None;
+                self.errors.remove(&Tab::Tts);
                 self.apply_config(config);
                 info!("已保存语音合成设置（{}）", self.paths.config_file.display());
             }
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.voice_edit_error = Some(message.clone());
-                warn!("保存语音合成设置失败：{message}");
-            }
+            Err(err) => self.fail_tab(Tab::Tts, err, "保存语音合成设置失败"),
         }
     }
 
     fn try_save_tts_tab(&self) -> anyhow::Result<AppConfig> {
-        let model_dirty = self.tts_model_dirty();
-        let drafts_dirty = self.voice_drafts_dirty();
-        let voice_dirty = self.voice_input_dirty();
-        let dialect_dirty = self.tts_dialect_dirty();
-        let wanted_voice = self.voice_draft_value();
+        let tts = &self.drafts.tts;
+        let model_dirty = tts.model_dirty(&self.config);
+        let drafts_dirty = tts.voices_dirty(&self.config);
+        let voice_dirty = tts.selection_dirty(&self.config);
+        let dialect_dirty = tts.dialect_dirty(&self.config);
+        let wanted_voice = tts.selection();
 
         config_edit::update(&self.paths.config_file, |config| {
             if model_dirty {
-                let model = self.tts_model.trim();
+                let model = tts.model.trim();
                 if model.is_empty() {
                     anyhow::bail!("合成模型不能为空");
                 }
@@ -504,7 +321,7 @@ impl BivoxApp {
             }
 
             if drafts_dirty {
-                let entries = editor::drafts_to_entries(&self.voice_drafts)?;
+                let entries = editor::drafts_to_entries(&tts.drafts)?;
                 // 样例音频必须存在（相对路径按配置文件目录解析）
                 for (key, voice) in &entries {
                     for sample in &voice.samples {
@@ -548,7 +365,7 @@ impl BivoxApp {
             }
 
             if dialect_dirty {
-                config.tts.dialect = self.tts_dialect.trim().to_string();
+                config.tts.dialect = self.drafts.tts.dialect.trim().to_string();
             }
             Ok(())
         })
@@ -560,12 +377,11 @@ impl BivoxApp {
         let wanted_index = self
             .selected_voice
             .as_ref()
-            .and_then(|key| self.voice_drafts.iter().position(|draft| &draft.key == key));
-        self.sync_from_config();
-        self.sync_voice_inputs();
-        self.voice_edit_error = None;
+            .and_then(|key| self.drafts.tts.drafts.iter().position(|d| &d.key == key));
+        self.drafts.tts = TtsDraft::from_config(&self.config, &self.drafts.tts);
+        self.errors.remove(&Tab::Tts);
         if let Some(index) = wanted_index
-            && let Some(draft) = self.voice_drafts.get(index)
+            && let Some(draft) = self.drafts.tts.drafts.get(index)
         {
             self.selected_voice = Some(draft.key.clone());
         }
@@ -573,30 +389,14 @@ impl BivoxApp {
 
     // ---- 语音识别页 ----
 
-    /// 把多行热词草稿解析为归一化列表（一行一个；空行忽略）。
-    fn hotwords_draft_list(&self) -> Vec<String> {
-        let lines: Vec<String> = self.asr_hotwords.lines().map(str::to_string).collect();
-        crate::config::normalize_hotwords(&lines)
-    }
-
-    /// 语音识别页的模型是否有改动。
-    fn asr_model_dirty(&self) -> bool {
-        self.asr_model.trim() != self.config.asr.model
-    }
-
-    /// 语音识别页的热词是否有改动（按归一化后的列表比较，空白行不算改动）。
-    fn asr_hotwords_dirty(&self) -> bool {
-        self.hotwords_draft_list() != self.config.asr.hotwords
-    }
-
     /// 语音识别页是否有未保存改动。
     pub fn asr_tab_dirty(&self) -> bool {
-        self.asr_model_dirty() || self.asr_hotwords_dirty()
+        self.drafts.asr.is_dirty(&self.config)
     }
 
-    /// 保存语音识别页的全部改动（模型 + 语言列表 + 热词，一次原子写回）。
+    /// 保存语音识别页的全部改动（模型 + 热词，一次原子写回）。
     ///
-    /// 成功后重载配置；运行中会按 D20 自动重启实时管线，下次会话启动时自动
+    /// 成功后应用配置；运行中会按 D20 自动重启实时管线，下次会话启动时自动
     /// 创建/更新百炼预编译热词列表（D31）。
     pub fn save_asr_tab(&mut self) {
         if !self.asr_tab_dirty() {
@@ -604,46 +404,33 @@ impl BivoxApp {
         }
         match self.try_save_asr_tab() {
             Ok(config) => {
-                self.asr_edit_error = None;
+                self.errors.remove(&Tab::Asr);
                 self.apply_config(config);
                 info!("已保存语音识别设置（{}）", self.paths.config_file.display());
             }
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.asr_edit_error = Some(message.clone());
-                warn!("保存语音识别设置失败：{message}");
-            }
+            Err(err) => self.fail_tab(Tab::Asr, err, "保存语音识别设置失败"),
         }
     }
 
     fn try_save_asr_tab(&self) -> anyhow::Result<AppConfig> {
-        let model = self.asr_model.trim().to_string();
-        if model.is_empty() {
-            anyhow::bail!("识别模型不能为空");
-        }
-        let hotwords = self.hotwords_draft_list();
-        crate::config::validate_hotwords(&hotwords)?;
-
+        let asr = self.drafts.asr.clone();
         config_edit::update(&self.paths.config_file, |config| {
-            config.asr.model = model;
-            config.asr.hotwords = hotwords;
+            asr.apply_to(config);
             Ok(())
         })
     }
 
     /// 放弃语音识别页的全部改动，恢复为配置文件里的值。
     pub fn reset_asr_tab(&mut self) {
-        self.sync_asr_inputs();
+        self.drafts.asr = AsrDraft::from_config(&self.config);
+        self.errors.remove(&Tab::Asr);
     }
 
     // ---- 自己页 ----
 
     /// 「自己」页是否有未保存改动（麦克风切换即写回，不算脏）。
     pub fn self_tab_dirty(&self) -> bool {
-        self.self_languages != self.config.local.languages
-            || self.self_translate != self.config.local.translate
-            || self.self_target != self.config.local.target
-            || self.self_tts != self.config.local.tts
+        self.drafts.local.is_dirty(&self.config)
     }
 
     /// 保存「自己」页的其余改动（语言 / 翻译 / 合成，`[self]` 一次原子写回）。
@@ -656,43 +443,33 @@ impl BivoxApp {
         }
         match self.try_save_self_tab() {
             Ok(config) => {
-                self.self_edit_error = None;
+                self.errors.remove(&Tab::Local);
                 self.apply_config(config);
                 info!("已保存「自己」设置（{}）", self.paths.config_file.display());
             }
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.self_edit_error = Some(message.clone());
-                warn!("保存「自己」设置失败：{message}");
-            }
+            Err(err) => self.fail_tab(Tab::Local, err, "保存「自己」设置失败"),
         }
     }
 
     fn try_save_self_tab(&self) -> anyhow::Result<AppConfig> {
-        if self.self_languages.is_empty() {
-            anyhow::bail!("语言列表不能为空（至少保留一种语言）");
-        }
+        let local = self.drafts.local.clone();
         config_edit::update(&self.paths.config_file, |config| {
-            config.local.languages = self.self_languages.clone();
-            config.local.translate = self.self_translate;
-            config.local.target = self.self_target.clone();
-            config.local.tts = self.self_tts;
+            local.apply_to(config);
             Ok(())
         })
     }
 
     /// 放弃「自己」页的改动，恢复为配置文件里的值。
     pub fn reset_self_tab(&mut self) {
-        self.sync_self_inputs();
+        self.drafts.local = LocalDraft::from_config(&self.config);
+        self.errors.remove(&Tab::Local);
     }
 
     // ---- 他人页 ----
 
     /// 「他人」页是否有未保存改动（侦听开关切换即写回，不算脏）。
     pub fn others_tab_dirty(&self) -> bool {
-        self.others_languages != self.config.others.languages
-            || self.others_translate != self.config.others.translate
-            || self.others_target != self.config.others.target
+        self.drafts.others.is_dirty(&self.config)
     }
 
     /// 保存「他人」页的其余改动（语言 / 翻译，`[others]` 一次原子写回）。
@@ -705,33 +482,26 @@ impl BivoxApp {
         }
         match self.try_save_others_tab() {
             Ok(config) => {
-                self.others_edit_error = None;
+                self.errors.remove(&Tab::Others);
                 self.apply_config(config);
                 info!("已保存「他人」设置（{}）", self.paths.config_file.display());
             }
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.others_edit_error = Some(message.clone());
-                warn!("保存「他人」设置失败：{message}");
-            }
+            Err(err) => self.fail_tab(Tab::Others, err, "保存「他人」设置失败"),
         }
     }
 
     fn try_save_others_tab(&self) -> anyhow::Result<AppConfig> {
-        if self.others_languages.is_empty() {
-            anyhow::bail!("语言列表不能为空（至少保留一种语言）");
-        }
+        let others = self.drafts.others.clone();
         config_edit::update(&self.paths.config_file, |config| {
-            config.others.languages = self.others_languages.clone();
-            config.others.translate = self.others_translate;
-            config.others.target = self.others_target.clone();
+            others.apply_to(config);
             Ok(())
         })
     }
 
     /// 放弃「他人」页的改动，恢复为配置文件里的值。
     pub fn reset_others_tab(&mut self) {
-        self.sync_others_inputs();
+        self.drafts.others = OthersDraft::from_config(&self.config);
+        self.errors.remove(&Tab::Others);
     }
 
     /// 重新枚举音频设备（启动时与「刷新设备」按钮调用）。
@@ -749,51 +519,42 @@ impl BivoxApp {
 
     /// 设置页是否有未保存改动（API Key + 高级设置）。
     pub fn settings_tab_dirty(&self) -> bool {
-        let key = self.api_key_input.trim();
-        let configured_key = self.config.api.key.as_deref().unwrap_or("");
-        key != configured_key
-            || self.settings_workspace_host.trim() != self.config.api.workspace_host
-            || self.settings_cache_file.trim() != self.config.cache.file.to_string_lossy()
-            || self.settings_chunk_words != self.config.chunking.words
+        self.drafts.settings.is_dirty(&self.config)
     }
 
     /// 整页保存设置：API Key、接入域名、缓存文件、分块词数。
     ///
     /// API Key 留空表示清除该配置项；其它字段由序列化器省略默认值。
     pub fn save_settings_tab(&mut self) {
-        let key = self.api_key_input.trim().to_string();
-        let host = self.settings_workspace_host.trim().to_string();
-        let cache_file = self.settings_cache_file.trim().to_string();
-        let chunk_words = self.settings_chunk_words;
+        let settings = self.drafts.settings.clone();
         let result = self.write_config(|config| {
-            config.api.key = (!key.is_empty()).then_some(key);
-            config.api.workspace_host = host;
-            config.cache.file = std::path::PathBuf::from(cache_file);
-            config.chunking.words = chunk_words;
+            settings.apply_to(config);
             Ok(())
         });
+        let saved = result.is_ok();
         self.finish_config_write(result, "已保存设置");
-        if self.config_write_error.is_none() {
+        if saved {
             self.api_key_notice = None;
         }
     }
 
     /// 放弃设置页的整页改动。
     pub fn reset_settings_tab(&mut self) {
-        self.sync_settings_inputs();
+        self.drafts.settings = SettingsDraft::from_config(&self.config);
+        self.errors.remove(&Tab::Settings);
     }
 
     /// 翻译模型草稿是否与配置不同。
     pub fn translate_model_dirty(&self) -> bool {
-        self.translate_model.trim() != self.config.translate.model
+        self.drafts.translate_model_dirty(&self.config)
     }
 
     /// 保存翻译模型；其余翻译字段仍由翻译页即时保存。
     pub fn save_translate_model(&mut self) {
-        let model = self.translate_model.trim().to_string();
+        let model = self.drafts.translate_model.trim().to_string();
         if model.is_empty() {
-            self.config_write_error = Some("翻译模型不能为空".to_string());
-            self.config_write_error_tab = Some(Tab::Translate);
+            self.errors
+                .insert(Tab::Translate, "翻译模型不能为空".to_string());
             return;
         }
         let result = self.write_config(|config| {
@@ -805,26 +566,14 @@ impl BivoxApp {
 
     /// 音频页 VAD 草稿是否与配置不同。
     pub fn vad_settings_dirty(&self) -> bool {
-        self.vad_enabled != self.config.vad.enabled
-            || self.vad_threshold != self.config.vad.threshold
-            || self.vad_min_silence_ms != self.config.vad.min_silence_ms
-            || self.vad_tail_ms != self.config.vad.tail_ms
-            || self.vad_debug != self.config.vad.debug
+        self.drafts.vad.is_dirty(&self.config)
     }
 
     /// 保存音频页 VAD 参数；改后按 D20 热重启实时管线。
     pub fn save_vad_settings(&mut self) {
-        let enabled = self.vad_enabled;
-        let threshold = self.vad_threshold;
-        let min_silence_ms = self.vad_min_silence_ms;
-        let tail_ms = self.vad_tail_ms;
-        let debug = self.vad_debug;
+        let vad = self.drafts.vad.clone();
         let result = self.write_config(|config| {
-            config.vad.enabled = enabled;
-            config.vad.threshold = threshold;
-            config.vad.min_silence_ms = min_silence_ms;
-            config.vad.tail_ms = tail_ms;
-            config.vad.debug = debug;
+            vad.apply_to(config);
             Ok(())
         });
         self.finish_config_write(result, "已保存 VAD 设置");
@@ -832,11 +581,8 @@ impl BivoxApp {
 
     /// 放弃音频页 VAD 草稿。
     pub fn reset_vad_settings(&mut self) {
-        self.vad_enabled = self.config.vad.enabled;
-        self.vad_threshold = self.config.vad.threshold;
-        self.vad_min_silence_ms = self.config.vad.min_silence_ms;
-        self.vad_tail_ms = self.config.vad.tail_ms;
-        self.vad_debug = self.config.vad.debug;
+        self.drafts.vad = VadDraft::from_config(&self.config);
+        self.errors.remove(&Tab::Audio);
     }
 
     /// 更新 `[audio]` 设备（`None` = 系统默认）；设备名是完整名称（D12）。
@@ -893,10 +639,12 @@ impl BivoxApp {
     /// 它是对方线路的采集目标、进配置指纹，运行中保存会触发 D20 热重启；
     /// 因此用「文本框 + 应用」而不是逐键写回。
     pub fn save_vrchat_process(&mut self) {
-        let process = self.vrchat_process.trim().to_string();
+        let process = self.drafts.vrchat_process.trim().to_string();
         if process.is_empty() {
-            self.config_write_error = Some("目标进程不能为空（例如 VRChat.exe）".to_string());
-            self.config_write_error_tab = Some(Tab::Vrchat);
+            self.errors.insert(
+                Tab::Vrchat,
+                "目标进程不能为空（例如 VRChat.exe）".to_string(),
+            );
             return;
         }
         if process == self.config.vrchat.process {
@@ -950,7 +698,6 @@ impl BivoxApp {
                     self.timeline.drop_open(Speaker::Local);
                 }
                 self.config_write_error = None;
-                self.config_write_error_tab = None;
                 info!(
                     "麦克风已{}（{}）",
                     if enabled { "开启" } else { "关闭" },
@@ -960,7 +707,6 @@ impl BivoxApp {
             Err(err) => {
                 let message = format!("{err:#}");
                 self.config_write_error = Some(message.clone());
-                self.config_write_error_tab = None;
                 warn!("切换麦克风失败：{message}");
             }
         }
@@ -989,7 +735,6 @@ impl BivoxApp {
                     self.timeline.drop_open(Speaker::Others);
                 }
                 self.config_write_error = None;
-                self.config_write_error_tab = None;
                 info!(
                     "他人侦听已{}（{}）",
                     if enabled { "开启" } else { "关闭" },
@@ -999,7 +744,6 @@ impl BivoxApp {
             Err(err) => {
                 let message = format!("{err:#}");
                 self.config_write_error = Some(message.clone());
-                self.config_write_error_tab = None;
                 warn!("切换他人侦听失败：{message}");
             }
         }
@@ -1029,7 +773,6 @@ impl BivoxApp {
             Err(err) => {
                 let message = format!("{err:#}");
                 self.config_write_error = Some(message.clone());
-                self.config_write_error_tab = None;
                 warn!("麦克风启动失败后写回关闭状态失败：{message}");
             }
         }
@@ -1050,33 +793,27 @@ impl BivoxApp {
     fn finish_config_write(&mut self, result: anyhow::Result<AppConfig>, success_message: &str) {
         match result {
             Ok(config) => {
+                self.errors.remove(&self.tab);
                 self.apply_config(config);
                 info!("{success_message}（{}）", self.paths.config_file.display());
             }
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.config_write_error = Some(message.clone());
-                self.config_write_error_tab = Some(self.tab);
-                warn!("写回配置失败：{message}");
-            }
+            Err(err) => self.fail_tab(self.tab, err, "写回配置失败"),
         }
     }
 
-    /// 当前页签要显示的配置写回错误；其它页签的错误不串页展示。
-    pub fn config_write_error_for(&self, tab: Tab) -> Option<&str> {
-        if self.config_write_error_tab == Some(tab) {
-            self.config_write_error.as_deref()
-        } else {
-            None
-        }
+    /// 记一条页签级错误（页内红字）并写日志；`tab` 由调用方指定（不一定是当前页签）。
+    fn fail_tab(&mut self, tab: Tab, err: anyhow::Error, context: &str) {
+        let message = format!("{err:#}");
+        self.errors.insert(tab, message.clone());
+        warn!("{context}：{message}");
+    }
+
+    /// 某个页签的保存/校验错误（页内红字）；其它页签的错误不串页展示。
+    pub fn error_for(&self, tab: Tab) -> Option<&str> {
+        self.errors.get(&tab).map(String::as_str)
     }
 
     // ---- 自定义音色编辑 ----
-
-    /// 音色草稿是否有未保存修改。
-    fn voice_drafts_dirty(&self) -> bool {
-        self.voice_drafts != editor::drafts_from_config(&self.config)
-    }
 
     /// 打开程序目录（Windows 资源管理器）。
     pub fn open_exe_dir(&self) {
@@ -1418,82 +1155,8 @@ impl BivoxApp {
         false
     }
 
-    /// 他人线路的实时状态横幅：等待/连接中显示原因与倒计时，恢复后自动消失。
-    ///
-    /// 与「运行告警」不同：它是实时状态（不可手动关闭），所以每 500ms 请求重绘刷新倒计时。
-    fn others_status_banner(&self, ui: &mut egui::Ui) {
-        let Some(status) = &self.others_status else {
-            return;
-        };
-        let detail = status.detail.trim();
-        let text = match status.state {
-            OthersLineState::Capturing => return,
-            OthersLineState::Connecting => {
-                if detail.is_empty() {
-                    "正在连接…".to_string()
-                } else {
-                    format!("正在连接…（{detail}）")
-                }
-            }
-            OthersLineState::Waiting => {
-                let seconds = self
-                    .others_retry_deadline
-                    .map(|deadline| retry_seconds(deadline, Instant::now()));
-                match (detail.is_empty(), seconds) {
-                    (true, Some(seconds)) => format!("{seconds} 秒后重试"),
-                    (false, Some(seconds)) => format!("{detail}；{seconds} 秒后重试"),
-                    (true, None) => "等待重试".to_string(),
-                    (false, None) => detail.to_string(),
-                }
-            }
-        };
-        gui::widgets::banner(ui, "他人语音", &text, gui::theme::AMBER);
-        // 倒计时每秒都在变：即使没有新事件也要让界面继续刷新。
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
-    }
-
     fn central(&mut self, ui: &mut egui::Ui) {
-        if let Some(detail) = self.crash.clone() {
-            gui::widgets::banner(
-                ui,
-                "程序发生崩溃",
-                &format!("{detail}（详情见 crash.log）"),
-                gui::theme::RED,
-            );
-        }
-        if let Some(detail) = self.startup_error.clone() {
-            gui::widgets::banner(ui, "启动检查未通过", &detail, gui::theme::AMBER);
-        }
-        if let Some(detail) = self.config_reload_error.clone() {
-            gui::widgets::banner(
-                ui,
-                "配置重新加载失败",
-                &format!("{detail}（已保留当前运行配置；修复磁盘配置前无法写回）"),
-                gui::theme::RED,
-            );
-        }
-        if let Some(detail) = self.config_write_error.clone()
-            && self.config_write_error_tab.is_none()
-        {
-            gui::widgets::banner(ui, "配置写回失败", &detail, gui::theme::RED);
-            if ui.button("清除错误").clicked() {
-                self.config_write_error = None;
-            }
-        }
-        self.others_status_banner(ui);
-        if let Some(detail) = self.pipeline_warning.clone() {
-            gui::widgets::banner(ui, "运行告警", &detail, gui::theme::AMBER);
-            if ui.button("清除告警").clicked() {
-                self.pipeline_warning = None;
-            }
-        }
-        if let Some(detail) = self.pipeline_error.clone() {
-            gui::widgets::banner(ui, "实时管线错误", &detail, gui::theme::RED);
-            if ui.button("清除错误").clicked() {
-                self.pipeline_error = None;
-            }
-        }
-
+        gui::banners::show(self, ui);
         ui.horizontal(|ui| {
             for tab in Tab::ALL {
                 if ui.selectable_label(self.tab == tab, tab.title()).clicked() {
@@ -1818,18 +1481,6 @@ pub fn run(paths: AppPaths) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn retry_countdown_rounds_up() {
-        let now = Instant::now();
-        assert_eq!(retry_seconds(now + Duration::from_millis(1), now), 1);
-        assert_eq!(retry_seconds(now + Duration::from_millis(2_500), now), 3);
-        assert_eq!(retry_seconds(now, now), 0);
-        assert_eq!(
-            retry_seconds(now - Duration::from_secs(5), now),
-            0,
-            "已过期的倒计时按 0 处理"
-        );
-    }
 
     #[test]
     fn config_signature_is_stable_across_instances() {

@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use eframe::egui;
 
-use crate::app::BivoxApp;
+use crate::app::{BivoxApp, Tab};
 use crate::config::{DEFAULT_SAMPLE_RATE, DEFAULT_TTS_MODEL};
 use crate::gui::{tts_current_voice, tts_voice_editor, widgets};
 use crate::language::CLONING_LANGUAGES;
@@ -33,7 +33,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     if action.reset {
         app.reset_tts_tab();
     }
-    widgets::error_line(ui, app.voice_edit_error.as_deref());
+    widgets::error_line(ui, app.error_for(Tab::Tts));
     ui.label(
         egui::RichText::new(
             "上方选择合成模型、当前音色与中文方言；下方编辑自定义音色。改动后点右上角「保存」\
@@ -46,12 +46,12 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("合成模型");
         ui.add(
-            egui::TextEdit::singleline(&mut app.tts_model)
+            egui::TextEdit::singleline(&mut app.drafts.tts.model)
                 .desired_width(380.0)
                 .hint_text(DEFAULT_TTS_MODEL),
         );
         if ui.button("恢复默认").clicked() {
-            app.tts_model = DEFAULT_TTS_MODEL.to_string();
+            app.drafts.tts.model = DEFAULT_TTS_MODEL.to_string();
         }
     });
     ui.label(
@@ -65,7 +65,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     tts_current_voice::show(app, ui);
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        widgets::dialect_combo(ui, "中文方言", &mut app.tts_dialect);
+        widgets::dialect_combo(ui, "中文方言", &mut app.drafts.tts.dialect);
         ui.label(egui::RichText::new("仅中文句子生效；普通话不附加方言指令").weak())
             .on_hover_text(
                 "复刻音色支持官方列出的 20 种方言；qwen-audio-3.1-tts-flash 的 4 个多语种/方言\
@@ -104,11 +104,11 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
                 .auto_shrink([false, false])
                 .id_salt("tts_voice_list_scroll")
                 .show(ui, |ui| {
-                    if app.voice_drafts.is_empty() {
+                    if app.drafts.tts.drafts.is_empty() {
                         ui.label(egui::RichText::new("还没有自定义音色。").weak());
                     }
                     let selected = app.selected_voice.clone();
-                    for (index, draft) in app.voice_drafts.iter().enumerate() {
+                    for (index, draft) in app.drafts.tts.drafts.iter().enumerate() {
                         let languages = draft
                             .samples
                             .iter()
@@ -117,7 +117,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
                             .join(", ");
                         let is_selected = selected.as_deref() == Some(draft.key.as_str());
                         // 新增音色后把列表滚到末尾（最后一项底部对齐）
-                        let scroll_here = scroll_to_end && index + 1 == app.voice_drafts.len();
+                        let scroll_here = scroll_to_end && index + 1 == app.drafts.tts.drafts.len();
                         if tts_voice_editor::voice_item(
                             ui,
                             index,
@@ -133,10 +133,10 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         });
 
     if add_new {
-        let key = unique_voice_key(&app.voice_drafts);
+        let key = unique_voice_key(&app.drafts.tts.drafts);
         // 新音色的第一个样本固定用中文，后续可在样本行里改语言
         let language = "zh".to_string();
-        app.voice_drafts.push(VoiceDraft {
+        app.drafts.tts.drafts.push(VoiceDraft {
             key: key.clone(),
             display_name: String::new(),
             samples: vec![SampleDraft {
@@ -146,7 +146,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
             }],
         });
         app.selected_voice = Some(key);
-        app.voice_edit_error = None;
+        app.errors.remove(&Tab::Tts);
         // 新音色追加在列表末尾：等它真正画出来后的下一帧再把列表滚到底
         app.voice_list_scroll_to_end = true;
     }
@@ -161,12 +161,18 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     let Some(key) = app.selected_voice.clone() else {
         return;
     };
-    let Some(index) = app.voice_drafts.iter().position(|draft| draft.key == key) else {
+    let Some(index) = app
+        .drafts
+        .tts
+        .drafts
+        .iter()
+        .position(|draft| draft.key == key)
+    else {
         app.selected_voice = None;
         return;
     };
 
-    let mut draft = app.voice_drafts[index].clone();
+    let mut draft = app.drafts.tts.drafts[index].clone();
     let mut delete_voice = false;
     // 样本删除在滚出闭包后统一应用（避免同时借用 app）；排序在 edit_samples 内直接改草稿
     let mut remove_sample: Option<usize> = None;
@@ -240,30 +246,32 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         });
 
     // 把编辑后的草稿写回，并处理样本移动/删除（在草稿上进行）
-    app.voice_drafts[index] = draft;
+    app.drafts.tts.drafts[index] = draft;
     // 配置键名可能刚被编辑：选中状态是按「键名」记录的，必须同步更新，
     // 否则下一帧列表找不到选中项，会取消选中并让右栏详情消失。
-    let current_key = app.voice_drafts[index].key.clone();
+    let current_key = app.drafts.tts.drafts[index].key.clone();
     if app.selected_voice.as_deref() != Some(current_key.as_str()) {
         app.selected_voice = Some(current_key.clone());
     }
     // 顶部「自定义音色」下拉若正选中这个音色，键名被改名后要跟着走，
     // 否则下一帧在下拉选项里找不到旧键名，会退化成显示原始键名。
-    if app.voice_custom_key == key && app.voice_custom_key != current_key {
-        app.voice_custom_key = current_key.clone();
+    if app.drafts.tts.custom_key == key && app.drafts.tts.custom_key != current_key {
+        app.drafts.tts.custom_key = current_key.clone();
     }
     if let Some(i) = remove_sample {
-        app.voice_drafts[index].samples.remove(i);
+        app.drafts.tts.drafts[index].samples.remove(i);
     }
 
     if delete_voice {
-        app.voice_drafts.remove(index);
-        app.voice_edit_error = None;
+        app.drafts.tts.drafts.remove(index);
+        app.errors.remove(&Tab::Tts);
         app.selected_voice = None;
         // 顶部下拉选中的就是这个被删掉的音色时，换到剩余第一个（没有则清空）
-        if app.voice_custom_key == key {
-            app.voice_custom_key = app
-                .voice_drafts
+        if app.drafts.tts.custom_key == key {
+            app.drafts.tts.custom_key = app
+                .drafts
+                .tts
+                .drafts
                 .first()
                 .map(|draft| draft.key.clone())
                 .unwrap_or_default();

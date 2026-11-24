@@ -21,7 +21,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
             if action.reset {
                 app.reset_settings_tab();
             }
-            widgets::error_line(ui, app.config_write_error_for(Tab::Settings));
+            widgets::error_line(ui, app.error_for(Tab::Settings));
             if let Some(notice) = &app.api_key_notice {
                 ui.colored_label(theme::AMBER, notice);
             }
@@ -60,7 +60,7 @@ fn show_bailian_section(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("API Key");
         ui.add(
-            egui::TextEdit::singleline(&mut app.api_key_input)
+            egui::TextEdit::singleline(&mut app.drafts.settings.api_key)
                 .password(true)
                 .desired_width(420.0)
                 .hint_text("sk-..."),
@@ -78,7 +78,7 @@ fn show_bailian_section(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("接入域名");
         ui.add(
-            egui::TextEdit::singleline(&mut app.settings_workspace_host)
+            egui::TextEdit::singleline(&mut app.drafts.settings.workspace_host)
                 .desired_width(420.0)
                 .hint_text("dashscope.aliyuncs.com"),
         );
@@ -97,7 +97,7 @@ fn show_advanced_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("缓存文件");
         ui.add(
-            egui::TextEdit::singleline(&mut app.settings_cache_file)
+            egui::TextEdit::singleline(&mut app.drafts.settings.cache_file)
                 .desired_width(420.0)
                 .hint_text("cache.json"),
         );
@@ -113,7 +113,7 @@ fn show_advanced_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("分块词数");
         ui.add(
-            egui::DragValue::new(&mut app.settings_chunk_words)
+            egui::DragValue::new(&mut app.drafts.settings.chunk_words)
                 .range(1..=1000)
                 .speed(1.0),
         );

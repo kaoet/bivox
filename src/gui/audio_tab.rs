@@ -27,7 +27,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
-    widgets::error_line(ui, app.config_write_error_for(Tab::Audio));
+    widgets::error_line(ui, app.error_for(Tab::Audio));
     ui.add_space(8.0);
 
     let (configured_input, configured_output) = current_devices(app);
@@ -82,13 +82,16 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
 fn show_vad_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.separator();
     ui.label(egui::RichText::new("本地 VAD").strong());
-    ui.checkbox(&mut app.vad_enabled, "启用本地 VAD（关闭后音频全量上传）");
+    ui.checkbox(
+        &mut app.drafts.vad.enabled,
+        "启用本地 VAD（关闭后音频全量上传）",
+    );
 
-    ui.add_enabled_ui(app.vad_enabled, |ui| {
+    ui.add_enabled_ui(app.drafts.vad.enabled, |ui| {
         ui.horizontal(|ui| {
             ui.label("起音阈值");
             ui.add(
-                egui::DragValue::new(&mut app.vad_threshold)
+                egui::DragValue::new(&mut app.drafts.vad.threshold)
                     .range(0.01..=0.99)
                     .speed(0.01)
                     .max_decimals(2),
@@ -98,7 +101,7 @@ fn show_vad_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("静音结束时长");
             ui.add(
-                egui::DragValue::new(&mut app.vad_min_silence_ms)
+                egui::DragValue::new(&mut app.drafts.vad.min_silence_ms)
                     .range(0..=5000)
                     .speed(10.0)
                     .suffix(" ms"),
@@ -108,14 +111,17 @@ fn show_vad_settings(app: &mut BivoxApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("句末补发静音");
             ui.add(
-                egui::DragValue::new(&mut app.vad_tail_ms)
+                egui::DragValue::new(&mut app.drafts.vad.tail_ms)
                     .range(0..=5000)
                     .speed(10.0)
                     .suffix(" ms"),
             );
             ui.label(egui::RichText::new("用于触发服务端 sentence_end").weak());
         });
-        ui.checkbox(&mut app.vad_debug, "打印每个 chunk 的 VAD 决策（排障用）");
+        ui.checkbox(
+            &mut app.drafts.vad.debug,
+            "打印每个 chunk 的 VAD 决策（排障用）",
+        );
     });
 
     ui.add_space(4.0);

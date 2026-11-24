@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::app::BivoxApp;
+use crate::app::{BivoxApp, Tab};
 use crate::gui::{language_list, widgets};
 use crate::language::TRANSLATION_LANGUAGES;
 
@@ -29,7 +29,7 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     if action.reset {
         app.reset_others_tab();
     }
-    widgets::error_line(ui, app.others_edit_error.as_deref());
+    widgets::error_line(ui, app.error_for(Tab::Others));
     ui.label(
         egui::RichText::new(
             "本页是他人线路的专属设置：说的话从「VRChat」页配置的进程采集，只上屏，\
@@ -51,12 +51,15 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
     );
 
     ui.add_space(10.0);
-    language_list::show(ui, "others_languages", &mut app.others_languages);
+    language_list::show(ui, "others_languages", &mut app.drafts.others.languages);
 
     ui.add_space(10.0);
-    ui.checkbox(&mut app.others_translate, "把他人说的话翻译成目标语言");
-    let mut target = app.others_target.clone();
-    ui.add_enabled_ui(app.others_translate, |ui| {
+    ui.checkbox(
+        &mut app.drafts.others.translate,
+        "把他人说的话翻译成目标语言",
+    );
+    let mut target = app.drafts.others.target.clone();
+    ui.add_enabled_ui(app.drafts.others.translate, |ui| {
         ui.horizontal(|ui| {
             ui.label("目标语言");
             egui::ComboBox::from_id_salt("others_target")
@@ -73,5 +76,5 @@ fn show_content(app: &mut BivoxApp, ui: &mut egui::Ui) {
                 });
         });
     });
-    app.others_target = target;
+    app.drafts.others.target = target;
 }

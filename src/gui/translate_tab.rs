@@ -32,7 +32,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
         )
         .weak(),
     );
-    widgets::error_line(ui, app.config_write_error_for(Tab::Translate));
+    widgets::error_line(ui, app.error_for(Tab::Translate));
     ui.add_space(8.0);
 
     let configured = current(app);
@@ -43,11 +43,12 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("翻译模型");
         ui.add(
-            egui::TextEdit::singleline(&mut app.translate_model)
+            egui::TextEdit::singleline(&mut app.drafts.translate_model)
                 .desired_width(380.0)
                 .hint_text(DEFAULT_TRANSLATE_MODEL),
         );
-        let can_apply = app.translate_model_dirty() && !app.translate_model.trim().is_empty();
+        let can_apply =
+            app.translate_model_dirty() && !app.drafts.translate_model.trim().is_empty();
         if ui
             .add_enabled(can_apply, egui::Button::new("应用模型"))
             .clicked()
@@ -55,7 +56,7 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
             app.save_translate_model();
         }
         if ui.button("恢复默认").clicked() {
-            app.translate_model = DEFAULT_TRANSLATE_MODEL.to_string();
+            app.drafts.translate_model = DEFAULT_TRANSLATE_MODEL.to_string();
             app.save_translate_model();
         }
         if app.translate_model_dirty() {
