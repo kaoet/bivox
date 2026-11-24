@@ -75,11 +75,6 @@ impl ActiveVoice {
             Self::Custom(custom) => custom.selection_for(asr_language),
         }
     }
-
-    /// 按本句语言返回应使用的百炼 voice（语速见 [`Self::selection_for`]）。
-    pub fn voice_for(&self, asr_language: &str) -> String {
-        self.selection_for(asr_language).0.to_string()
-    }
 }
 
 impl ResolvedCustomVoice {
@@ -98,13 +93,6 @@ impl ResolvedCustomVoice {
         self.sample_for(asr_language)
             .map(|(_, sample)| (sample.voice_id.as_str(), sample.rate))
             .unwrap_or(("", DEFAULT_SAMPLE_RATE))
-    }
-
-    /// 按本句语言选择 voice_id：无该语言样本时回退到 `samples[0]`（默认声线）。
-    pub fn voice_for(&self, asr_language: &str) -> &str {
-        self.sample_for(asr_language)
-            .map(|(_, sample)| sample.voice_id.as_str())
-            .unwrap_or_default()
     }
 
     /// 已配置的语言（按字典序，便于展示）。
@@ -874,7 +862,6 @@ mod tests {
         assert_eq!(custom.selection_for("zh"), ("voice-zh", 1.3));
         // 没有对应语言样本（例如 en）时回退默认样本，语速也用默认样本的
         assert_eq!(custom.selection_for("en"), ("voice-zh", 1.3));
-        assert_eq!(custom.voice_for("ja"), "voice-ja");
 
         let builtin = ActiveVoice::Builtin {
             name: "qiaoxiaojiao_v3.1".to_string(),
@@ -883,7 +870,6 @@ mod tests {
             builtin.selection_for("ja"),
             ("qiaoxiaojiao_v3.1", crate::config::DEFAULT_SAMPLE_RATE)
         );
-        assert_eq!(builtin.voice_for("ja"), "qiaoxiaojiao_v3.1");
     }
 
     #[tokio::test]

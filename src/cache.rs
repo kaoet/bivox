@@ -90,13 +90,6 @@ pub struct HotwordCacheEntry {
     pub updated_at: u64,
 }
 
-/// 一条缓存记录的定位键（目标模型 + 音频内容哈希）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VoiceCacheKey {
-    pub target_model: String,
-    pub audio_hash: String,
-}
-
 /// 缓存文件的读写封装。先在内存里改，完成后再 [`AppCache::save`] 落盘。
 #[derive(Debug)]
 pub struct AppCache {
@@ -133,11 +126,6 @@ impl AppCache {
         Ok(Self { path, file })
     }
 
-    /// 缓存文件路径。
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// 音色缓存记录数量（所有模型合计）。
     pub fn len(&self) -> usize {
         self.file.voices.values().map(BTreeMap::len).sum()
@@ -146,11 +134,6 @@ impl AppCache {
     /// 是否没有音色缓存记录（热词缓存不参与该判断）。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// 热词缓存记录数量（所有 ASR 模型合计）。
-    pub fn hotwords_len(&self) -> usize {
-        self.file.asr_hotwords.len()
     }
 
     /// 按「模型 + 音频内容 SHA256」查询音色缓存。
@@ -173,26 +156,6 @@ impl AppCache {
             .map(|(hash, entry)| (hash.as_str(), entry))
     }
 
-    /// 遍历全部音色缓存记录：`(模型, 音频哈希, 记录)`。
-    pub fn entries(&self) -> impl Iterator<Item = (&str, &str, &VoiceCacheEntry)> {
-        self.file.voices.iter().flat_map(|(model, by_hash)| {
-            by_hash
-                .iter()
-                .map(move |(hash, entry)| (model.as_str(), hash.as_str(), entry))
-        })
-    }
-
-    /// 查找某个音频内容哈希在所有模型下的缓存记录：`(模型, 记录)`。
-    pub fn entries_for_hash(&self, audio_hash: &str) -> Vec<(&str, &VoiceCacheEntry)> {
-        self.file
-            .voices
-            .iter()
-            .filter_map(|(model, by_hash)| {
-                by_hash.get(audio_hash).map(|entry| (model.as_str(), entry))
-            })
-            .collect()
-    }
-
     /// 写入/覆盖一条音色缓存（只在内存中，需调用 [`AppCache::save`] 落盘）。
     pub fn insert(
         &mut self,
@@ -207,68 +170,9 @@ impl AppCache {
             .insert(audio_hash.into(), entry);
     }
 
-    /// 删除某个 voice_id 对应的所有记录（所有模型下），返回被删除的键。
-    pub fn remove_by_voice_id(&mut self, voice_id: &str) -> Vec<VoiceCacheKey> {
-        let mut removed = Vec::new();
-        for (model, by_hash) in self.file.voices.iter_mut() {
-            let stale: Vec<String> = by_hash
-                .iter()
-                .filter(|(_, entry)| entry.voice_id == voice_id)
-                .map(|(hash, _)| hash.clone())
-                .collect();
-            for hash in stale {
-                by_hash.remove(&hash);
-                removed.push(VoiceCacheKey {
-                    target_model: model.clone(),
-                    audio_hash: hash,
-                });
-            }
-        }
-        self.drop_empty_models();
-        removed
-    }
-
-    /// 只保留 `alive` 中的 voice_id；返回被清理掉的键。
-    ///
-    /// 用于把本地缓存与百炼账号的实际音色列表对齐（云端已删除的视为失效）。
-    pub fn retain_voice_ids(&mut self, alive: impl Fn(&str) -> bool) -> Vec<VoiceCacheKey> {
-        let mut removed = Vec::new();
-        for (model, by_hash) in self.file.voices.iter_mut() {
-            let stale: Vec<String> = by_hash
-                .iter()
-                .filter(|(_, entry)| !alive(&entry.voice_id))
-                .map(|(hash, _)| hash.clone())
-                .collect();
-            for hash in stale {
-                by_hash.remove(&hash);
-                removed.push(VoiceCacheKey {
-                    target_model: model.clone(),
-                    audio_hash: hash,
-                });
-            }
-        }
-        self.drop_empty_models();
-        removed
-    }
-
-    /// 清空全部音色缓存，返回清理条数（热词缓存不受影响）。
-    pub fn clear(&mut self) -> usize {
-        let count = self.len();
-        self.file.voices.clear();
-        count
-    }
-
     /// 按 ASR 模型查询预编译热词缓存。
     pub fn hotword_entry(&self, target_model: &str) -> Option<&HotwordCacheEntry> {
         self.file.asr_hotwords.get(target_model)
-    }
-
-    /// 遍历全部热词缓存：`(ASR 模型, 记录)`。
-    pub fn hotword_entries(&self) -> impl Iterator<Item = (&str, &HotwordCacheEntry)> {
-        self.file
-            .asr_hotwords
-            .iter()
-            .map(|(model, entry)| (model.as_str(), entry))
     }
 
     /// 写入/覆盖一条热词缓存（只在内存中，需调用 [`AppCache::save`] 落盘）。
@@ -276,11 +180,6 @@ impl AppCache {
         self.file
             .asr_hotwords
             .insert(target_model.to_string(), entry);
-    }
-
-    /// 删除某个 ASR 模型的热词缓存，返回是否真的删除了记录。
-    pub fn remove_hotword_entry(&mut self, target_model: &str) -> bool {
-        self.file.asr_hotwords.remove(target_model).is_some()
     }
 
     /// 把内存中的缓存原子写入磁盘（临时文件 + rename），并自动创建父目录。
@@ -299,11 +198,6 @@ impl AppCache {
         std::fs::rename(&tmp_path, &self.path)
             .with_context(|| format!("保存本地缓存 {} 失败", self.path.display()))?;
         Ok(())
-    }
-
-    /// 删除没有记录的模型层，避免 JSON 里残留空对象。
-    fn drop_empty_models(&mut self) {
-        self.file.voices.retain(|_, by_hash| !by_hash.is_empty());
     }
 }
 
@@ -373,7 +267,7 @@ mod tests {
         let path = temp_cache_path("missing");
         let cache = AppCache::load(path.clone()).unwrap();
         assert!(cache.is_empty());
-        assert_eq!(cache.hotwords_len(), 0);
+        assert!(cache.hotword_entry(ASR_MODEL).is_none());
         assert!(!path.exists(), "读取空缓存不应创建文件");
     }
 
@@ -446,7 +340,6 @@ mod tests {
             vec!["原神".to_string(), "Kaoet".to_string()]
         );
         assert_eq!(entry.weight, 50);
-        assert_eq!(reloaded.hotwords_len(), 1);
         assert!(reloaded.is_empty(), "只有热词缓存时音色缓存仍为空");
 
         std::fs::remove_file(&path).ok();
@@ -471,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn hotword_entry_can_be_replaced_and_removed() {
+    fn hotword_entry_can_be_replaced() {
         let mut cache = AppCache::load(temp_cache_path("hotwords-update")).unwrap();
         cache.set_hotword_entry(ASR_MODEL, hotword_entry("vocab-1", &["旧词"]));
         cache.set_hotword_entry(ASR_MODEL, hotword_entry("vocab-2", &["新词"]));
@@ -479,63 +372,6 @@ mod tests {
             cache.hotword_entry(ASR_MODEL).unwrap().vocabulary_id,
             "vocab-2"
         );
-        assert!(cache.remove_hotword_entry(ASR_MODEL));
-        assert!(cache.hotword_entry(ASR_MODEL).is_none());
-        assert!(!cache.remove_hotword_entry(ASR_MODEL));
-    }
-
-    #[test]
-    fn remove_by_voice_id_drops_all_aliases_across_models() {
-        let mut cache = AppCache::load(temp_cache_path("remove")).unwrap();
-        cache.insert(MODEL_A, "hash-1", entry("voice-a"));
-        cache.insert(MODEL_A, "hash-2", entry("voice-a"));
-        cache.insert(MODEL_B, "hash-3", entry("voice-a"));
-        cache.insert(MODEL_A, "hash-4", entry("voice-b"));
-
-        let removed = cache.remove_by_voice_id("voice-a");
-        assert_eq!(removed.len(), 3);
-        assert!(cache.get(MODEL_A, "hash-1").is_none());
-        assert!(cache.get(MODEL_A, "hash-2").is_none());
-        assert!(cache.get(MODEL_B, "hash-3").is_none());
-        assert!(cache.get(MODEL_A, "hash-4").is_some());
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn remove_by_voice_id_drops_empty_model_layers() {
-        let path = temp_cache_path("remove-empty-model");
-        let mut cache = AppCache::load(path.clone()).unwrap();
-        cache.insert(MODEL_B, "hash-1", entry("voice-b"));
-        cache.remove_by_voice_id("voice-b");
-        cache.save().unwrap();
-
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            json["voices"].as_object().unwrap().len(),
-            0,
-            "空模型层不应残留"
-        );
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn retain_voice_ids_prunes_records_missing_in_cloud() {
-        let mut cache = AppCache::load(temp_cache_path("prune")).unwrap();
-        cache.insert(MODEL_A, "hash-1", entry("voice-a"));
-        cache.insert(MODEL_A, "hash-2", entry("voice-b"));
-        cache.insert(MODEL_B, "hash-3", entry("voice-a"));
-
-        let removed = cache.retain_voice_ids(|id| id == "voice-b");
-        let mut pruned: Vec<(&str, &str)> = removed
-            .iter()
-            .map(|key| (key.target_model.as_str(), key.audio_hash.as_str()))
-            .collect();
-        pruned.sort_unstable();
-        assert_eq!(pruned, vec![(MODEL_B, "hash-3"), (MODEL_A, "hash-1")]);
-        assert_eq!(cache.len(), 1);
-        assert!(cache.get(MODEL_A, "hash-2").is_some());
     }
 
     #[test]
@@ -569,52 +405,6 @@ mod tests {
             cache
                 .find_with_hash_by_audio_path(MODEL_A, "samples/other.wav")
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn entries_for_hash_returns_all_models() {
-        let mut cache = AppCache::load(temp_cache_path("by-hash")).unwrap();
-        cache.insert(MODEL_A, "hash-1", entry("voice-a"));
-        cache.insert(MODEL_B, "hash-1", entry("voice-b"));
-        cache.insert(MODEL_A, "hash-2", entry("voice-c"));
-
-        let mut found: Vec<(&str, &str)> = cache
-            .entries_for_hash("hash-1")
-            .iter()
-            .map(|(model, entry)| (*model, entry.voice_id.as_str()))
-            .collect();
-        found.sort_unstable();
-        assert_eq!(found, vec![(MODEL_B, "voice-b"), (MODEL_A, "voice-a")]);
-        assert!(cache.entries_for_hash("missing").is_empty());
-    }
-
-    #[test]
-    fn clear_removes_everything() {
-        let mut cache = AppCache::load(temp_cache_path("clear")).unwrap();
-        cache.insert(MODEL_A, "hash-1", entry("voice-a"));
-        cache.insert(MODEL_B, "hash-1", entry("voice-b"));
-        assert_eq!(cache.clear(), 2);
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn entries_iterates_all_models() {
-        let mut cache = AppCache::load(temp_cache_path("entries")).unwrap();
-        cache.insert(MODEL_A, "hash-1", entry("voice-a"));
-        cache.insert(MODEL_B, "hash-1", entry("voice-b"));
-
-        let mut rows: Vec<(&str, &str, &str)> = cache
-            .entries()
-            .map(|(model, hash, entry)| (model, hash, entry.voice_id.as_str()))
-            .collect();
-        rows.sort_unstable();
-        assert_eq!(
-            rows,
-            vec![
-                (MODEL_B, "hash-1", "voice-b"),
-                (MODEL_A, "hash-1", "voice-a"),
-            ]
         );
     }
 

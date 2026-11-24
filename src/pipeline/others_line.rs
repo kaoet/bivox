@@ -376,12 +376,12 @@ async fn drive(
 
     loop {
         // 句终屏障解除后，先按序处理缓存的 ASR 事件。
-        if let (Some(cfg), Some(state), Some(runtime)) =
+        if let (Some(_), Some(state), Some(runtime)) =
             (translate, translate_state.as_mut(), translation.as_mut())
             && !runtime.finish_pending
             && let Some(event) = backlog.pop_front()
         {
-            on_asr_translated(event, emit, state, runtime, cfg);
+            on_asr_translated(event, emit, state, runtime);
             continue;
         }
 
@@ -424,7 +424,7 @@ async fn drive(
             } => {
                 match event {
                     Some(event) => {
-                        if let (Some(cfg), Some(state), Some(runtime)) = (
+                        if let (Some(_), Some(state), Some(runtime)) = (
                             translate,
                             translate_state.as_mut(),
                             translation.as_mut(),
@@ -432,7 +432,7 @@ async fn drive(
                             if runtime.finish_pending {
                                 backlog.push_back(event);
                             } else {
-                                on_asr_translated(event, emit, state, runtime, cfg);
+                                on_asr_translated(event, emit, state, runtime);
                             }
                         } else {
                             forward_asr(event, emit, &mut tracker, &mut sentence_language);
@@ -491,7 +491,6 @@ fn on_asr_translated(
     emit: &Emitter,
     state: &mut TranslateState,
     runtime: &mut TranslationRuntime,
-    cfg: &OthersTranslate,
 ) {
     state.sentence.on_event(&event.text, event.is_sentence_end);
     if runtime.sentence_id.is_none() {
@@ -510,13 +509,11 @@ fn on_asr_translated(
         let skip = canonical_language(&source_language) == runtime.target_language.as_str();
         let job = TranslationJob {
             generation: runtime.generation,
-            seq: runtime.next_seq,
             text: chunk.chunk_text,
             source_language,
             skip_translation: skip,
             is_sentence_end: chunk.is_sentence_end,
         };
-        runtime.next_seq = runtime.next_seq.wrapping_add(1);
         runtime.pending = runtime.pending.saturating_add(1);
         if runtime.tx_job.send(job).is_err() {
             log::warn!("他人语音：翻译 worker 已退出，本句可能缺少译文");
@@ -551,7 +548,6 @@ fn on_asr_translated(
         }
     }
     state.sentence.on_event_end(event.is_sentence_end);
-    let _ = cfg;
 }
 
 /// 翻译模式：并入一条译文；屏障满足时把当前句定稿。

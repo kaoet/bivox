@@ -279,7 +279,6 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                             asr_sentence_open = false;
                             discard_asr_sentence = true;
                         }
-                        tts_task_language = None;
 
                         let source_language = language_state.typed_language(&text);
                         // 先把源文交给界面：译文回来之前就能看到原文行，句终仍由 Translation 收口。
@@ -296,13 +295,11 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                         runtime.pending = 1;
                         let job = TranslationJob {
                             generation: runtime.generation,
-                            seq: runtime.next_seq,
                             text,
                             source_language,
                             skip_translation: skip,
                             is_sentence_end: true,
                         };
-                        runtime.next_seq += 1;
                         if runtime.tx_job.send(job).is_err() {
                             break;
                         }
@@ -413,13 +410,11 @@ pub async fn run(params: Params<'_>, emit: &mut (dyn FnMut(PipelineEvent) + Send
                             == runtime.target_language.as_str();
                         let job = TranslationJob {
                             generation: runtime.generation,
-                            seq: runtime.next_seq,
                             text: chunk.chunk_text,
                             source_language,
                             skip_translation: skip,
                             is_sentence_end: chunk.is_sentence_end,
                         };
-                        runtime.next_seq = runtime.next_seq.wrapping_add(1);
                         runtime.pending = runtime.pending.saturating_add(1);
                         if runtime.tx_job.send(job).is_err() {
                             break;
@@ -648,7 +643,6 @@ pub struct TranslationRuntime {
     pub(crate) tx_job: UnboundedSender<TranslationJob>,
     /// 打字打断时 +1：旧 generation 的在途译文直接丢弃，避免串到新句。
     pub(crate) generation: u64,
-    pub(crate) next_seq: u64,
     pub(crate) pending: u32,
     /// 本句已生成的译文（与已送 TTS 的前缀一致）。
     pub(crate) translated: String,
@@ -668,7 +662,6 @@ impl TranslationRuntime {
             target_language,
             tx_job,
             generation: 0,
-            next_seq: 0,
             pending: 0,
             translated: String::new(),
             tts_open: false,
@@ -687,7 +680,6 @@ impl TranslationRuntime {
     }
 
     pub(crate) fn reset_sentence(&mut self) {
-        self.next_seq = 0;
         self.pending = 0;
         self.translated.clear();
         self.tts_open = false;

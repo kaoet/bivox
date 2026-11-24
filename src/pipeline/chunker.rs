@@ -198,6 +198,8 @@ impl TextChunker {
     /// 默认安全尾部余量字符数（防止 ASR 尾部浮动窗口被过早硬切）
     pub const DEFAULT_GUARD_TAIL_CHARS: usize = 3;
 
+    /// 默认阈值 + 默认安全尾（单测用；生产走 [`Self::with_policy`]）。
+    #[cfg(test)]
     pub fn new(chunk_word_threshold: usize) -> Self {
         Self {
             emitted_text: String::new(),
@@ -207,6 +209,8 @@ impl TextChunker {
         }
     }
 
+    /// 指定安全尾余量（单测用来验证 guard 行为）。
+    #[cfg(test)]
     pub fn with_guard_tail(chunk_word_threshold: usize, guard_tail_chars: usize) -> Self {
         Self {
             emitted_text: String::new(),

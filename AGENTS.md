@@ -22,7 +22,7 @@
 | [`docs/decisions.md`](docs/decisions.md) | 设计决定与理由（稳定编号 `D<n>`） |
 | [`docs/troubleshooting/windows-temp-low-integrity.md`](docs/troubleshooting/windows-temp-low-integrity.md) | Windows 上测试写 `%TEMP%` 报 os error 5 的排查、规避与修复（DSH Low 完整性标签残留） |
 | [`src/config.rs`](src/config.rs) | 配置字段、默认值与校验的唯一完整说明（字段注释 + `Default`/常量 + `validate`） |
-| [`TODO.md`](TODO.md) | 人类维护的任务与想法记录；**AI 编码代理不得修改，也应忽略其中内容** |
+| [`TODO.md`](TODO.md) | 人类维护的任务与想法记录；**AI 编码代理不得修改，也应忽略其中内容，不要包含到AI生成的git commit中** |
 | `src/**/*.rs` 的 `//!` | 模块职责与关键约束 |
 
 ## 事实来源

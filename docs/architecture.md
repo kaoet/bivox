@@ -628,7 +628,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 每账号最多 50 个预编译热词列表；固定使用超级热词权重 50，因此每个列表最多 50 条。换 ASR 模型会新建列表，旧列表需用 `admin vocab delete` 清理；每次列表创建/更新后生效时间受百炼部署延迟影响，更新还受「两次间隔 ≥5 分钟」限制（D31）。
 - 跨机便携（拷贝整个目录到另一台机器）没有自动化测试，发布前需人工冒烟。
 - 中文方言的效果取决于音色是否支持方言指令：复刻音色支持官方 20 种方言，`qwen-audio-3.1-tts-flash` 的 4 个多语种/方言系统音色仅支持 8 种，其余系统音色可能只支持普通话。程序不做音色能力探测，不支持的组合可能仍按普通话合成（D29）。
-- `AudioPlaybackHandle::interrupt` 与 `AudioCapture::stop` 当前没有调用方（预留接口）；播放/采集的生命周期由 drop 控制。
+- 播放/采集的生命周期由 drop 控制：`AudioPlaybackEngine` / `AudioCapture` 一 drop 就停止对应音频流，没有单独的「停止/中断」接口。
 - 打字输入句是**排队**语义：当前排队/播放的音频全部播完后才轮到它；界面在提交时就把该句加入字幕历史，可能与实际发声时间有延迟。
 - 若提交打字输入时 ASR 当前句尚未句终，该句剩余部分会被丢弃、不会补读（字幕只保留已送 TTS 的前缀，D24）；极端情况下用户持续说话期间打字输入会暂停该句后续合成。
 - 打字输入句上限 500 字符；TTS 连续启动失败 3 次时该句按现有机制丢弃（只写日志，不弹错误条）。
@@ -650,7 +650,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 - **开关与字段**：翻译相关字段见 `src/config.rs`（D25）；`enabled = false` 时整条链路与旧行为完全一致。
 - **翻译接口**：`POST https://{workspace_host}/compatible-mode/v1/chat/completions`，`model` 取配置中的翻译模型；`messages` 单条 user 文本；`translation_options = { source_lang, target_lang }` **必填**（缺失时模型会退化成普通对话）。源/目标语言直接用 ISO 代码，`source_lang = "auto"` 可兜底；目标语言限 16 种 TTS 语言。
-- **worker**：独立 tokio 任务，单 in-flight 顺序处理（`TranslationJob`/`TranslationDone` 带 `generation` 与 `seq`），主循环不 await HTTP；打字输入会 bump `generation` 并丢弃旧句在途译文。
+- **worker**：独立 tokio 任务，单 in-flight 顺序处理（`TranslationJob`/`TranslationDone` 带 `generation`，结果按发送顺序回来），主循环不 await HTTP；打字输入会 bump `generation` 并丢弃旧句在途译文。
 - **句终屏障**：源文句终时若还有译文在途，等 `pending` 归零后再发「空文本 + 句终」收口 TTS task；打字输入立即收口当前 task 并丢弃未返回译文。译文全部失败时也照样补发句终事件，保证当前字幕行被收口（D26）。
 - **屏障期间的 ASR 缓存**：句终屏障未完成时，新到达的 ASR 事件先进 `asr_backlog`，等旧句句终 `Translation` 发出、状态复位后再按序补处理——否则下一句源文会先于旧句句终译文落到界面，出现「一句变两句、原文译文错位」（D28）。
 - **分块策略**：`clause`（默认）= 标点/句终切 + 安全尾；`sentence` = 只句终切（见第 9 节）。

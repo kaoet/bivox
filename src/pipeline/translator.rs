@@ -1,4 +1,4 @@
-//! 翻译 worker：独立 tokio 任务顺序处理翻译请求，结果按 `seq` 回传。
+//! 翻译 worker：独立 tokio 任务顺序处理翻译请求，结果按发送顺序回传。
 //!
 //! 会话主循环不能 `await` HTTP：它是 `biased select`，打字输入优先，
 //! 阻塞一次翻译会让打字变慢（D5 的同类约束）。因此这里用无界通道把任务送给
@@ -17,8 +17,6 @@ use crate::client::qwen_mt::{QwenMtClient, TranslateRequest};
 pub struct TranslationJob {
     /// 会话代号：打字打断 ASR 句时递增，旧结果全部丢弃。
     pub generation: u64,
-    /// 同一会话代号内的顺序号（worker 顺序处理，结果天然有序）。
-    pub seq: u64,
     pub text: String,
     /// 该片段使用的源语言（ISO 代码；判定失败时可用 `auto`）。
     pub source_language: String,
@@ -32,7 +30,6 @@ pub struct TranslationJob {
 #[derive(Debug, Clone)]
 pub struct TranslationDone {
     pub generation: u64,
-    pub seq: u64,
     pub is_sentence_end: bool,
     /// 成功为译文；失败为带阶段的中文错误（`anyhow::Error` 不可 `Clone`）。
     pub result: Result<String, String>,
@@ -73,7 +70,6 @@ pub fn spawn(
             };
             let done = TranslationDone {
                 generation: job.generation,
-                seq: job.seq,
                 is_sentence_end: job.is_sentence_end,
                 result,
             };
@@ -102,10 +98,9 @@ mod tests {
         .expect("构造翻译客户端")
     }
 
-    fn job(text: &str, seq: u64, is_sentence_end: bool) -> TranslationJob {
+    fn job(text: &str, is_sentence_end: bool) -> TranslationJob {
         TranslationJob {
             generation: 1,
-            seq,
             text: text.to_string(),
             source_language: "zh".to_string(),
             skip_translation: false,
@@ -129,19 +124,15 @@ mod tests {
         let (tx_job, mut rx_done, handle) =
             spawn(client_for(&server), "en".to_string(), running.clone());
 
-        tx_job.send(job("一", 0, false)).expect("发送任务 1");
-        tx_job.send(job("二", 1, false)).expect("发送任务 2");
-        tx_job.send(job("三", 2, true)).expect("发送任务 3");
+        tx_job.send(job("一", false)).expect("发送任务 1");
+        tx_job.send(job("二", false)).expect("发送任务 2");
+        tx_job.send(job("三", true)).expect("发送任务 3");
 
         let mut done = Vec::new();
         for _ in 0..3 {
             done.push(rx_done.recv().await.expect("等待翻译结果"));
         }
 
-        assert_eq!(
-            done.iter().map(|item| item.seq).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
         assert!(done.iter().all(|item| item.generation == 1));
         assert_eq!(
             done.iter()
@@ -166,7 +157,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let (tx_job, mut rx_done, _handle) = spawn(client_for(&server), "zh".to_string(), running);
 
-        let mut skipped = job("你好", 0, true);
+        let mut skipped = job("你好", true);
         skipped.skip_translation = true;
         tx_job.send(skipped).expect("发送跳过任务");
 
@@ -182,7 +173,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(false));
         let (tx_job, _rx_done, handle) = spawn(client_for(&server), "en".to_string(), running);
 
-        tx_job.send(job("不会处理", 0, true)).expect("发送任务");
+        tx_job.send(job("不会处理", true)).expect("发送任务");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
             .await
             .expect("worker 应在运行标志清除后退出");

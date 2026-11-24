@@ -75,8 +75,11 @@ pub struct PipelineSessionHandle {
     others_enabled_tx: watch::Sender<bool>,
     /// 保留一个接收端：会话尚未订阅时，watch 通道也不能因为无接收者而关闭，
     /// 否则 Starting 期间的顶栏切换会丢失（D43）。
+    ///
+    /// 麦克风这条的当前值还会被 [`Self::mic_enabled`] 读取；他人这条路没有读取方，
+    /// 只用下划线前缀声明「只为保活」，避免 dead_code 告警。
     mic_enabled_keep: watch::Receiver<bool>,
-    others_enabled_keep: watch::Receiver<bool>,
+    _others_enabled_keep: watch::Receiver<bool>,
     /// 麦克风实时电平（f32 bits）。
     mic_level: Arc<AtomicU32>,
     /// 他人线路实时电平（f32 bits）。
@@ -90,7 +93,7 @@ impl PipelineSessionHandle {
         others_enabled: bool,
     ) -> Self {
         let (mic_enabled_tx, mic_enabled_keep) = watch::channel(mic_enabled);
-        let (others_enabled_tx, others_enabled_keep) = watch::channel(others_enabled);
+        let (others_enabled_tx, _others_enabled_keep) = watch::channel(others_enabled);
         Self {
             running: Arc::new(AtomicBool::new(true)),
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -102,7 +105,7 @@ impl PipelineSessionHandle {
             mic_enabled_tx,
             others_enabled_tx,
             mic_enabled_keep,
-            others_enabled_keep,
+            _others_enabled_keep,
             mic_level: Arc::new(AtomicU32::new(0)),
             others_level: Arc::new(AtomicU32::new(0)),
         }
@@ -150,10 +153,6 @@ impl PipelineSessionHandle {
 
     pub fn mic_enabled(&self) -> bool {
         *self.mic_enabled_keep.borrow()
-    }
-
-    pub fn others_enabled(&self) -> bool {
-        *self.others_enabled_keep.borrow()
     }
 
     fn mic_enabled_rx(&self) -> watch::Receiver<bool> {

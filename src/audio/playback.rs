@@ -3,14 +3,12 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct AudioPlaybackHandle {
     sample_queue: Arc<Mutex<VecDeque<i16>>>,
     resampler: Option<Arc<Mutex<MonoResampler>>>,
-    interrupt_flag: Arc<AtomicBool>,
 }
 
 impl AudioPlaybackHandle {
@@ -36,19 +34,6 @@ impl AudioPlaybackHandle {
                 let sample = i16::from_le_bytes(*chunk);
                 queue.push_back(sample);
             }
-        }
-    }
-
-    #[allow(dead_code)] // 预留：播放中断；当前由 drop 播放引擎停止，暂无调用方
-    pub fn interrupt(&self) {
-        self.interrupt_flag.store(true, Ordering::Relaxed);
-        if let Ok(mut queue) = self.sample_queue.lock() {
-            queue.clear();
-        }
-        if let Some(ref resampler_mutex) = self.resampler
-            && let Ok(mut resampler) = resampler_mutex.lock()
-        {
-            resampler.input_fifo.clear();
         }
     }
 
@@ -78,7 +63,6 @@ impl AudioPlaybackHandle {
         Self {
             sample_queue: Arc::new(Mutex::new(VecDeque::new())),
             resampler: None,
-            interrupt_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -106,9 +90,6 @@ impl AudioPlaybackEngine {
         let sample_queue = Arc::new(Mutex::new(VecDeque::<i16>::with_capacity(48000 * 2)));
         let queue_clone = sample_queue.clone();
 
-        let interrupt_flag = Arc::new(AtomicBool::new(false));
-        let interrupt_clone = interrupt_flag.clone();
-
         let resampler = MonoResampler::new(input_sample_rate, native_sample_rate)?
             .map(|r| Arc::new(Mutex::new(r)));
 
@@ -119,10 +100,6 @@ impl AudioPlaybackEngine {
                 supported_config.config(),
                 move |data: &mut [f32], _| {
                     let mut queue = queue_clone.lock().unwrap();
-
-                    if interrupt_clone.swap(false, Ordering::Relaxed) {
-                        queue.clear();
-                    }
 
                     for frame in data.chunks_mut(channels) {
                         let sample_f32 = if let Some(s) = queue.pop_front() {
@@ -142,10 +119,6 @@ impl AudioPlaybackEngine {
                 supported_config.config(),
                 move |data: &mut [i16], _| {
                     let mut queue = queue_clone.lock().unwrap();
-
-                    if interrupt_clone.swap(false, Ordering::Relaxed) {
-                        queue.clear();
-                    }
 
                     for frame in data.chunks_mut(channels) {
                         let s16_sample = queue.pop_front().unwrap_or(0);
@@ -170,7 +143,6 @@ impl AudioPlaybackEngine {
         let handle = AudioPlaybackHandle {
             sample_queue,
             resampler,
-            interrupt_flag,
         };
 
         Ok(Self {

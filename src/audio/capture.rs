@@ -3,13 +3,12 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 
 pub struct AudioCapture {
     _stream: Stream,
-    is_capturing: Arc<AtomicBool>,
     dropped_chunks: Arc<AtomicU64>,
 }
 
@@ -23,8 +22,6 @@ impl AudioCapture {
         let channels = supported_config.channels();
         let sample_format = supported_config.sample_format();
 
-        let is_capturing = Arc::new(AtomicBool::new(true));
-        let capturing_flag = is_capturing.clone();
         let dropped_chunks = Arc::new(AtomicU64::new(0));
         let dropped_flag = dropped_chunks.clone();
 
@@ -63,10 +60,6 @@ impl AudioCapture {
             SampleFormat::F32 => device.build_input_stream(
                 supported_config.config(),
                 move |data: &[f32], _| {
-                    if !capturing_flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-
                     for frame in data.chunks_exact(channels as usize) {
                         let channel_sum: f32 = frame.iter().copied().sum();
                         let mono_sample = channel_sum / channels as f32;
@@ -79,10 +72,6 @@ impl AudioCapture {
             SampleFormat::I16 => device.build_input_stream(
                 supported_config.config(),
                 move |data: &[i16], _| {
-                    if !capturing_flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-
                     for frame in data.chunks_exact(channels as usize) {
                         let channel_sum: i32 = frame.iter().map(|&s| s as i32).sum();
                         let mono_sample = channel_sum as f32 / (channels as f32 * 32768.0);
@@ -104,7 +93,6 @@ impl AudioCapture {
 
         Ok(Self {
             _stream: stream,
-            is_capturing,
             dropped_chunks,
         })
     }
@@ -112,10 +100,5 @@ impl AudioCapture {
     /// 因通道满（下游积压）被丢弃的 100ms 音频块数；正常收尾导致的关闭不计入。
     pub fn dropped_chunks(&self) -> u64 {
         self.dropped_chunks.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)] // 预留：显式停止采集；当前由 drop `AudioCapture` 停止
-    pub fn stop(&self) {
-        self.is_capturing.store(false, Ordering::Relaxed);
     }
 }

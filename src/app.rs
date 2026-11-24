@@ -112,8 +112,6 @@ pub struct BivoxApp {
     pub restart_pending: bool,
     /// 最近一帧的 egui Context（自动重启时用来请求重绘）。
     pub egui_ctx: Option<egui::Context>,
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
     /// 当前有效配置；启动时加载失败会直接退出，因此这里始终是合法配置。
     pub config: AppConfig,
     /// 语音合成页左栏当前选中的自定义音色（配置键名）；`None` = 未选中。
@@ -241,8 +239,6 @@ impl BivoxApp {
             running_config_signature: None,
             restart_pending: false,
             egui_ctx: None,
-            input_device: None,
-            output_device: None,
             config,
             selected_voice: None,
             api_key_input: String::new(),
@@ -363,8 +359,6 @@ impl BivoxApp {
     /// 把配置里的 Key / 设备 / 音色草稿同步到界面状态（加载、重载、写回成功后调用）。
     fn sync_from_config(&mut self) {
         self.sync_settings_inputs();
-        self.input_device = self.config.audio.input_device.clone();
-        self.output_device = self.config.audio.output_device.clone();
         self.vad_enabled = self.config.vad.enabled;
         self.vad_threshold = self.config.vad.threshold;
         self.vad_min_silence_ms = self.config.vad.min_silence_ms;
@@ -388,7 +382,7 @@ impl BivoxApp {
     }
 
     /// 从配置同步语音合成页顶部「当前音色」的草稿值。
-    pub fn sync_voice_inputs(&mut self) {
+    fn sync_voice_inputs(&mut self) {
         if let Some(name) = self.config.custom_voice_name().map(str::to_string) {
             self.voice_mode = VoiceMode::Custom;
             self.voice_custom_key = name;
@@ -412,14 +406,14 @@ impl BivoxApp {
     }
 
     /// 从配置同步「语音识别」页的草稿值（模型 / 热词）。
-    pub fn sync_asr_inputs(&mut self) {
+    fn sync_asr_inputs(&mut self) {
         self.asr_model = self.config.asr.model.clone();
         self.asr_hotwords = self.config.asr.hotwords.join("\n");
         self.asr_edit_error = None;
     }
 
     /// 从配置同步「自己」页的草稿值（麦克风不在草稿里，直接读配置）。
-    pub fn sync_self_inputs(&mut self) {
+    fn sync_self_inputs(&mut self) {
         self.self_languages = self.config.local.languages.clone();
         self.self_translate = self.config.local.translate;
         self.self_target = self.config.local.target.clone();
@@ -428,7 +422,7 @@ impl BivoxApp {
     }
 
     /// 从配置同步「他人」页的草稿值（侦听开关不在草稿里，直接读配置）。
-    pub fn sync_others_inputs(&mut self) {
+    fn sync_others_inputs(&mut self) {
         self.others_languages = self.config.others.languages.clone();
         self.others_translate = self.config.others.translate;
         self.others_target = self.config.others.target.clone();
@@ -436,7 +430,7 @@ impl BivoxApp {
     }
 
     /// 顶部「当前音色」的草稿值（`[tts] voice` 形态）。
-    pub fn voice_draft_value(&self) -> String {
+    fn voice_draft_value(&self) -> String {
         match self.voice_mode {
             VoiceMode::Existing => self.voice_input.trim().to_string(),
             VoiceMode::Custom => {
@@ -451,17 +445,17 @@ impl BivoxApp {
     }
 
     /// 顶部「当前音色」是否与配置文件不同。
-    pub fn voice_input_dirty(&self) -> bool {
+    fn voice_input_dirty(&self) -> bool {
         self.voice_draft_value() != self.config.tts.voice.trim()
     }
 
     /// 「中文方言」草稿是否与配置文件不同。
-    pub fn tts_dialect_dirty(&self) -> bool {
+    fn tts_dialect_dirty(&self) -> bool {
         self.tts_dialect.trim() != self.config.tts.dialect
     }
 
     /// 合成模型草稿是否与配置文件不同。
-    pub fn tts_model_dirty(&self) -> bool {
+    fn tts_model_dirty(&self) -> bool {
         self.tts_model.trim() != self.config.tts.model
     }
 
@@ -584,18 +578,18 @@ impl BivoxApp {
     // ---- 语音识别页 ----
 
     /// 把多行热词草稿解析为归一化列表（一行一个；空行忽略）。
-    pub fn hotwords_draft_list(&self) -> Vec<String> {
+    fn hotwords_draft_list(&self) -> Vec<String> {
         let lines: Vec<String> = self.asr_hotwords.lines().map(str::to_string).collect();
         crate::config::normalize_hotwords(&lines)
     }
 
     /// 语音识别页的模型是否有改动。
-    pub fn asr_model_dirty(&self) -> bool {
+    fn asr_model_dirty(&self) -> bool {
         self.asr_model.trim() != self.config.asr.model
     }
 
     /// 语音识别页的热词是否有改动（按归一化后的列表比较，空白行不算改动）。
-    pub fn asr_hotwords_dirty(&self) -> bool {
+    fn asr_hotwords_dirty(&self) -> bool {
         self.hotwords_draft_list() != self.config.asr.hotwords
     }
 
@@ -1086,7 +1080,7 @@ impl BivoxApp {
     // ---- 自定义音色编辑 ----
 
     /// 音色草稿是否有未保存修改。
-    pub fn voice_drafts_dirty(&self) -> bool {
+    fn voice_drafts_dirty(&self) -> bool {
         self.voice_drafts != editor::drafts_from_config(&self.config)
     }
 
@@ -1566,6 +1560,7 @@ fn config_signature(config: &AppConfig) -> String {
     voices.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut signature = String::new();
+    // best-effort: 写入 `String` 的 `write!` 不会失败（`fmt::Error` 只可能来自底层 writer）
     let _ = write!(
         signature,
         "key={:?}\n\
@@ -1621,6 +1616,7 @@ fn config_signature(config: &AppConfig) -> String {
         config.translate.model,
         config.translate.granularity.label(),
     );
+    // best-effort: 同上，写 `String` 不会失败
     for (name, voice) in voices {
         let _ = write!(signature, "voice:{name}:{:?}:", voice.name);
         for sample in &voice.samples {
