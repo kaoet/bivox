@@ -26,7 +26,7 @@ use crate::timeline::Timeline;
 use crate::voice::editor;
 
 /// 窗口标题。
-pub const WINDOW_TITLE: &str = "Bivox — 实时语音识别与合成";
+pub const WINDOW_TITLE: &str = "Bivox — 超低延迟 VRChat 语音识别、翻译与语音合成";
 
 pub use drafts::Drafts;
 use drafts::{AsrDraft, LocalDraft, OthersDraft, SettingsDraft, TtsDraft, VadDraft};

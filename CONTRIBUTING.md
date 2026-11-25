@@ -248,7 +248,7 @@ git commit -m "..."                        # 7. 以上全部通过后才允许�
 | 开发流程、规范、测试、发布、调试 | 本文件 | 其它文档只引用，不复制 |
 | AI 代理入口 | `AGENTS.md` | 只做导航与阅读顺序 |
 | 模块/数据流/算法 | `docs/architecture.md` | 当前实现的“怎么做” |
-| 设计决定与理由 | `docs/decisions.md` | `D<n>`，编号稳定 |
+| 设计决定与理由 | `docs/decisions.md` | `D<n>`，被替代时先改引用再删除条目 |
 | 配置字段、默认值与校验 | `src/config.rs` | 字段注释 + `Default`/常量 + `validate` |
 | 语言代码集合 | `src/language.rs` | README 的用户表格据此维护 |
 | 模块职责概览 | `docs/architecture.md` | 本文件不重复维护目录树 |
@@ -258,7 +258,14 @@ git commit -m "..."                        # 7. 以上全部通过后才允许�
 
 - 用户可见行为变化 → 更新 `README.md`；必要时同步 `docs/architecture.md`；
 - 模块边界、数据流、协议、算法变化 → 更新 `docs/architecture.md`；
-- 新的长期设计取舍 → 在 `docs/decisions.md` 追加 `D<n>`（不重排旧编号），并更新相关源码注释中的 `D` 引用；
+- 新的**长期约束** → 在 `docs/decisions.md` 追加 `D<n>`（不重排、不复用旧编号），并更新相关源码注释中的 `D` 引用；
+- **被替代的决定整条删除**：先用 `git grep -n "D<旧编号>"` 把源码注释、`architecture.md`、`README.md` 的引用改指向后继决定，再删条目（编号作废不回填），需要的内容并入后继条目；文件里不留「由 Dxx 取代」这类历史注记；
+- **新功能默认不新增 `D` 编号**。写进 `docs/decisions.md` 之前先过准入三问，任一不满足就不写：
+  1. 它约束的是**未来的改动**，而不是描述这次的实现？
+  2. `docs/architecture.md` 或代码里读不到它？（能读到就写在那里，不要抄第二份）
+  3. 删掉它，会不会有人（或 AI）据此做出与之矛盾的改动？
+
+  对应关系：「怎么做」写成 `docs/architecture.md`；「这次为什么这样改」留在 commit message；只有「不记录就会被未来改动破坏」的取舍才进 `docs/decisions.md`。
 - 命令、门禁、代码规范、发布流程变化 → 更新本文件；`AGENTS.md` 保持只引用；
 - 配置字段变化 → 更新 `src/config.rs` 的字段注释、`Default`/常量和 `validate`；README 只描述 GUI 行为；
 - 语言列表变化 → 更新 `src/language.rs` 与 README 的对应表格。

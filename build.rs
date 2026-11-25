@@ -4,7 +4,10 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_icon("assets/bivox.ico");
         res.set("ProductName", "Bivox");
-        res.set("FileDescription", "Bivox — 实时语音识别与合成");
+        res.set(
+            "FileDescription",
+            "Bivox — 超低延迟 VRChat 语音识别、翻译与语音合成",
+        );
         res.set("OriginalFilename", "bivox.exe");
         res.compile()
             .expect("编译 Windows 资源失败（assets/bivox.ico）");

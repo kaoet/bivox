@@ -111,7 +111,6 @@ pub fn show(app: &mut BivoxApp, ui: &mut egui::Ui) {
             .inner;
         let has_focus = ui.memory(|memory| memory.has_focus(response.id));
 
-        // 输入框下方只保留错误提示（使用说明已移除）。
         if let Some(error) = app.typed_input_error.as_deref() {
             ui.colored_label(theme::RED, error);
         }

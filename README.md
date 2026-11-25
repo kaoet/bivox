@@ -1,4 +1,4 @@
-# Bivox — 超低延迟实时语音识别 / 语音合成（Windows GUI）
+# Bivox — 超低延迟 VRChat 语音识别、翻译与语音合成
 
 [![CI](https://github.com/kaoet/bivox/actions/workflows/ci.yml/badge.svg)](https://github.com/kaoet/bivox/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
@@ -169,7 +169,7 @@ crash.log              # 崩溃信息（如有）
 - VRChat 没启动 / 中途退出时，只在顶部显示黄色提示并自动重连（1→2→4→8→10 秒退避），不会中断会话；
 - 只采到「混音」：多人同时说话会混在一起，远处玩家音量小、识别率低；游戏音效与 BGM 也会进入同一条流，建议把 VRChat 内语音音量调高、音效音量调低。
 
-**OSC 聊天框**
+#### OSC 聊天框
 
 在「VRChat」页勾选 **启用 OSC 聊天框** 后，实时字幕会同步到本机 VRChat 的 ChatBox。使用前需要：
 

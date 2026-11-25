@@ -468,14 +468,14 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 
 目的：只上传语音段，降低 ASR 费用，同时避免服务端任务因长时间没有音频而超时（D34）。
 
-**Silero VAD（16k / 32ms 帧）**
+#### Silero VAD（16k / 32ms 帧）
 
 - 模型为官方 `silero_vad_16k_op15.onnx`（MIT，1.23MiB），编译期 `include_bytes!` 内嵌进 exe，运行时由 ONNX Runtime 从内存加载；模型来源/版本/SHA256 见 `assets/silero/README.md`。
 - 每帧恰好 512 采样（32ms）；输入 `input[1,576]`（64 采样 context + 512 新帧）、`state[2,1,128]`、`sr`；输出该帧语音概率与下一帧 state。
 - 采集块名义 100ms（实际 100–107ms）：门控内部按 512 分帧，跨 chunk 保留不足一帧的采样余量（以 1600 为例 3×512 + 64）。
 - 实测（release，单线程）：单帧约 0.13ms；会话启动加载会话约 36ms。单帧推理不在 cpal 实时回调里执行。
 
-**发送门控（`SpeechGate`）**
+#### 发送门控（`SpeechGate`）
 
 - 起音：连续 2 帧概率 ≥ `threshold`（默认值见 `VadConfig::default`，约 64ms 去抖）；
 - 保持：概率 ≥ `threshold - 0.15`（负阈值迟滞）；
@@ -487,7 +487,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - `asr_line` 在 VAD 之前对每个 chunk 做电平 tap（RMS → dBFS → 0..1），写入顶栏共享 `AtomicU32`（D43）；电平 tap 在 tokio 任务里，不阻塞 cpal 回调。
 - `[vad] enabled = false` 时跳过门控，全量上传（字段语义见 `src/config.rs`）。
 
-**独立 VAD 线程**
+#### 独立 VAD 线程
 
 - `vad_thread` 用 `std::thread("silero-vad")` 持有检测器与门控：收采集原始 chunk，输出应上传的 chunk 给 ASR 任务；cpal 实时回调只做重采样/攒块，ASR 任务只发 WebSocket。
 - 断线重连：ASR 置位 `vad_reset`，VAD 线程在下一块音频前 `reset_transient()`（模型 state、起音/拖尾、pre-roll、keepalive）。
@@ -629,7 +629,7 @@ TTS 返回的 22050Hz PCM16 进入 `AudioPlaybackHandle` 的队列；输出设�
 - 每账号最多 50 个预编译热词列表；固定使用超级热词权重 50，因此每个列表最多 50 条。换 ASR 模型会新建列表，旧列表需用 `admin vocab delete` 清理；每次列表创建/更新后生效时间受百炼部署延迟影响，更新还受「两次间隔 ≥5 分钟」限制（D31）。
 - 跨机便携（拷贝整个目录到另一台机器）没有自动化测试，发布前需人工冒烟。
 - 中文方言的效果取决于音色是否支持方言指令：复刻音色支持官方 20 种方言，`qwen-audio-3.1-tts-flash` 的 4 个多语种/方言系统音色仅支持 8 种，其余系统音色可能只支持普通话。程序不做音色能力探测，不支持的组合可能仍按普通话合成（D29）。
-- 播放/采集的生命周期由 drop 控制：`AudioPlaybackEngine` / `AudioCapture` 一 drop 就停止对应音频流，没有单独的「停止/中断」接口。
+- 播放/采集的生命周期由 drop 控制：`AudioPlaybackEngine` / `AudioCapture` 一 drop 就停止对应音频流。
 - 打字输入句是**排队**语义：当前排队/播放的音频全部播完后才轮到它；界面在提交时就把该句加入字幕历史，可能与实际发声时间有延迟。
 - 若提交打字输入时 ASR 当前句尚未句终，该句剩余部分会被丢弃、不会补读（字幕只保留已送 TTS 的前缀，D24）；极端情况下用户持续说话期间打字输入会暂停该句后续合成。
 - 打字输入句上限 500 字符；TTS 连续启动失败 3 次时该句按现有机制丢弃（只写日志，不弹错误条）。
