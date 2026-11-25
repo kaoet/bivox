@@ -52,38 +52,34 @@
 
 删除功能、代码、配置时，直接移除对应的代码、注释、文档、测试。除非明确要求验证某项**不应存在**（协议/安全约束），否则不写“无 / 没有 / 不含 / 预留 / 暂未使用 / 目前无调用方”这类反向注释或反向断言。
 
-## 批量文本改动：不要用会解释转义的字符串
+## 批量改写文件
 
-**现象**：用 PowerShell 的双引号字符串或 `@"..."@` here-string 拼正文做批量替换时，反引号
-（`` ` ``）会被当成 PowerShell 转义符，正文里的行内代码会被写坏：
+**改文件内容只用 `edit` / `write` 工具**——它们按字面量写入，不做任何插值。shell 只用于只读检查（`git grep`、行数统计、控制字符扫描）。
 
-| 正文里写的 | 实际落盘 | 外观 |
-|---|---|---|
-| `` `false` `` | `` `f `` → **U+000C 换页符** | 显示成「返回  alse」 |
-| `` `events.rs` `` | `` `e `` → **U+001B ESC** | 显示成「更新 <不可见>vents.rs」 |
-| `` `retention_secs` `` | `` `r `` → **CR** | 一行被截成两行，第二行以「etention_secs」开头 |
-| `` `n… ` ``、`` `t… ` `` | LF、TAB | 换行 / 缩进错乱，肉眼很难发现 |
-| `` `chatbox` ``（非转义字母） | 反引号被吞 | 不报错，但 markdown 代码片段失效 |
+需要脚本批量改写时用 **Python**（DSH 自带的解释器路径见 `load_workspace_dependencies`），不要用 shell 做字符串替换。这类事故已经发生过两次：PowerShell 双引号会把反引号当转义符（`` `f `` → U+000C、`` `e `` → U+001B、`` `r `` → CR 截断行、普通单词前的反引号被吞），`$pair[0]` 会把字符串当成字符数组（`Replace('-',' ')` 清空了全文的列表项）；bash 同类陷阱是双引号里的反引号会被当命令替换。
 
-**规则**：
+脚本必须同时满足四条：
 
-1. 改文档或源码里的**字面文本**时，用编辑工具（`edit`）或单引号字符串（`'...'`，其中反引号是字面量）；不要用双引号/here-string 拼接含反引号、`$`、`\` 的正文。
-2. 任何批量文本改动（脚本替换、文档压缩、批量改名）之后，提交前跑一次控制字符扫描——它比肉眼可靠：
+1. **先断言后写**：逐个定位锚点（行首前缀、`## D<n>`、标题行），任一断言失败就 `sys.exit(1)` 退出，绝不写半成品；
+2. **dry-run 优先**：先打印 planned changes（行号 + 旧/新内容前 40 字符），确认无误再加 `--apply`；
+3. **写前备份、写后校验**：`shutil.copy2` 备份原文件；写完重新读取并校验（行数合理、锚点仍在、无控制字符），不一致立即用备份还原；
+4. **显式编码与换行**：`encoding='utf-8'`、`newline='\n'`，仓库统一 LF、不带 BOM。
 
-   ```powershell
-   foreach ($rel in (git ls-files | Where-Object { $_ -notmatch '\.(png|ico|onnx|zip|wav|jpg)$' })) {
-     $t = [System.IO.File]::ReadAllText((Join-Path (Get-Location) $rel))
-     for ($i = 0; $i -lt $t.Length; $i++) {
-       $c = [int]$t[$i]
-       if (($c -lt 32 -and $c -ne 9 -and $c -ne 10 -and $c -ne 13) -or $c -eq 0xFEFF -or $c -eq 0x200B) {
-         "$rel : U+{0:X4} @ {1}" -f $c, $i
-       }
-     }
-   }
-   ```
+任何批量改动（脚本替换、文档压缩、批量改名）之后，提交前再跑一遍控制字符扫描：
 
-3. 顺带检查 markdown 的**行内代码是否成对**（每行反引号数量为偶数）与是否存在以字母开头的“孤儿行”，这两条能抓出被吃掉的反引号和被 CR 截断的行。
-4. 发现写坏要**修内容而不是加忽略**：还原成原本的代码片段（而不是删掉反引号或改措辞）。
+```powershell
+foreach ($rel in (git ls-files | Where-Object { $_ -notmatch '\.(png|ico|onnx|zip|wav|jpg)$' })) {
+  $t = [System.IO.File]::ReadAllText((Join-Path (Get-Location) $rel))
+  for ($i = 0; $i -lt $t.Length; $i++) {
+    $c = [int]$t[$i]
+    if (($c -lt 32 -and $c -ne 9 -and $c -ne 10 -and $c -ne 13) -or $c -eq 0xFEFF -or $c -eq 0x200B) {
+      "$rel : U+{0:X4} @ {1}" -f $c, $i
+    }
+  }
+}
+```
+
+顺带检查 markdown 的**行内代码是否成对**（每行反引号数量为偶数）与是否存在以字母开头的“孤儿行”——这两条能抓出被吞掉的反引号和被 CR 截断的行。写坏了要**修内容而不是加忽略**：还原成原本的代码片段，而不是删掉反引号或改措辞。
 
 ## 提交
 
